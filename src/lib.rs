@@ -30,15 +30,18 @@
 pub mod coalesce;
 pub mod error;
 pub mod git;
+pub mod highlight;
 pub mod model;
 pub mod sessions;
 pub mod summarize;
+pub mod ui;
 
 use std::path::Path;
 
 pub use error::Error;
 pub use model::{CoalescedHistory, CommitGroup, CommitInfo, CommitSummary, TimedMessage};
 pub use summarize::Summarizer;
+pub use ui::{CodeView, DiffView};
 
 /// Re-export of the underlying session-parsing crate, so consumers (such as the
 /// egui front-end) can match on [`ncs::Role`] / [`ncs::ContentBlock`] without

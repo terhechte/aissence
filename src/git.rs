@@ -49,6 +49,29 @@ pub fn commit_log(folder: &Path) -> Result<Vec<CommitInfo>, Error> {
     Ok(commits)
 }
 
+/// Return the unified diff (patch text) introduced by `commit_id` in the
+/// repository containing `folder`.
+///
+/// This shells out to the `git` CLI (`git show`) — the most reliable way to
+/// render a textual patch. The commit *log* uses `gix`; only patch generation
+/// uses the CLI. Feed the result to [`crate::DiffView`].
+pub fn commit_patch(folder: &Path, commit_id: &str) -> Result<String, Error> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(folder)
+        .args(["show", "--no-color", "--format=", commit_id])
+        .output()
+        .map_err(|e| Error::Git(format!("running git show: {e}")))?;
+
+    if !output.status.success() {
+        return Err(Error::Git(format!(
+            "git show {commit_id}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 fn to_commit_info(commit: &gix::Commit<'_>) -> Result<CommitInfo, Error> {
     let map_git = |e: &dyn std::fmt::Display| Error::Git(e.to_string());
 
