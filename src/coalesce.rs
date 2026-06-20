@@ -46,6 +46,7 @@ pub fn coalesce(
         groups.push(CommitGroup {
             commit: Some(commit),
             messages,
+            summary: None,
         });
     }
 
@@ -54,6 +55,7 @@ pub fn coalesce(
         groups.push(CommitGroup {
             commit: None,
             messages: timed[idx..].to_vec(),
+            summary: None,
         });
     }
 

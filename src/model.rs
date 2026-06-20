@@ -85,6 +85,21 @@ impl TimedMessage {
     }
 }
 
+/// LLM-generated, three-part summary of what went into a commit.
+///
+/// Produced by the [`crate::summarize::Summarizer`]. Each field is empty when
+/// the commit group has nothing of that kind (e.g. a commit with no captured
+/// code-editing tool calls leaves `ai_implemented` empty).
+#[derive(Debug, Clone, Default)]
+pub struct CommitSummary {
+    /// 3-5 sentences: what the user asked for across all their messages.
+    pub user_requested: String,
+    /// 3-5 sentences: what the assistant explained/answered in its replies.
+    pub ai_answered: String,
+    /// 3-5 sentences: what the assistant implemented in code (file edits).
+    pub ai_implemented: String,
+}
+
 /// A commit together with the chat messages that led up to it.
 ///
 /// `commit` is `None` for the trailing group: messages that occurred after the
@@ -94,6 +109,9 @@ pub struct CommitGroup {
     pub commit: Option<CommitInfo>,
     /// Messages assigned to this commit, in chronological order.
     pub messages: Vec<TimedMessage>,
+    /// LLM summary of this group, populated on demand by
+    /// [`crate::summarize::Summarizer`]. `None` until summarized.
+    pub summary: Option<CommitSummary>,
 }
 
 impl CommitGroup {

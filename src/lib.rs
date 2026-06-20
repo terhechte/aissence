@@ -32,11 +32,13 @@ pub mod error;
 pub mod git;
 pub mod model;
 pub mod sessions;
+pub mod summarize;
 
 use std::path::Path;
 
 pub use error::Error;
-pub use model::{CoalescedHistory, CommitGroup, CommitInfo, TimedMessage};
+pub use model::{CoalescedHistory, CommitGroup, CommitInfo, CommitSummary, TimedMessage};
+pub use summarize::Summarizer;
 
 /// Re-export of the underlying session-parsing crate, so consumers (such as the
 /// egui front-end) can match on [`ncs::Role`] / [`ncs::ContentBlock`] without

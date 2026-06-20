@@ -23,3 +23,8 @@ egui = "0.29"
 # Timestamp parsing/comparison shared between git commit times and chat messages.
 chrono = "0.4"
 thiserror = "2"
+# LLM summarization of conversations + code changes via OpenRouter.
+openrouter-rs = "0.10"
+# Async runtime + concurrency for the (async) summarization layer.
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+futures = "0.3"

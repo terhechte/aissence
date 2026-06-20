@@ -20,4 +20,12 @@ pub enum Error {
     /// An I/O error occurred while reading session files.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// A required environment variable was not set (e.g. `OPENROUTER_API_KEY`).
+    #[error("missing environment variable: {0}")]
+    MissingEnv(&'static str),
+
+    /// The OpenRouter client or a summarization request failed.
+    #[error("llm error: {0}")]
+    Llm(String),
 }
