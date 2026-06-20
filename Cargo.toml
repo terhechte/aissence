@@ -1,0 +1,25 @@
+[package]
+name = "aissence"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "aissence"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aissence"
+path = "src/main.rs"
+
+[dependencies]
+# Unified parsing of Claude Code / Codex / Gemini session logs into one model.
+normalize-chat-sessions = "0.3.2"
+# Pure-Rust git access. Pinned to ^0.81 to unify with normalize-chat-sessions'
+# own gix dependency (avoids compiling two different gix versions).
+gix = "0.81"
+# Immediate-mode GUI. Not used by the library itself; it is added now so the
+# upcoming egui front-end (built on top of this library) can start immediately.
+egui = "0.29"
+# Timestamp parsing/comparison shared between git commit times and chat messages.
+chrono = "0.4"
+thiserror = "2"
