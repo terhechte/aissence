@@ -2,28 +2,36 @@
 //! correlated with its git commits.
 //!
 //! Start with `--folder <path>` (or pick a folder via a dialog when omitted).
-//! The app parses every session for the folder, summarizes each commit's
-//! conversation with an LLM (showing progress), then presents:
+//! The app parses every session for the folder and shows cached summaries
+//! immediately. Summarization is **on demand**: selecting a commit offers
+//! *Summarize* and *Ignore* buttons. Panes:
 //!
-//! - **left**: commits, each with a one-line summary,
-//! - **middle**: the per-message summaries for the selected commit
-//!   (user wrote / ai wrote / ai changed),
+//! - **left**: commits, each with a one-line summary (ignored ones faded),
+//! - **middle**: Summarize/Ignore buttons + the per-message summaries for the
+//!   selected commit (user wrote / ai wrote / ai changed),
 //! - **right**: syntax-highlighted code changes — the whole commit diff, or the
 //!   edits of a selected "ai changed" message.
+//!
+//! Generated summaries and ignore flags persist to `<folder>/.aissence`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
-use aissence::{CoalescedHistory, DiffView, MessageKind, SummaryStore, Summarizer, analyze, git};
+use aissence::{
+    CoalescedHistory, CommitGroup, CommitSummary, DiffView, MessageKind, SummaryStore, Summarizer,
+    analyze, git, persist,
+};
 use eframe::egui;
-use elegance::{Accent, Callout, CalloutTone, Card, ProgressBar, Spinner, Theme};
+use elegance::{Accent, Button, Callout, CalloutTone, Card, Spinner, Theme};
 
 // Per-kind accent colors (One Dark family).
 const USER_COLOR: egui::Color32 = egui::Color32::from_rgb(97, 175, 239); // blue
 const AI_COLOR: egui::Color32 = egui::Color32::from_rgb(152, 195, 121); // green
 const CHANGE_COLOR: egui::Color32 = egui::Color32::from_rgb(229, 192, 123); // yellow
 const DIM: egui::Color32 = egui::Color32::from_gray(140);
+const DISABLED: egui::Color32 = egui::Color32::from_gray(90); // faded / ignored
 
 fn main() -> eframe::Result {
     let folder = match folder_from_args() {
@@ -67,25 +75,31 @@ fn folder_from_args() -> Option<PathBuf> {
     None
 }
 
-/// Background-load lifecycle, shared between the worker task and the UI thread.
+/// Parse lifecycle, shared between the worker task and the UI thread.
 enum Phase {
-    Loading {
-        message: String,
-        fraction: Option<f32>,
-    },
+    Loading(String),
     Failed(String),
-    Ready {
-        history: CoalescedHistory,
-        notice: Option<String>,
-    },
+    Ready(CoalescedHistory),
+}
+
+/// Result of one background summarization, sent back to the UI thread.
+struct SummarizeResult {
+    group_index: usize,
+    commit_id: Option<String>,
+    signature: u64,
+    outcome: Result<CommitSummary, String>,
 }
 
 struct AissenceApp {
     folder: PathBuf,
-    _runtime: tokio::runtime::Runtime,
+    runtime: tokio::runtime::Runtime,
     phase: Arc<Mutex<Phase>>,
+    /// `None` when `OPENROUTER_API_KEY` is unset (Summarize disabled).
+    summarizer: Option<Arc<Summarizer>>,
+    /// On-disk cache of summaries + ignore flags (lives on the UI thread).
+    store: SummaryStore,
 
-    // Populated once loading finishes (moved out of `phase`).
+    // Populated once parsing finishes (moved out of `phase`).
     history: Option<CoalescedHistory>,
     notice: Option<String>,
 
@@ -99,6 +113,11 @@ struct AissenceApp {
     last_selection: (Option<usize>, Option<usize>),
     /// Cache of whole-commit git diffs by group index.
     patch_cache: HashMap<usize, Result<String, String>>,
+
+    // On-demand summarization.
+    in_progress: HashSet<usize>,
+    results_tx: Sender<SummarizeResult>,
+    results_rx: Receiver<SummarizeResult>,
 }
 
 impl AissenceApp {
@@ -109,36 +128,122 @@ impl AissenceApp {
             .enable_all()
             .build()
             .expect("tokio runtime");
-        let phase = Arc::new(Mutex::new(Phase::Loading {
-            message: "Starting…".to_string(),
-            fraction: None,
-        }));
+        let phase = Arc::new(Mutex::new(Phase::Loading("Starting…".to_string())));
 
+        // Parsing runs in the background; the store + summarizer live on the UI
+        // thread (summaries are kicked off on demand).
         runtime.spawn(load(folder.clone(), phase.clone(), cc.egui_ctx.clone()));
+        let store = SummaryStore::load(&folder);
+        let summarizer = Summarizer::from_env().ok().map(Arc::new);
+        let notice = summarizer
+            .is_none()
+            .then(|| "Set OPENROUTER_API_KEY to enable AI summaries.".to_string());
+
+        let (results_tx, results_rx) = std::sync::mpsc::channel();
 
         Self {
             folder,
-            _runtime: runtime,
+            runtime,
             phase,
+            summarizer,
+            store,
             history: None,
-            notice: None,
+            notice,
             selected_group: None,
             selected_message: None,
             current_patch: None,
             last_selection: (None, None),
             patch_cache: HashMap::new(),
+            in_progress: HashSet::new(),
+            results_tx,
+            results_rx,
         }
     }
 
-    fn on_ready(&mut self, history: CoalescedHistory, notice: Option<String>) {
+    fn on_ready(&mut self, mut history: CoalescedHistory) {
+        // Apply summaries cached in `.aissence` (resume without re-summarizing).
+        for group in history.groups.iter_mut() {
+            let Some(commit_id) = group.commit.as_ref().map(|c| c.id.clone()) else {
+                continue;
+            };
+            let signature = persist::signature(group);
+            if let Some(cached) = self.store.get(&commit_id, signature) {
+                group.summary = Some(cached.clone());
+            }
+        }
+
         // Default to the most recent group that actually has messages.
         self.selected_group = (0..history.groups.len())
             .rev()
             .find(|&i| !history.groups[i].messages.is_empty())
             .or(history.groups.len().checked_sub(1));
         self.selected_message = None;
-        self.notice = notice;
         self.history = Some(history);
+    }
+
+    /// Drain finished summarizations, applying them to `history` and persisting.
+    fn drain_results(&mut self, history: &mut CoalescedHistory) {
+        while let Ok(result) = self.results_rx.try_recv() {
+            self.in_progress.remove(&result.group_index);
+            match result.outcome {
+                Ok(summary) => {
+                    if let Some(group) = history.groups.get_mut(result.group_index) {
+                        group.summary = Some(summary.clone());
+                    }
+                    if let Some(commit_id) = &result.commit_id
+                        && let Err(err) =
+                            self.store.insert_and_save(commit_id, result.signature, summary)
+                    {
+                        self.notice = Some(format!("Could not write .aissence: {err}"));
+                    }
+                }
+                Err(err) => self.notice = Some(format!("Summarization failed: {err}")),
+            }
+        }
+    }
+
+    /// Spawn summarization for one group (also un-ignores it).
+    fn start_summarize(&mut self, group_index: usize, group: &CommitGroup, ctx: egui::Context) {
+        let Some(summarizer) = self.summarizer.clone() else {
+            return;
+        };
+        if self.in_progress.contains(&group_index) {
+            return;
+        }
+
+        let commit_id = group.commit.as_ref().map(|c| c.id.clone());
+        let signature = persist::signature(group);
+        if let Some(id) = &commit_id
+            && let Err(err) = self.store.set_ignored(id, false)
+        {
+            self.notice = Some(format!("Could not write .aissence: {err}"));
+        }
+
+        let group = group.clone();
+        let tx = self.results_tx.clone();
+        self.in_progress.insert(group_index);
+        self.runtime.spawn(async move {
+            let outcome = summarizer
+                .summarize_group(&group)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(SummarizeResult {
+                group_index,
+                commit_id,
+                signature,
+                outcome,
+            });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Mark a commit ignored / un-ignored.
+    fn set_commit_ignored(&mut self, group: &CommitGroup, ignored: bool) {
+        if let Some(commit) = &group.commit
+            && let Err(err) = self.store.set_ignored(&commit.id, ignored)
+        {
+            self.notice = Some(format!("Could not write .aissence: {err}"));
+        }
     }
 
     /// Recompute [`Self::current_patch`] when the selection changed.
@@ -199,30 +304,21 @@ impl eframe::App for AissenceApp {
             // Peek the phase; consume it if loading finished.
             let snapshot = {
                 let mut guard = self.phase.lock().unwrap();
-                if matches!(&*guard, Phase::Ready { .. }) {
-                    std::mem::replace(
-                        &mut *guard,
-                        Phase::Loading {
-                            message: String::new(),
-                            fraction: None,
-                        },
-                    )
+                if matches!(&*guard, Phase::Ready(_)) {
+                    std::mem::replace(&mut *guard, Phase::Loading(String::new()))
                 } else {
                     match &*guard {
-                        Phase::Loading { message, fraction } => Phase::Loading {
-                            message: message.clone(),
-                            fraction: *fraction,
-                        },
+                        Phase::Loading(message) => Phase::Loading(message.clone()),
                         Phase::Failed(e) => Phase::Failed(e.clone()),
-                        Phase::Ready { .. } => unreachable!(),
+                        Phase::Ready(_) => unreachable!(),
                     }
                 }
             };
 
             match snapshot {
-                Phase::Ready { history, notice } => self.on_ready(history, notice),
-                Phase::Loading { message, fraction } => {
-                    show_loading(ui, &message, fraction);
+                Phase::Ready(history) => self.on_ready(history),
+                Phase::Loading(message) => {
+                    show_loading(ui, &message);
                     ui.ctx().request_repaint(); // animate the spinner
                     return;
                 }
@@ -240,7 +336,8 @@ impl eframe::App for AissenceApp {
 impl AissenceApp {
     fn show_main(&mut self, ui: &mut egui::Ui) {
         // Own the history for the frame so we can freely mutate selection state.
-        let history = self.history.take().expect("history present");
+        let mut history = self.history.take().expect("history present");
+        self.drain_results(&mut history);
         self.refresh_patch(&history);
 
         egui::Panel::top("topbar").show_inside(ui, |ui| {
@@ -272,6 +369,11 @@ impl AissenceApp {
         // Central panel must be added last.
         egui::CentralPanel::default().show_inside(ui, |ui| self.changes_pane(ui));
 
+        // Keep animating while any commit is being summarized.
+        if !self.in_progress.is_empty() {
+            ui.ctx().request_repaint();
+        }
+
         self.history = Some(history);
     }
 
@@ -283,24 +385,42 @@ impl AissenceApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for (i, group) in history.groups.iter().enumerate() {
+                    let ignored = group
+                        .commit
+                        .as_ref()
+                        .is_some_and(|c| self.store.is_ignored(&c.id));
+                    let summarized = group.summary.is_some();
+
                     let (headline, sub) = match &group.commit {
-                        Some(commit) => (
-                            commit.summary.clone(),
-                            format!("{}  ·  {} msg", commit.short_id, group.messages.len()),
-                        ),
+                        Some(commit) => {
+                            let mut sub =
+                                format!("{}  ·  {} msg", commit.short_id, group.messages.len());
+                            if ignored {
+                                sub.push_str("  ·  ignored");
+                            } else if summarized {
+                                sub.push_str("  ·  ✓");
+                            }
+                            (commit.summary.clone(), sub)
+                        }
                         None => (
                             "Uncommitted work".to_string(),
                             format!("pending  ·  {} msg", group.messages.len()),
                         ),
                     };
 
+                    // Ignored commits render in a faded (disabled) color.
+                    let headline_color = if ignored {
+                        DISABLED
+                    } else {
+                        ui.visuals().text_color()
+                    };
                     let selected = self.selected_group == Some(i);
                     let mut job = egui::text::LayoutJob::default();
                     job.append(
                         &headline,
                         0.0,
                         egui::TextFormat {
-                            color: ui.visuals().text_color(),
+                            color: headline_color,
                             ..Default::default()
                         },
                     );
@@ -308,7 +428,7 @@ impl AissenceApp {
                         &format!("\n{sub}"),
                         0.0,
                         egui::TextFormat {
-                            color: DIM,
+                            color: if ignored { DISABLED } else { DIM },
                             font_id: egui::FontId::proportional(11.0),
                             ..Default::default()
                         },
@@ -335,6 +455,11 @@ impl AissenceApp {
         let Some(group) = history.groups.get(group_idx) else {
             return;
         };
+        let ignored = group
+            .commit
+            .as_ref()
+            .is_some_and(|c| self.store.is_ignored(&c.id));
+        let busy = self.in_progress.contains(&group_idx);
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -356,8 +481,43 @@ impl AissenceApp {
                     });
                 }
 
+                // Action row: Summarize / Ignore (or a spinner while running).
+                ui.add_space(6.0);
+                if busy {
+                    ui.horizontal(|ui| {
+                        ui.add(Spinner::new().size(18.0));
+                        ui.label("Summarizing…");
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        let can_summarize = self.summarizer.is_some() && !group.messages.is_empty();
+                        let label = if group.summary.is_some() {
+                            "Re-summarize"
+                        } else {
+                            "Summarize"
+                        };
+                        let summarize =
+                            ui.add_enabled(can_summarize, Button::new(label).accent(Accent::Blue));
+                        if summarize.clicked() {
+                            self.start_summarize(group_idx, group, ui.ctx().clone());
+                        }
+                        if self.summarizer.is_none() {
+                            summarize.on_disabled_hover_text("Set OPENROUTER_API_KEY");
+                        }
+                        if group.commit.is_some() {
+                            let ignore_label = if ignored { "Un-ignore" } else { "Ignore" };
+                            if ui
+                                .add(Button::new(ignore_label).accent(Accent::Amber))
+                                .clicked()
+                            {
+                                self.set_commit_ignored(group, !ignored);
+                            }
+                        }
+                    });
+                }
+
                 // "All changes" selector → whole-commit diff on the right.
-                ui.add_space(4.0);
+                ui.add_space(6.0);
                 if ui
                     .selectable_label(self.selected_message.is_none(), "📦  All changes in this commit")
                     .clicked()
@@ -366,18 +526,30 @@ impl AissenceApp {
                 }
                 ui.separator();
 
-                match &group.summary {
-                    Some(summary) => {
-                        if summary.messages.is_empty() {
-                            ui.label(
-                                egui::RichText::new("No conversation summarized.").color(DIM),
-                            );
-                        }
-                        for (i, message) in summary.messages.iter().enumerate() {
-                            self.message_row(ui, i, message);
-                        }
+                if ignored {
+                    ui.label(
+                        egui::RichText::new(
+                            "Ignored — not summarized. Click Summarize to include it.",
+                        )
+                        .italics()
+                        .color(DISABLED),
+                    );
+                } else if let Some(summary) = &group.summary {
+                    if summary.messages.is_empty() {
+                        ui.label(egui::RichText::new("No conversation summarized.").color(DIM));
                     }
-                    None => raw_messages(ui, group),
+                    for (i, message) in summary.messages.iter().enumerate() {
+                        self.message_row(ui, i, message);
+                    }
+                } else {
+                    ui.label(
+                        egui::RichText::new(
+                            "Not summarized yet — click Summarize, or browse the raw messages below.",
+                        )
+                        .color(DIM),
+                    );
+                    ui.add_space(4.0);
+                    raw_messages(ui, group);
                 }
             });
     }
@@ -438,13 +610,8 @@ fn join_diffs<'a>(diffs: impl Iterator<Item = &'a str>) -> String {
     diffs.collect::<Vec<_>>().join("\n")
 }
 
-/// Fallback message list when no LLM summary is available (e.g. no API key).
-fn raw_messages(ui: &mut egui::Ui, group: &aissence::CommitGroup) {
-    ui.label(
-        egui::RichText::new("No AI summary — showing raw messages.")
-            .italics()
-            .color(DIM),
-    );
+/// Raw message preview (role + first line), shown before a commit is summarized.
+fn raw_messages(ui: &mut egui::Ui, group: &CommitGroup) {
     for message in &group.messages {
         let (color, who) = match message.role {
             aissence::ncs::Role::User => (USER_COLOR, "user"),
@@ -465,7 +632,7 @@ fn raw_messages(ui: &mut egui::Ui, group: &aissence::CommitGroup) {
     }
 }
 
-fn show_loading(ui: &mut egui::Ui, message: &str, fraction: Option<f32>) {
+fn show_loading(ui: &mut egui::Ui, message: &str) {
     ui.add_space(120.0);
     ui.vertical_centered(|ui| {
         ui.add(Spinner::new().size(40.0));
@@ -473,15 +640,6 @@ fn show_loading(ui: &mut egui::Ui, message: &str, fraction: Option<f32>) {
         ui.heading("Preparing your sessions");
         ui.add_space(6.0);
         ui.label(egui::RichText::new(message).color(DIM));
-        if let Some(fraction) = fraction {
-            ui.add_space(12.0);
-            ui.add(
-                ProgressBar::new(fraction.clamp(0.0, 1.0))
-                    .desired_width(320.0)
-                    .accent(Accent::Blue)
-                    .text(format!("{:.0}%", fraction * 100.0)),
-            );
-        }
     });
 }
 
@@ -494,103 +652,17 @@ fn show_failed(ui: &mut egui::Ui, error: &str) {
         .show(ui, |_| {});
 }
 
-/// The background pipeline: analyze, then summarize each commit with progress.
+/// Background step: parse the folder's sessions + commits. Summarization is
+/// kicked off on demand from the UI; cached summaries are applied in `on_ready`.
 async fn load(folder: PathBuf, phase: Arc<Mutex<Phase>>, ctx: egui::Context) {
-    let set = |phase: &Mutex<Phase>, p: Phase| *phase.lock().unwrap() = p;
-
-    set(
-        &phase,
-        Phase::Loading {
-            message: "Parsing sessions and commits…".to_string(),
-            fraction: None,
-        },
-    );
+    *phase.lock().unwrap() = Phase::Loading("Parsing sessions and commits…".to_string());
     ctx.request_repaint();
 
-    let folder_for_analyze = folder.clone();
-    let analyzed = tokio::task::spawn_blocking(move || analyze(&folder_for_analyze)).await;
-    let mut history = match analyzed {
-        Ok(Ok(history)) => history,
-        Ok(Err(err)) => {
-            set(&phase, Phase::Failed(format!("Analysis failed: {err}")));
-            ctx.request_repaint();
-            return;
-        }
-        Err(err) => {
-            set(&phase, Phase::Failed(format!("Worker crashed: {err}")));
-            ctx.request_repaint();
-            return;
-        }
+    let analyzed = tokio::task::spawn_blocking(move || analyze(&folder)).await;
+    *phase.lock().unwrap() = match analyzed {
+        Ok(Ok(history)) => Phase::Ready(history),
+        Ok(Err(err)) => Phase::Failed(format!("Analysis failed: {err}")),
+        Err(err) => Phase::Failed(format!("Worker crashed: {err}")),
     };
-
-    // Resume: apply any summaries cached in `<folder>/.aissence`. This works
-    // even without an API key, so prior runs' work is shown immediately.
-    let mut store = SummaryStore::load(&folder);
-    for group in history.groups.iter_mut() {
-        let Some(commit_id) = group.commit.as_ref().map(|c| c.id.clone()) else {
-            continue; // never cache the live (uncommitted) group
-        };
-        let signature = aissence::persist::signature(group);
-        if let Some(cached) = store.get(&commit_id, signature) {
-            group.summary = Some(cached.clone());
-        }
-    }
-
-    let mut notice = None;
-    match Summarizer::from_env() {
-        Ok(summarizer) => {
-            // Commits still needing a summary (skip empty + already-cached).
-            let pending: Vec<usize> = history
-                .groups
-                .iter()
-                .enumerate()
-                .filter(|(_, g)| !g.messages.is_empty() && g.summary.is_none())
-                .map(|(i, _)| i)
-                .collect();
-            let already = history
-                .groups
-                .iter()
-                .filter(|g| !g.messages.is_empty() && g.summary.is_some())
-                .count();
-            let total = (pending.len() + already).max(1);
-
-            for (offset, &idx) in pending.iter().enumerate() {
-                let done = already + offset;
-                set(
-                    &phase,
-                    Phase::Loading {
-                        message: format!("Summarizing commit {}/{} …", done + 1, total),
-                        fraction: Some(done as f32 / total as f32),
-                    },
-                );
-                ctx.request_repaint();
-
-                match summarizer.summarize_group(&history.groups[idx]).await {
-                    Ok(summary) => {
-                        history.groups[idx].summary = Some(summary.clone());
-                        // Persist immediately so a quit resumes from here.
-                        if let Some(commit_id) =
-                            history.groups[idx].commit.as_ref().map(|c| c.id.clone())
-                        {
-                            let signature = aissence::persist::signature(&history.groups[idx]);
-                            if let Err(err) = store.insert_and_save(&commit_id, signature, summary) {
-                                notice = Some(format!("Could not write .aissence cache: {err}"));
-                            }
-                        }
-                    }
-                    Err(err) => notice = Some(format!("Some summaries failed: {err}")),
-                }
-            }
-        }
-        Err(err) => {
-            notice = Some(if store.is_empty() {
-                format!("AI summaries unavailable ({err}). Showing commits and diffs only.")
-            } else {
-                format!("AI summaries unavailable ({err}); showing cached summaries.")
-            });
-        }
-    }
-
-    *phase.lock().unwrap() = Phase::Ready { history, notice };
     ctx.request_repaint();
 }

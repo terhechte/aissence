@@ -10,7 +10,7 @@
 //! The cache is written atomically (temp file + rename) after every summary, so
 //! quitting mid-run loses at most the in-flight commit.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
@@ -34,12 +34,17 @@ struct CacheFile {
     version: u32,
     /// Keyed by full commit hex id.
     commits: BTreeMap<String, CacheEntry>,
+    /// Commit ids the user has chosen not to summarize.
+    #[serde(default)]
+    ignored: BTreeSet<String>,
 }
 
-/// In-memory + on-disk store of commit summaries for one folder.
+/// In-memory + on-disk store of commit summaries (and ignore flags) for one
+/// folder.
 pub struct SummaryStore {
     path: PathBuf,
     commits: BTreeMap<String, CacheEntry>,
+    ignored: BTreeSet<String>,
 }
 
 impl SummaryStore {
@@ -47,13 +52,32 @@ impl SummaryStore {
     /// missing, unreadable, corrupt, or written by a different version.
     pub fn load(folder: &Path) -> Self {
         let path = folder.join(CACHE_FILE);
-        let commits = std::fs::read_to_string(&path)
+        let (commits, ignored) = std::fs::read_to_string(&path)
             .ok()
             .and_then(|text| serde_json::from_str::<CacheFile>(&text).ok())
             .filter(|cache| cache.version == VERSION)
-            .map(|cache| cache.commits)
+            .map(|cache| (cache.commits, cache.ignored))
             .unwrap_or_default();
-        Self { path, commits }
+        Self {
+            path,
+            commits,
+            ignored,
+        }
+    }
+
+    /// Whether the user marked `commit_id` as ignored.
+    pub fn is_ignored(&self, commit_id: &str) -> bool {
+        self.ignored.contains(commit_id)
+    }
+
+    /// Mark `commit_id` ignored (or not) and persist.
+    pub fn set_ignored(&mut self, commit_id: &str, ignored: bool) -> std::io::Result<()> {
+        if ignored {
+            self.ignored.insert(commit_id.to_string());
+        } else {
+            self.ignored.remove(commit_id);
+        }
+        self.save()
     }
 
     /// Number of cached commit summaries.
@@ -92,6 +116,7 @@ impl SummaryStore {
         let file = CacheFile {
             version: VERSION,
             commits: self.commits.clone(),
+            ignored: self.ignored.clone(),
         };
         let json = serde_json::to_string_pretty(&file).map_err(std::io::Error::other)?;
         let tmp = self.path.with_file_name(format!("{CACHE_FILE}.tmp"));
@@ -171,6 +196,22 @@ mod tests {
         assert!(store.get("abc123", 99).is_none());
         assert!(store.get("missing", 42).is_none());
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ignore_flag_persists_and_toggles() {
+        let dir = tmp_dir("ignore");
+        {
+            let mut store = SummaryStore::load(&dir);
+            store.set_ignored("deadbeef", true).unwrap();
+        }
+        assert!(SummaryStore::load(&dir).is_ignored("deadbeef"));
+        {
+            let mut store = SummaryStore::load(&dir);
+            store.set_ignored("deadbeef", false).unwrap();
+        }
+        assert!(!SummaryStore::load(&dir).is_ignored("deadbeef"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
