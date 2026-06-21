@@ -41,8 +41,8 @@ use std::path::Path;
 
 pub use error::Error;
 pub use model::{
-    CoalescedHistory, CodeChange, CommitGroup, CommitInfo, CommitSummary, MessageKind,
-    MessageSummary, TimedMessage,
+    AgentUsage, CoalescedHistory, CodeChange, CommitGroup, CommitInfo, CommitSummary, MessageKind,
+    MessageSummary, TimedMessage, agents_for, friendly_agent,
 };
 pub use persist::SummaryStore;
 pub use summarize::Summarizer;

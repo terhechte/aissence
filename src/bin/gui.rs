@@ -478,6 +478,16 @@ impl AissenceApp {
                             .color(DIM)
                             .size(11.0),
                         );
+                        // Provenance: which agent(s) + model(s) produced this commit.
+                        let agents = aissence::agents_for(group);
+                        if !agents.is_empty() {
+                            let text = agents
+                                .iter()
+                                .map(|a| a.label())
+                                .collect::<Vec<_>>()
+                                .join(",   ");
+                            ui.label(egui::RichText::new(text).color(USER_COLOR).size(11.0));
+                        }
                     });
                 }
 

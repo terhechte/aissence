@@ -174,6 +174,7 @@ mod tests {
                 changes: vec![],
                 timestamp: None,
             }],
+            agents: vec![],
         }
     }
 

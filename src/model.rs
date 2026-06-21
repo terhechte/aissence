@@ -38,9 +38,13 @@ pub struct TimedMessage {
     pub content: Vec<ncs::ContentBlock>,
     /// Session identifier this message belongs to (format-specific).
     pub session_id: Option<String>,
-    /// Provider that produced the session (e.g. `anthropic`, `openai`, `google`).
+    /// LLM provider that produced the session (e.g. `anthropic`, `openai`).
     pub provider: Option<String>,
+    /// Model id reported by the session (e.g. `claude-opus-4-8`), if known.
     pub model: Option<String>,
+    /// Friendly coding-agent name (e.g. `Claude Code`, `Codex`, `Gemini`),
+    /// derived from the session format. See [`friendly_agent`].
+    pub agent: Option<String>,
     /// Path of the session log file this message was read from.
     pub session_path: PathBuf,
 }
@@ -107,6 +111,56 @@ impl MessageKind {
     }
 }
 
+/// The coding agent + model used in a session — a commit's "provenance".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentUsage {
+    /// Friendly agent name: `Claude Code`, `Codex`, `Gemini`.
+    pub provider: String,
+    /// Model id reported by the session (e.g. `claude-opus-4-8`), if known.
+    pub model: Option<String>,
+}
+
+impl AgentUsage {
+    /// `"Claude Code · claude-opus-4-8"` (or just the provider if no model).
+    pub fn label(&self) -> String {
+        match &self.model {
+            Some(model) => format!("{} · {}", self.provider, model),
+            None => self.provider.clone(),
+        }
+    }
+}
+
+/// Map a `normalize-chat-sessions` format id to a friendly agent name.
+pub fn friendly_agent(format: &str) -> String {
+    match format {
+        "claude" => "Claude Code",
+        "codex" => "Codex",
+        "gemini" => "Gemini",
+        "normalize" => "Normalize",
+        other => other,
+    }
+    .to_string()
+}
+
+/// The distinct (agent, model) pairs used across a commit group's messages, in
+/// first-seen order.
+pub fn agents_for(group: &CommitGroup) -> Vec<AgentUsage> {
+    let mut usages: Vec<AgentUsage> = Vec::new();
+    for message in &group.messages {
+        let usage = AgentUsage {
+            provider: message
+                .agent
+                .clone()
+                .unwrap_or_else(|| "Unknown".to_string()),
+            model: message.model.clone(),
+        };
+        if !usages.contains(&usage) {
+            usages.push(usage);
+        }
+    }
+    usages
+}
+
 /// A single code edit the assistant made, rendered as a unified diff so it can
 /// be shown in [`crate::DiffView`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,6 +201,9 @@ pub struct CommitSummary {
     pub ai_implemented: String,
     /// Per-message summaries, in chronological order.
     pub messages: Vec<MessageSummary>,
+    /// Coding agent(s) + model(s) that produced this commit's sessions.
+    #[serde(default)]
+    pub agents: Vec<AgentUsage>,
 }
 
 /// A commit together with the chat messages that led up to it.

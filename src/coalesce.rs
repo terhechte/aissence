@@ -84,6 +84,7 @@ fn flatten_messages(sessions: &[ncs::Session]) -> (Vec<TimedMessage>, Vec<TimedM
                     session_id: session.metadata.session_id.clone(),
                     provider: session.metadata.provider.clone(),
                     model: session.metadata.model.clone(),
+                    agent: Some(crate::model::friendly_agent(&session.format)),
                     session_path: session.path.clone(),
                 };
                 if timestamp.is_some() {
@@ -204,6 +205,18 @@ mod tests {
         assert_eq!(history.groups.len(), 1);
         assert!(history.groups[0].is_pending());
         assert_eq!(history.message_count(), 1);
+    }
+
+    #[test]
+    fn agents_for_collects_provider_and_model() {
+        let mut session = session_with(vec![user_msg("hi", Some("2026-01-01T09:00:00Z"))]);
+        session.metadata.model = Some("model-x".into());
+        let history = coalesce(PathBuf::from("/proj"), vec![], &[session], vec![]);
+
+        let agents = crate::model::agents_for(&history.groups[0]);
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].provider, "test"); // friendly_agent passes unknown ids through
+        assert_eq!(agents[0].model.as_deref(), Some("model-x"));
     }
 
     #[test]

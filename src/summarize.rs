@@ -149,6 +149,7 @@ impl Summarizer {
             ai_answered,
             ai_implemented,
             messages,
+            agents: crate::model::agents_for(group),
         })
     }
 
