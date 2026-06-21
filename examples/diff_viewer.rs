@@ -62,15 +62,15 @@ impl DiffApp {
 }
 
 impl eframe::App for DiffApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.set_visuals(egui::Visuals::dark());
-        egui::TopBottomPanel::top("title").show(ctx, |ui| {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        ui.ctx().set_visuals(egui::Visuals::dark());
+        egui::Panel::top("title").show_inside(ui, |ui| {
             ui.add_space(4.0);
             ui.heading("aissence — diff viewer");
             ui.label(egui::RichText::new(&self.title).weak());
             ui.add_space(4.0);
         });
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             DiffView::from_patch(&self.patch).show(ui);
         });
     }

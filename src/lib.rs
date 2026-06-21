@@ -32,6 +32,7 @@ pub mod error;
 pub mod git;
 pub mod highlight;
 pub mod model;
+pub mod persist;
 pub mod sessions;
 pub mod summarize;
 pub mod ui;
@@ -39,7 +40,11 @@ pub mod ui;
 use std::path::Path;
 
 pub use error::Error;
-pub use model::{CoalescedHistory, CommitGroup, CommitInfo, CommitSummary, TimedMessage};
+pub use model::{
+    CoalescedHistory, CodeChange, CommitGroup, CommitInfo, CommitSummary, MessageKind,
+    MessageSummary, TimedMessage,
+};
+pub use persist::SummaryStore;
 pub use summarize::Summarizer;
 pub use ui::{CodeView, DiffView};
 

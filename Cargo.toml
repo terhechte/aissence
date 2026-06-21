@@ -7,9 +7,15 @@ edition = "2024"
 name = "aissence"
 path = "src/lib.rs"
 
+# CLI demo (text output).
 [[bin]]
 name = "aissence"
 path = "src/main.rs"
+
+# The egui desktop app (3-pane commit / message / diff browser).
+[[bin]]
+name = "aissence-gui"
+path = "src/bin/gui.rs"
 
 [dependencies]
 # Unified parsing of Claude Code / Codex / Gemini session logs into one model.
@@ -17,22 +23,28 @@ normalize-chat-sessions = "0.3.2"
 # Pure-Rust git access. Pinned to ^0.81 to unify with normalize-chat-sessions'
 # own gix dependency (avoids compiling two different gix versions).
 gix = "0.81"
-# Immediate-mode GUI. Version matches VikerKit (0.31) for the highlighted
-# code/diff widgets in `ui`.
-egui = "0.31"
+# Immediate-mode GUI. 0.34 to match egui-elegance ^0.34.
+egui = "0.34"
+# Native window shell for the app + examples.
+eframe = "0.34"
+# Opinionated egui widgets + paired dark/light themes.
+egui-elegance = "0.13"
+# Native folder-picker dialog (used when no --folder is given).
+rfd = "0.15"
 # Syntax highlighting backend. `default-fancy` selects the pure-Rust fancy-regex
 # engine (no Oniguruma/C dependency). The scope→color theme mapping is vendored
 # from VikerKit (MIT). See `src/highlight/`.
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 # Timestamp parsing/comparison shared between git commit times and chat messages.
-chrono = "0.4"
+# `serde` feature: serialize message timestamps into the `.aissence` cache.
+chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
+# Serialize cached summaries (the `.aissence` file) + inspect tool-call inputs
+# (the `ncs::ContentBlock::ToolUse` payload is a serde_json::Value).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 # LLM summarization of conversations + code changes via OpenRouter.
 openrouter-rs = "0.10"
 # Async runtime + concurrency for the (async) summarization layer.
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 futures = "0.3"
-
-[dev-dependencies]
-# Window shell for the `diff_viewer` example (egui native runner).
-eframe = "0.31"

@@ -30,7 +30,10 @@ use openrouter_rs::types::Role as OrRole;
 use openrouter_rs::OpenRouterClient;
 
 use crate::error::Error;
-use crate::model::{CoalescedHistory, CommitGroup, CommitSummary, TimedMessage};
+use crate::model::{
+    CoalescedHistory, CodeChange, CommitGroup, CommitSummary, MessageKind, MessageSummary,
+    TimedMessage,
+};
 use crate::ncs;
 
 /// Environment variable holding the OpenRouter API key.
@@ -97,57 +100,82 @@ impl Summarizer {
         Ok(())
     }
 
-    /// Summarize a single commit group into its three-part [`CommitSummary`].
+    /// Summarize a single commit group: a per-message breakdown plus the three
+    /// aggregated overviews.
     pub async fn summarize_group(&self, group: &CommitGroup) -> Result<CommitSummary, Error> {
-        let items = GroupItems::from_group(group);
+        let items = raw_items(group);
         let commit_context = group
             .commit
             .as_ref()
             .map(|c| c.summary.clone())
             .unwrap_or_else(|| "(uncommitted work in progress)".to_string());
 
+        // Stage 1 (map): summarize every message, concurrently.
+        let per_item = self.map_raw_items(&items).await?;
+
+        // Per-message breakdown (drives the app's middle pane).
+        let messages: Vec<MessageSummary> = items
+            .into_iter()
+            .zip(per_item)
+            .map(|(item, summary)| MessageSummary {
+                kind: item.kind,
+                summary,
+                changes: item.changes,
+                timestamp: item.timestamp,
+            })
+            .collect();
+
+        // Stage 2 (reduce): aggregate each category from its message summaries.
+        let by_kind = |kind: MessageKind| -> Vec<String> {
+            messages
+                .iter()
+                .filter(|m| m.kind == kind)
+                .map(|m| m.summary.clone())
+                .collect()
+        };
+        let user = by_kind(MessageKind::UserWrote);
+        let answered = by_kind(MessageKind::AiWrote);
+        let changed = by_kind(MessageKind::AiChanged);
+
         // The three categories are independent — run them concurrently.
         let (user_requested, ai_answered, ai_implemented) = futures::try_join!(
-            self.summarize_category(&items.user, Category::User, &commit_context),
-            self.summarize_category(&items.responses, Category::Response, &commit_context),
-            self.summarize_category(&items.changes, Category::Change, &commit_context),
+            self.reduce_items(&user, Category::User, &commit_context),
+            self.reduce_items(&answered, Category::Response, &commit_context),
+            self.reduce_items(&changed, Category::Change, &commit_context),
         )?;
 
         Ok(CommitSummary {
             user_requested,
             ai_answered,
             ai_implemented,
+            messages,
         })
     }
 
-    /// Map-reduce one category of items into a single 3-5 sentence summary.
-    async fn summarize_category(
-        &self,
-        items: &[String],
-        category: Category,
-        commit_context: &str,
-    ) -> Result<String, Error> {
-        if items.is_empty() {
-            return Ok(String::new());
+    /// Stage 1: summarize each message, concurrently and order-preserving.
+    /// Messages shorter than [`Self::passthrough_chars`] are used verbatim.
+    async fn map_raw_items(&self, items: &[RawItem]) -> Result<Vec<String>, Error> {
+        // Build the futures in a plain loop (not `.map`) so each one captures
+        // owned data and a uniform `&self` borrow — avoids the higher-ranked
+        // closure-lifetime bound that breaks `tokio::spawn`'s `Send + 'static`.
+        let mut jobs = Vec::with_capacity(items.len());
+        for item in items {
+            let kind = item.kind;
+            let text = item.text.clone();
+            jobs.push(async move {
+                if text.chars().count() <= self.passthrough_chars {
+                    return Ok::<String, Error>(text);
+                }
+                let category = Category::for_kind(kind);
+                let truncated = truncate_chars(&text, self.item_char_budget);
+                self.complete(category.item_system(), category.item_user(&truncated))
+                    .await
+            });
         }
-        let per_item = self.map_items(items, category).await?;
-        self.reduce_items(&per_item, category, commit_context).await
-    }
-
-    /// Stage 1: summarize each item, concurrently and order-preserving. Items
-    /// shorter than [`Self::passthrough_chars`] are returned verbatim.
-    async fn map_items(&self, items: &[String], category: Category) -> Result<Vec<String>, Error> {
-        let results: Vec<Result<String, Error>> = stream::iter(items.iter().map(|item| async move {
-            if item.chars().count() <= self.passthrough_chars {
-                return Ok(item.clone());
-            }
-            let truncated = truncate_chars(item, self.item_char_budget);
-            self.complete(category.item_system(), category.item_user(&truncated))
-                .await
-        }))
-        .buffered(self.max_concurrency)
-        .collect()
-        .await;
+        let results: Vec<Result<String, Error>> = stream::iter(jobs)
+            .buffered(self.max_concurrency)
+            .collect()
+            .await;
         results.into_iter().collect()
     }
 
@@ -212,65 +240,162 @@ impl Summarizer {
     }
 }
 
-/// The items of a commit group, bucketed by category.
-struct GroupItems {
-    user: Vec<String>,
-    responses: Vec<String>,
-    changes: Vec<String>,
+/// One message turned into a unit of summarization.
+struct RawItem {
+    kind: MessageKind,
+    /// Text fed to the model (message text, or a rendering of the edits).
+    text: String,
+    /// Code changes — only for [`MessageKind::AiChanged`].
+    changes: Vec<CodeChange>,
+    timestamp: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-impl GroupItems {
-    fn from_group(group: &CommitGroup) -> Self {
-        let mut user = Vec::new();
-        let mut responses = Vec::new();
-        let mut changes = Vec::new();
-
-        for message in &group.messages {
-            match message.role {
-                ncs::Role::User => push_nonempty(&mut user, message.text()),
-                ncs::Role::Assistant => {
-                    push_nonempty(&mut responses, message.text());
-                    changes.extend(change_items(message));
+/// Split a commit group into ordered per-message [`RawItem`]s. A single
+/// assistant message can yield both an `AiWrote` (its text) and an `AiChanged`
+/// (its edits) item.
+fn raw_items(group: &CommitGroup) -> Vec<RawItem> {
+    let mut items = Vec::new();
+    for message in &group.messages {
+        match message.role {
+            ncs::Role::User => {
+                let text = message.text();
+                if !text.trim().is_empty() {
+                    items.push(RawItem {
+                        kind: MessageKind::UserWrote,
+                        text,
+                        changes: Vec::new(),
+                        timestamp: message.timestamp,
+                    });
                 }
-                // Tool results and system notices aren't user intent, the
-                // assistant's answer, or a code change — skip them.
-                ncs::Role::Tool | ncs::Role::System => {}
             }
-        }
-
-        Self {
-            user,
-            responses,
-            changes,
+            ncs::Role::Assistant => {
+                let text = message.text();
+                if !text.trim().is_empty() {
+                    items.push(RawItem {
+                        kind: MessageKind::AiWrote,
+                        text,
+                        changes: Vec::new(),
+                        timestamp: message.timestamp,
+                    });
+                }
+                let changes = code_changes(message);
+                if !changes.is_empty() {
+                    items.push(RawItem {
+                        kind: MessageKind::AiChanged,
+                        text: render_changes(&changes),
+                        changes,
+                        timestamp: message.timestamp,
+                    });
+                }
+            }
+            // Tool results and system notices aren't user intent, the
+            // assistant's answer, or a code change — skip them.
+            ncs::Role::Tool | ncs::Role::System => {}
         }
     }
+    items
 }
 
-fn push_nonempty(into: &mut Vec<String>, value: String) {
-    if !value.trim().is_empty() {
-        into.push(value);
-    }
-}
-
-/// Render each file-editing tool call in `message` as a text item.
-fn change_items(message: &TimedMessage) -> Vec<String> {
+/// Extract the file-editing tool calls of `message` as [`CodeChange`]s.
+fn code_changes(message: &TimedMessage) -> Vec<CodeChange> {
     message
         .content
         .iter()
         .filter_map(|block| match block {
             ncs::ContentBlock::ToolUse { name, input, .. } if is_edit_tool(name) => {
-                let file = input
-                    .get("file_path")
-                    .or_else(|| input.get("path"))
-                    .or_else(|| input.get("filename"))
-                    .or_else(|| input.get("file"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("(unknown file)");
-                Some(format!("Tool `{name}` on `{file}`:\n{}", input))
+                Some(code_change(name, input))
             }
             _ => None,
         })
         .collect()
+}
+
+/// Build a [`CodeChange`] (with a synthesized unified diff) from one tool call.
+fn code_change(name: &str, input: &serde_json::Value) -> CodeChange {
+    let file = input
+        .get("file_path")
+        .or_else(|| input.get("path"))
+        .or_else(|| input.get("filename"))
+        .or_else(|| input.get("file"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("(unknown file)")
+        .to_string();
+    let diff = synth_diff(&file, input);
+    CodeChange {
+        tool: name.to_string(),
+        file,
+        diff,
+    }
+}
+
+/// Render code changes as text for the model to summarize.
+fn render_changes(changes: &[CodeChange]) -> String {
+    changes
+        .iter()
+        .map(|c| format!("{} `{}`:\n{}", c.tool, c.file, c.diff))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Best-effort unified diff from a tool-call input. Handles `old_string`/
+/// `new_string` (Edit/replace), an `edits` array (MultiEdit), and `content`
+/// (Write — shown as a new file); otherwise dumps any stringy payload as
+/// additions.
+fn synth_diff(file: &str, input: &serde_json::Value) -> String {
+    let s = |key: &str| input.get(key).and_then(|v| v.as_str());
+
+    let old = s("old_string").or_else(|| s("old_str")).or_else(|| s("oldText"));
+    let new = s("new_string").or_else(|| s("new_str")).or_else(|| s("newText"));
+    if let (Some(old), Some(new)) = (old, new) {
+        return diff_old_new(file, old, new);
+    }
+
+    if let Some(edits) = input.get("edits").and_then(|v| v.as_array()) {
+        let mut out = format!("--- a/{file}\n+++ b/{file}\n");
+        for edit in edits {
+            let old = edit.get("old_string").and_then(|v| v.as_str()).unwrap_or("");
+            let new = edit.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
+            out.push_str("@@ @@\n");
+            push_prefixed(&mut out, '-', old);
+            push_prefixed(&mut out, '+', new);
+        }
+        return out;
+    }
+
+    if let Some(content) = s("content").or_else(|| s("contents")) {
+        return added_file(file, content);
+    }
+
+    let dump = s("patch")
+        .or_else(|| s("input"))
+        .map(str::to_string)
+        .unwrap_or_else(|| input.to_string());
+    added_file(file, &dump)
+}
+
+fn diff_old_new(file: &str, old: &str, new: &str) -> String {
+    let oc = old.lines().count().max(1);
+    let nc = new.lines().count().max(1);
+    let mut out = format!("--- a/{file}\n+++ b/{file}\n@@ -1,{oc} +1,{nc} @@\n");
+    push_prefixed(&mut out, '-', old);
+    push_prefixed(&mut out, '+', new);
+    out
+}
+
+fn added_file(file: &str, content: &str) -> String {
+    let nc = content.lines().count().max(1);
+    let mut out = format!("--- /dev/null\n+++ b/{file}\n@@ -0,0 +1,{nc} @@\n");
+    push_prefixed(&mut out, '+', content);
+    out
+}
+
+/// Append each line of `text`, prefixed by the diff `marker`.
+fn push_prefixed(out: &mut String, marker: char, text: &str) {
+    for line in text.lines() {
+        out.push(marker);
+        out.push_str(line);
+        out.push('\n');
+    }
 }
 
 /// Whether a tool name denotes a code/file modification across the supported
@@ -311,6 +436,15 @@ enum Category {
 }
 
 impl Category {
+    /// Map a per-message kind to its prompt category.
+    fn for_kind(kind: MessageKind) -> Self {
+        match kind {
+            MessageKind::UserWrote => Category::User,
+            MessageKind::AiWrote => Category::Response,
+            MessageKind::AiChanged => Category::Change,
+        }
+    }
+
     /// System prompt for the stage-1 per-item summary.
     fn item_system(self) -> &'static str {
         match self {

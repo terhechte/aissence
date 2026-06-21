@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use normalize_chat_sessions as ncs;
+use serde::{Deserialize, Serialize};
 
 /// A single git commit, normalized for correlation with chat messages.
 #[derive(Debug, Clone)]
@@ -85,12 +86,58 @@ impl TimedMessage {
     }
 }
 
-/// LLM-generated, three-part summary of what went into a commit.
+/// What a single summarized message represents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MessageKind {
+    /// A user message ("user wrote …").
+    UserWrote,
+    /// An assistant text reply ("ai wrote …").
+    AiWrote,
+    /// An assistant message that edited code ("ai changed …").
+    AiChanged,
+}
+
+impl MessageKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            MessageKind::UserWrote => "User wrote",
+            MessageKind::AiWrote => "AI wrote",
+            MessageKind::AiChanged => "AI changed",
+        }
+    }
+}
+
+/// A single code edit the assistant made, rendered as a unified diff so it can
+/// be shown in [`crate::DiffView`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeChange {
+    /// Editing tool that produced the change (e.g. `Edit`, `Write`).
+    pub tool: String,
+    /// File the change applies to.
+    pub file: String,
+    /// Synthesized unified-diff text (feed to [`crate::DiffView::from_patch`]).
+    pub diff: String,
+}
+
+/// LLM summary of one message within a commit group, plus — for `AiChanged`
+/// messages — the concrete code changes it made.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageSummary {
+    pub kind: MessageKind,
+    /// 2-3 sentence summary of this message (or the message verbatim if short).
+    pub summary: String,
+    /// Non-empty only for [`MessageKind::AiChanged`].
+    pub changes: Vec<CodeChange>,
+    pub timestamp: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// LLM-generated summary of what went into a commit.
 ///
-/// Produced by the [`crate::summarize::Summarizer`]. Each field is empty when
-/// the commit group has nothing of that kind (e.g. a commit with no captured
-/// code-editing tool calls leaves `ai_implemented` empty).
-#[derive(Debug, Clone, Default)]
+/// Produced by the [`crate::summarize::Summarizer`]. The three top-level fields
+/// are the *aggregated* overview; [`messages`](Self::messages) holds the
+/// per-message breakdown that drives the middle pane of the app. A field is
+/// empty when the commit group has nothing of that kind.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CommitSummary {
     /// 3-5 sentences: what the user asked for across all their messages.
     pub user_requested: String,
@@ -98,6 +145,8 @@ pub struct CommitSummary {
     pub ai_answered: String,
     /// 3-5 sentences: what the assistant implemented in code (file edits).
     pub ai_implemented: String,
+    /// Per-message summaries, in chronological order.
+    pub messages: Vec<MessageSummary>,
 }
 
 /// A commit together with the chat messages that led up to it.
