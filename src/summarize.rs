@@ -381,6 +381,7 @@ fn code_changes(message: &TimedMessage) -> Vec<CodeChange> {
 fn code_change(name: &str, input: &serde_json::Value) -> CodeChange {
     let file = input
         .get("file_path")
+        .or_else(|| input.get("filePath"))
         .or_else(|| input.get("path"))
         .or_else(|| input.get("filename"))
         .or_else(|| input.get("file"))
@@ -411,8 +412,14 @@ fn render_changes(changes: &[CodeChange]) -> String {
 fn synth_diff(file: &str, input: &serde_json::Value) -> String {
     let s = |key: &str| input.get(key).and_then(|v| v.as_str());
 
-    let old = s("old_string").or_else(|| s("old_str")).or_else(|| s("oldText"));
-    let new = s("new_string").or_else(|| s("new_str")).or_else(|| s("newText"));
+    let old = s("old_string")
+        .or_else(|| s("oldString"))
+        .or_else(|| s("old_str"))
+        .or_else(|| s("oldText"));
+    let new = s("new_string")
+        .or_else(|| s("newString"))
+        .or_else(|| s("new_str"))
+        .or_else(|| s("newText"));
     if let (Some(old), Some(new)) = (old, new) {
         return diff_old_new(file, old, new);
     }
@@ -429,7 +436,10 @@ fn synth_diff(file: &str, input: &serde_json::Value) -> String {
         return out;
     }
 
-    if let Some(content) = s("content").or_else(|| s("contents")) {
+    if let Some(content) = s("content")
+        .or_else(|| s("fileContent"))
+        .or_else(|| s("contents"))
+    {
         return added_file(file, content);
     }
 
@@ -618,5 +628,18 @@ mod tests {
         assert_eq!(merged[0].text, "a\n\nb"); // two user messages merged
         assert_eq!(merged[2].text, "d\n\ne\n\nf"); // three "ai changed" merged
         assert_eq!(merged[3].text, "g"); // separated by the other kinds
+    }
+
+    #[test]
+    fn understands_opencode_edit_payload_names() {
+        let input = serde_json::json!({
+            "filePath": "src/lib.rs",
+            "oldString": "old",
+            "newString": "new"
+        });
+        let change = code_change("edit", &input);
+
+        assert_eq!(change.file, "src/lib.rs");
+        assert!(change.diff.contains("-old\n+new"));
     }
 }

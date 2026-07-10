@@ -2,9 +2,11 @@
 //!
 //! Session logs do not live inside the project folder; each agent stores them
 //! in its own external location (e.g. Claude Code under `~/.claude/projects/…`).
-//! [`normalize_chat_sessions::project_metadata_roots`] tells us where every
-//! supported agent keeps its logs — but for some agents (notably Codex) that is
-//! a *single global directory* shared by every project, not a per-project one.
+//! [`normalize_chat_sessions::project_metadata_roots`] tells us where the
+//! file-backed agents keep their logs — but for some agents (notably Codex)
+//! that is a *single global directory* shared by every project, not a
+//! per-project one. OpenCode is loaded separately because current releases use
+//! a SQLite database (legacy releases used a directory of JSON files).
 //!
 //! Worse, the parsed [`ncs::Session`] does not expose the session's working
 //! directory (`metadata.project` is empty in practice), so we cannot scope on
@@ -24,6 +26,8 @@ use std::path::{Path, PathBuf};
 
 use normalize_chat_sessions as ncs;
 
+mod opencode;
+
 /// How many bytes from the start of each candidate file we scan for the folder
 /// path. The working directory is always recorded near the top of a log, so a
 /// modest cap keeps scanning of large, unrelated logs cheap.
@@ -36,8 +40,10 @@ pub struct LoadedSessions {
     pub warnings: Vec<String>,
 }
 
-/// Locate every session log file belonging to `folder`, across all supported
-/// agents (Claude Code, Codex, Gemini, …).
+/// Locate every file-backed session log belonging to `folder`, across the
+/// formats supported by `normalize-chat-sessions` (Claude Code, Codex, Gemini,
+/// …). OpenCode's SQLite/legacy-JSON stores are handled directly by
+/// [`load_sessions`].
 ///
 /// Returns absolute paths to candidate `.jsonl` / `.json` session files. The
 /// list is de-duplicated and sorted for deterministic output.
@@ -95,6 +101,10 @@ pub fn load_sessions(folder: &Path) -> LoadedSessions {
             Err(err) => warnings.push(format!("{}: {err}", file.display())),
         }
     }
+
+    let loaded_opencode = opencode::load_sessions(folder);
+    sessions.extend(loaded_opencode.sessions);
+    warnings.extend(loaded_opencode.warnings);
 
     LoadedSessions { sessions, warnings }
 }

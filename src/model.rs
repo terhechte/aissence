@@ -42,7 +42,7 @@ pub struct TimedMessage {
     pub provider: Option<String>,
     /// Model id reported by the session (e.g. `claude-opus-4-8`), if known.
     pub model: Option<String>,
-    /// Friendly coding-agent name (e.g. `Claude Code`, `Codex`, `Gemini`),
+    /// Friendly coding-agent name (e.g. `Claude Code`, `Codex`, `OpenCode`),
     /// derived from the session format. See [`friendly_agent`].
     pub agent: Option<String>,
     /// Path of the session log file this message was read from.
@@ -114,7 +114,7 @@ impl MessageKind {
 /// The coding agent + model used in a session — a commit's "provenance".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentUsage {
-    /// Friendly agent name: `Claude Code`, `Codex`, `Gemini`.
+    /// Friendly agent name: `Claude Code`, `Codex`, `OpenCode`, `Gemini`.
     pub provider: String,
     /// Model id reported by the session (e.g. `claude-opus-4-8`), if known.
     pub model: Option<String>,
@@ -135,6 +135,7 @@ pub fn friendly_agent(format: &str) -> String {
     match format {
         "claude" => "Claude Code",
         "codex" => "Codex",
+        "opencode" => "OpenCode",
         "gemini" => "Gemini",
         "normalize" => "Normalize",
         other => other,

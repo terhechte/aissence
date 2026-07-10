@@ -1,6 +1,7 @@
 //! # aissence
 //!
-//! Correlate the chat history of AI coding agents (Claude Code, Codex, Gemini)
+//! Correlate the chat history of AI coding agents (Claude Code, Codex,
+//! OpenCode, Gemini)
 //! with the git commits of a project, so you can see — for each commit — the
 //! conversation that led up to it.
 //!
