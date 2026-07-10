@@ -204,6 +204,11 @@ pub struct CommitSummary {
     /// Coding agent(s) + model(s) that produced this commit's sessions.
     #[serde(default)]
     pub agents: Vec<AgentUsage>,
+    /// A single cohesive overview (up to ~20 sentences) synthesizing what the
+    /// user wanted, what the AI implemented, and any important caveats. Built
+    /// last, from the three fields above.
+    #[serde(default)]
+    pub meta: String,
 }
 
 /// A commit together with the chat messages that led up to it.

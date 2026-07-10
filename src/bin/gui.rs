@@ -14,7 +14,7 @@
 //!
 //! Generated summaries and ignore flags persist to `<folder>/.aissence`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -32,6 +32,10 @@ const AI_COLOR: egui::Color32 = egui::Color32::from_rgb(152, 195, 121); // green
 const CHANGE_COLOR: egui::Color32 = egui::Color32::from_rgb(229, 192, 123); // yellow
 const DIM: egui::Color32 = egui::Color32::from_gray(140);
 const DISABLED: egui::Color32 = egui::Color32::from_gray(90); // faded / ignored
+
+/// How many commits "Summarize all" works on at once (each one also fans out
+/// internally), to avoid flooding the API with requests.
+const MAX_CONCURRENT_SUMMARIES: usize = 4;
 
 fn main() -> eframe::Result {
     let folder = match folder_from_args() {
@@ -116,6 +120,8 @@ struct AissenceApp {
 
     // On-demand summarization.
     in_progress: HashSet<usize>,
+    /// Group indices queued by "Summarize all", pumped with bounded concurrency.
+    queue: VecDeque<usize>,
     results_tx: Sender<SummarizeResult>,
     results_rx: Receiver<SummarizeResult>,
 }
@@ -155,6 +161,7 @@ impl AissenceApp {
             last_selection: (None, None),
             patch_cache: HashMap::new(),
             in_progress: HashSet::new(),
+            queue: VecDeque::new(),
             results_tx,
             results_rx,
         }
@@ -243,6 +250,43 @@ impl AissenceApp {
             && let Err(err) = self.store.set_ignored(&commit.id, ignored)
         {
             self.notice = Some(format!("Could not write .aissence: {err}"));
+        }
+    }
+
+    /// Whether group `idx` can be summarized now: it has messages, isn't already
+    /// summarized or running, and isn't ignored.
+    fn is_summarizable(&self, idx: usize, group: &CommitGroup) -> bool {
+        !group.messages.is_empty()
+            && group.summary.is_none()
+            && !self.in_progress.contains(&idx)
+            && group
+                .commit
+                .as_ref()
+                .is_none_or(|c| !self.store.is_ignored(&c.id))
+    }
+
+    /// Groups "Summarize all" would still enqueue (summarizable + not queued).
+    fn pending_for_all(&self, history: &CoalescedHistory) -> Vec<usize> {
+        history
+            .groups
+            .iter()
+            .enumerate()
+            .filter(|(i, g)| self.is_summarizable(*i, g) && !self.queue.contains(i))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Start summarizing queued commits, up to [`MAX_CONCURRENT_SUMMARIES`].
+    fn pump_queue(&mut self, history: &CoalescedHistory, ctx: &egui::Context) {
+        while self.in_progress.len() < MAX_CONCURRENT_SUMMARIES {
+            let Some(idx) = self.queue.pop_front() else {
+                break;
+            };
+            if let Some(group) = history.groups.get(idx)
+                && self.is_summarizable(idx, group)
+            {
+                self.start_summarize(idx, group, ctx.clone());
+            }
         }
     }
 
@@ -335,9 +379,11 @@ impl eframe::App for AissenceApp {
 
 impl AissenceApp {
     fn show_main(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
         // Own the history for the frame so we can freely mutate selection state.
         let mut history = self.history.take().expect("history present");
         self.drain_results(&mut history);
+        self.pump_queue(&history, &ctx);
         self.refresh_patch(&history);
 
         egui::Panel::top("topbar").show_inside(ui, |ui| {
@@ -345,6 +391,29 @@ impl AissenceApp {
             ui.horizontal(|ui| {
                 ui.heading("aissence");
                 ui.label(egui::RichText::new(self.folder.display().to_string()).color(DIM));
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let pending = self.pending_for_all(&history);
+                    let enabled = self.summarizer.is_some() && !pending.is_empty();
+                    let button = ui.add_enabled(
+                        enabled,
+                        Button::new(format!("Summarize all ({})", pending.len()))
+                            .accent(Accent::Blue),
+                    );
+                    if button.clicked() {
+                        self.queue.extend(pending);
+                    }
+                    if self.summarizer.is_none() {
+                        button.on_disabled_hover_text("Set OPENROUTER_API_KEY");
+                    }
+                    let outstanding = self.queue.len() + self.in_progress.len();
+                    if outstanding > 0 {
+                        ui.add(Spinner::new().size(16.0));
+                        ui.label(
+                            egui::RichText::new(format!("{outstanding} summarizing")).color(DIM),
+                        );
+                    }
+                });
             });
             if let Some(notice) = &self.notice {
                 Callout::new(CalloutTone::Warning)
@@ -369,8 +438,8 @@ impl AissenceApp {
         // Central panel must be added last.
         egui::CentralPanel::default().show_inside(ui, |ui| self.changes_pane(ui));
 
-        // Keep animating while any commit is being summarized.
-        if !self.in_progress.is_empty() {
+        // Keep animating / pumping while any commit is queued or summarizing.
+        if !self.in_progress.is_empty() || !self.queue.is_empty() {
             ui.ctx().request_repaint();
         }
 
@@ -545,6 +614,13 @@ impl AissenceApp {
                         .color(DISABLED),
                     );
                 } else if let Some(summary) = &group.summary {
+                    // Synthesized overview of the whole commit.
+                    if !summary.meta.trim().is_empty() {
+                        Card::new().heading("Overview").show(ui, |ui| {
+                            ui.label(&summary.meta);
+                        });
+                        ui.add_space(8.0);
+                    }
                     if summary.messages.is_empty() {
                         ui.label(egui::RichText::new("No conversation summarized.").color(DIM));
                     }

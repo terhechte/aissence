@@ -103,7 +103,9 @@ impl Summarizer {
     /// Summarize a single commit group: a per-message breakdown plus the three
     /// aggregated overviews.
     pub async fn summarize_group(&self, group: &CommitGroup) -> Result<CommitSummary, Error> {
-        let items = raw_items(group);
+        // Consecutive messages of the same kind (e.g. several "ai changed" in a
+        // row) are merged so they become a single summary entry.
+        let items = coalesce_consecutive(raw_items(group));
         let commit_context = group
             .commit
             .as_ref()
@@ -144,13 +146,51 @@ impl Summarizer {
             self.reduce_items(&changed, Category::Change, &commit_context),
         )?;
 
+        // Finally, synthesize the three into one longer overview.
+        let meta = self
+            .meta_summary(&user_requested, &ai_answered, &ai_implemented, &commit_context)
+            .await?;
+
         Ok(CommitSummary {
             user_requested,
             ai_answered,
             ai_implemented,
             messages,
             agents: crate::model::agents_for(group),
+            meta,
         })
+    }
+
+    /// Synthesize the three component summaries into one cohesive overview (up
+    /// to ~20 sentences): what the user wanted, what was implemented, and any
+    /// important caveats the assistant noted.
+    async fn meta_summary(
+        &self,
+        user_requested: &str,
+        ai_answered: &str,
+        ai_implemented: &str,
+        commit_context: &str,
+    ) -> Result<String, Error> {
+        if user_requested.trim().is_empty()
+            && ai_answered.trim().is_empty()
+            && ai_implemented.trim().is_empty()
+        {
+            return Ok(String::new());
+        }
+
+        let system = "You write a single cohesive overview (up to 20 sentences) of the work \
+             that led to a git commit, given three component summaries. Explain what the user \
+             wanted, what the assistant implemented in the code, and anything important the \
+             assistant noted (limitations, caveats, trade-offs, follow-ups). Write flowing \
+             prose in past tense. Output only the overview — no preamble, headings, or bullets.";
+        let user = format!(
+            "Commit: {commit_context}\n\n\
+             What the user requested:\n{user_requested}\n\n\
+             What the assistant answered/explained:\n{ai_answered}\n\n\
+             What the assistant implemented:\n{ai_implemented}\n\n\
+             Write the overview (up to 20 sentences)."
+        );
+        self.complete(system, user, 1200).await
     }
 
     /// Stage 1: summarize each message, concurrently and order-preserving.
@@ -169,7 +209,7 @@ impl Summarizer {
                 }
                 let category = Category::for_kind(kind);
                 let truncated = truncate_chars(&text, self.item_char_budget);
-                self.complete(category.item_system(), category.item_user(&truncated))
+                self.complete(category.item_system(), category.item_user(&truncated), 300)
                     .await
             });
         }
@@ -206,12 +246,18 @@ impl Summarizer {
         self.complete(
             category.reduce_system(),
             category.reduce_user(&joined, commit_context),
+            500,
         )
         .await
     }
 
     /// Issue one chat completion and return the assistant's text.
-    async fn complete(&self, system: &'static str, user: String) -> Result<String, Error> {
+    async fn complete(
+        &self,
+        system: &'static str,
+        user: String,
+        max_tokens: u32,
+    ) -> Result<String, Error> {
         let request = ChatCompletionRequest::builder()
             .model(self.model.as_str())
             .messages(vec![
@@ -219,7 +265,7 @@ impl Summarizer {
                 Message::new(OrRole::User, user),
             ])
             .temperature(0.2)
-            .max_tokens(500)
+            .max_tokens(max_tokens)
             .build()
             .map_err(|e| Error::Llm(format!("request build: {e}")))?;
 
@@ -295,6 +341,26 @@ fn raw_items(group: &CommitGroup) -> Vec<RawItem> {
         }
     }
     items
+}
+
+/// Merge runs of consecutive same-kind items into one. The merged item keeps
+/// the first timestamp, joins the texts, and concatenates the code changes — so
+/// e.g. five "ai changed" messages in a row become a single summarized entry.
+fn coalesce_consecutive(items: Vec<RawItem>) -> Vec<RawItem> {
+    let mut merged: Vec<RawItem> = Vec::with_capacity(items.len());
+    for item in items {
+        match merged.last_mut() {
+            Some(last) if last.kind == item.kind => {
+                if !last.text.is_empty() && !item.text.is_empty() {
+                    last.text.push_str("\n\n");
+                }
+                last.text.push_str(&item.text);
+                last.changes.extend(item.changes);
+            }
+            _ => merged.push(item),
+        }
+    }
+    merged
 }
 
 /// Extract the file-editing tool calls of `message` as [`CodeChange`]s.
@@ -510,5 +576,47 @@ impl Category {
             Category::Change => "Per-change summaries of what was implemented",
         };
         format!("Commit: {commit_context}\n\n{heading}:\n{joined}\n\nWrite the 3-5 sentence summary.")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(kind: MessageKind, text: &str) -> RawItem {
+        RawItem {
+            kind,
+            text: text.to_string(),
+            changes: Vec::new(),
+            timestamp: None,
+        }
+    }
+
+    #[test]
+    fn merges_runs_of_the_same_kind() {
+        let items = vec![
+            item(MessageKind::UserWrote, "a"),
+            item(MessageKind::UserWrote, "b"),
+            item(MessageKind::AiWrote, "c"),
+            item(MessageKind::AiChanged, "d"),
+            item(MessageKind::AiChanged, "e"),
+            item(MessageKind::AiChanged, "f"),
+            item(MessageKind::UserWrote, "g"),
+        ];
+        let merged = coalesce_consecutive(items);
+
+        let kinds: Vec<_> = merged.iter().map(|i| i.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                MessageKind::UserWrote,
+                MessageKind::AiWrote,
+                MessageKind::AiChanged,
+                MessageKind::UserWrote,
+            ]
+        );
+        assert_eq!(merged[0].text, "a\n\nb"); // two user messages merged
+        assert_eq!(merged[2].text, "d\n\ne\n\nf"); // three "ai changed" merged
+        assert_eq!(merged[3].text, "g"); // separated by the other kinds
     }
 }

@@ -70,14 +70,14 @@ impl SummaryStore {
         self.ignored.contains(commit_id)
     }
 
-    /// Mark `commit_id` ignored (or not) and persist.
+    /// Mark `commit_id` ignored (or not) and persist if the flag changed.
     pub fn set_ignored(&mut self, commit_id: &str, ignored: bool) -> std::io::Result<()> {
-        if ignored {
-            self.ignored.insert(commit_id.to_string());
+        let changed = if ignored {
+            self.ignored.insert(commit_id.to_string())
         } else {
-            self.ignored.remove(commit_id);
-        }
-        self.save()
+            self.ignored.remove(commit_id)
+        };
+        if changed { self.save() } else { Ok(()) }
     }
 
     /// Number of cached commit summaries.
@@ -175,6 +175,7 @@ mod tests {
                 timestamp: None,
             }],
             agents: vec![],
+            meta: "an overview".into(),
         }
     }
 
@@ -191,6 +192,7 @@ mod tests {
         let store = SummaryStore::load(&dir);
         let got = store.get("abc123", 42).expect("cached entry");
         assert_eq!(got.user_requested, "did things");
+        assert_eq!(got.meta, "an overview");
         assert_eq!(got.messages.len(), 1);
 
         // Signature mismatch and unknown id both miss.
