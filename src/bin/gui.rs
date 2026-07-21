@@ -9,8 +9,8 @@
 //! - **left**: commits, each with a one-line summary (ignored ones faded),
 //! - **middle**: Summarize/Ignore buttons + the per-message summaries for the
 //!   selected commit (user wrote / ai wrote / ai changed),
-//! - **right**: syntax-highlighted code changes — the whole commit diff, or the
-//!   edits of a selected "ai changed" message.
+//! - **right** (toggleable, hidden by default): syntax-highlighted code changes
+//!   — the whole commit diff, or the edits of a selected "ai changed" message.
 //!
 //! Generated summaries and ignore flags persist to `<folder>/.aissence`.
 
@@ -111,6 +111,8 @@ struct AissenceApp {
     selected_group: Option<usize>,
     /// `None` = show the whole-commit diff; `Some(i)` = message `i`'s changes.
     selected_message: Option<usize>,
+    /// Whether the optional right-hand git/code changes pane is visible.
+    show_changes: bool,
 
     // Right-pane patch, recomputed only when the selection changes.
     current_patch: Option<String>,
@@ -157,6 +159,7 @@ impl AissenceApp {
             notice,
             selected_group: None,
             selected_message: None,
+            show_changes: false,
             current_patch: None,
             last_selection: (None, None),
             patch_cache: HashMap::new(),
@@ -384,7 +387,6 @@ impl AissenceApp {
         let mut history = self.history.take().expect("history present");
         self.drain_results(&mut history);
         self.pump_queue(&history, &ctx);
-        self.refresh_patch(&history);
 
         egui::Panel::top("topbar").show_inside(ui, |ui| {
             ui.add_space(4.0);
@@ -413,6 +415,14 @@ impl AissenceApp {
                             egui::RichText::new(format!("{outstanding} summarizing")).color(DIM),
                         );
                     }
+                    let changes_label = if self.show_changes {
+                        "Hide changes"
+                    } else {
+                        "Show changes"
+                    };
+                    if ui.add(Button::new(changes_label)).clicked() {
+                        self.show_changes = !self.show_changes;
+                    }
                 });
             });
             if let Some(notice) = &self.notice {
@@ -429,14 +439,22 @@ impl AissenceApp {
             .size_range(egui::Rangef::new(220.0, 460.0))
             .show_inside(ui, |ui| self.commits_pane(ui, &history));
 
-        egui::Panel::left("messages")
-            .resizable(true)
-            .default_size(400.0)
-            .size_range(egui::Rangef::new(280.0, 640.0))
-            .show_inside(ui, |ui| self.messages_pane(ui, &history));
+        if self.show_changes {
+            self.refresh_patch(&history);
+            egui::Panel::left("messages")
+                .resizable(true)
+                .default_size(400.0)
+                .size_range(egui::Rangef::new(280.0, 640.0))
+                .show_inside(ui, |ui| self.messages_pane(ui, &history));
 
-        // Central panel must be added last.
-        egui::CentralPanel::default().show_inside(ui, |ui| self.changes_pane(ui));
+            // Central panel must be added last.
+            egui::CentralPanel::default().show_inside(ui, |ui| self.changes_pane(ui));
+        } else {
+            // With changes hidden, let the messages view use all remaining
+            // space instead of leaving an empty third pane.
+            egui::CentralPanel::default()
+                .show_inside(ui, |ui| self.messages_pane(ui, &history));
+        }
 
         // Keep animating / pumping while any commit is queued or summarizing.
         if !self.in_progress.is_empty() || !self.queue.is_empty() {
