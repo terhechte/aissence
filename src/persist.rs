@@ -98,6 +98,28 @@ impl SummaryStore {
             .map(|entry| &entry.summary)
     }
 
+    /// Replace cached summaries in place (no new summarization) and persist once.
+    ///
+    /// Each tuple is `(commit_id, signature, summary)`; an entry is updated only
+    /// when a cached one with a matching signature exists. Used to backfill
+    /// token counts — derived from session data, not the model — onto summaries
+    /// that predate token tracking, in a single write rather than one per commit.
+    pub fn backfill_summaries(
+        &mut self,
+        updates: Vec<(String, u64, CommitSummary)>,
+    ) -> std::io::Result<()> {
+        let mut changed = false;
+        for (id, signature, summary) in updates {
+            if let Some(entry) = self.commits.get_mut(&id)
+                && entry.signature == signature
+            {
+                entry.summary = summary;
+                changed = true;
+            }
+        }
+        if changed { self.save() } else { Ok(()) }
+    }
+
     /// Insert (or replace) a summary and persist the whole store to disk.
     pub fn insert_and_save(
         &mut self,
@@ -173,9 +195,11 @@ mod tests {
                 summary: "hello".into(),
                 changes: vec![],
                 timestamp: None,
+                tokens: None,
             }],
             agents: vec![],
             meta: "an overview".into(),
+            tokens: None,
         }
     }
 

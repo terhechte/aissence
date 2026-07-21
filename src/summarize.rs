@@ -32,7 +32,7 @@ use openrouter_rs::OpenRouterClient;
 use crate::error::Error;
 use crate::model::{
     CoalescedHistory, CodeChange, CommitGroup, CommitSummary, MessageKind, MessageSummary,
-    TimedMessage,
+    TimedMessage, TokenCount,
 };
 use crate::ncs;
 
@@ -124,6 +124,7 @@ impl Summarizer {
                 summary,
                 changes: item.changes,
                 timestamp: item.timestamp,
+                tokens: item.tokens,
             })
             .collect();
 
@@ -158,6 +159,7 @@ impl Summarizer {
             messages,
             agents: crate::model::agents_for(group),
             meta,
+            tokens: group.token_usage(),
         })
     }
 
@@ -295,6 +297,10 @@ struct RawItem {
     /// Code changes — only for [`MessageKind::AiChanged`].
     changes: Vec<CodeChange>,
     timestamp: Option<chrono::DateTime<chrono::Utc>>,
+    /// Token usage attributed to this item (turn-level, approximate). A message
+    /// that yields both an `AiWrote` and an `AiChanged` item puts its usage on
+    /// the first, so the total across items still matches the group total.
+    tokens: Option<TokenCount>,
 }
 
 /// Split a commit group into ordered per-message [`RawItem`]s. A single
@@ -312,10 +318,14 @@ fn raw_items(group: &CommitGroup) -> Vec<RawItem> {
                         text,
                         changes: Vec::new(),
                         timestamp: message.timestamp,
+                        tokens: message.token_usage,
                     });
                 }
             }
             ncs::Role::Assistant => {
+                // The message's usage covers its whole reply; attach it to the
+                // first item it produces so it isn't counted twice.
+                let mut tokens = message.token_usage;
                 let text = message.text();
                 if !text.trim().is_empty() {
                     items.push(RawItem {
@@ -323,6 +333,7 @@ fn raw_items(group: &CommitGroup) -> Vec<RawItem> {
                         text,
                         changes: Vec::new(),
                         timestamp: message.timestamp,
+                        tokens: tokens.take(),
                     });
                 }
                 let changes = code_changes(message);
@@ -332,6 +343,7 @@ fn raw_items(group: &CommitGroup) -> Vec<RawItem> {
                         text: render_changes(&changes),
                         changes,
                         timestamp: message.timestamp,
+                        tokens: tokens.take(),
                     });
                 }
             }
@@ -356,11 +368,34 @@ fn coalesce_consecutive(items: Vec<RawItem>) -> Vec<RawItem> {
                 }
                 last.text.push_str(&item.text);
                 last.changes.extend(item.changes);
+                if let Some(tokens) = item.tokens {
+                    last.tokens.get_or_insert_with(TokenCount::default).add(&tokens);
+                }
             }
             _ => merged.push(item),
         }
     }
     merged
+}
+
+/// Backfill token usage onto an already-produced summary from its group's
+/// session data — without calling the model.
+///
+/// Token usage is a pure function of the parsed sessions, so this fills in the
+/// per-commit total and the per-message counts on summaries created before
+/// token tracking existed (e.g. a cached `.aissence` entry). It re-derives the
+/// same per-message item structure [`Summarizer::summarize_group`] built the
+/// summary from, so the counts line up with the existing `messages` by index;
+/// if that structure no longer matches (the group changed), only the exact
+/// per-commit total is set.
+pub fn attach_token_usage(group: &CommitGroup, summary: &mut CommitSummary) {
+    summary.tokens = group.token_usage();
+    let items = coalesce_consecutive(raw_items(group));
+    if items.len() == summary.messages.len() {
+        for (item, message) in items.iter().zip(summary.messages.iter_mut()) {
+            message.tokens = item.tokens;
+        }
+    }
 }
 
 /// Extract the file-editing tool calls of `message` as [`CodeChange`]s.
@@ -599,6 +634,7 @@ mod tests {
             text: text.to_string(),
             changes: Vec::new(),
             timestamp: None,
+            tokens: None,
         }
     }
 
@@ -628,6 +664,93 @@ mod tests {
         assert_eq!(merged[0].text, "a\n\nb"); // two user messages merged
         assert_eq!(merged[2].text, "d\n\ne\n\nf"); // three "ai changed" merged
         assert_eq!(merged[3].text, "g"); // separated by the other kinds
+    }
+
+    fn timed(role: ncs::Role, text: &str, tokens: Option<TokenCount>) -> TimedMessage {
+        TimedMessage {
+            timestamp: Some(chrono::Utc::now()),
+            role,
+            content: vec![ncs::ContentBlock::Text { text: text.into() }],
+            session_id: None,
+            provider: None,
+            model: None,
+            agent: None,
+            session_path: std::path::PathBuf::from("test.jsonl"),
+            token_usage: tokens,
+        }
+    }
+
+    #[test]
+    fn raw_items_attribute_message_usage_to_a_single_item() {
+        let usage = TokenCount {
+            input: 100,
+            output: 40,
+            cache_read: None,
+            cache_create: None,
+        };
+        // An assistant message with both text and an edit: usage lands only on
+        // the first item, so the per-item sum equals the message's usage.
+        let mut assistant = timed(ncs::Role::Assistant, "here is the fix", Some(usage));
+        assistant.content.push(ncs::ContentBlock::ToolUse {
+            id: "1".into(),
+            name: "Write".into(),
+            input: serde_json::json!({ "file_path": "a.rs", "content": "x" }),
+        });
+        let group = CommitGroup {
+            commit: None,
+            messages: vec![timed(ncs::Role::User, "please fix", None), assistant],
+            summary: None,
+        };
+
+        let items = raw_items(&group);
+        assert_eq!(items.len(), 3); // user, ai wrote, ai changed
+        assert_eq!(items[0].tokens, None); // user message
+        assert_eq!(items[1].tokens, Some(usage)); // ai wrote carries it
+        assert_eq!(items[2].tokens, None); // ai changed does not double count
+    }
+
+    #[test]
+    fn attach_token_usage_fills_total_and_per_message() {
+        let usage = TokenCount {
+            input: 30,
+            output: 12,
+            cache_read: Some(4),
+            cache_create: None,
+        };
+        let group = CommitGroup {
+            commit: None,
+            messages: vec![
+                timed(ncs::Role::User, "hi", None),
+                timed(ncs::Role::Assistant, "hello there", Some(usage)),
+            ],
+            summary: None,
+        };
+        // A summary whose messages line up with the group's items.
+        let mut summary = CommitSummary {
+            messages: vec![
+                MessageSummary {
+                    kind: MessageKind::UserWrote,
+                    summary: "hi".into(),
+                    changes: vec![],
+                    timestamp: None,
+                    tokens: None,
+                },
+                MessageSummary {
+                    kind: MessageKind::AiWrote,
+                    summary: "hello".into(),
+                    changes: vec![],
+                    timestamp: None,
+                    tokens: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        attach_token_usage(&group, &mut summary);
+
+        assert_eq!(summary.tokens, Some(usage)); // exact conversation total
+        assert_eq!(summary.messages[0].tokens, None); // user
+        assert_eq!(summary.messages[1].tokens, Some(usage)); // assistant reply
     }
 
     #[test]

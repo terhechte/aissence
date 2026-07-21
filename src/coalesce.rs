@@ -75,8 +75,20 @@ fn flatten_messages(sessions: &[ncs::Session]) -> (Vec<TimedMessage>, Vec<TimedM
 
     for session in sessions {
         for turn in &session.turns {
-            for message in &turn.messages {
+            let usage = turn.token_usage.as_ref().map(crate::model::TokenCount::from);
+            // A turn's usage covers the reply it produced, so attribute it to the
+            // turn's assistant message (falling back to its last message). Every
+            // other message of the turn carries `None`, so summing across a group
+            // never double-counts a turn.
+            let carrier = usage.and(
+                turn.messages
+                    .iter()
+                    .rposition(|m| m.role == ncs::Role::Assistant)
+                    .or_else(|| turn.messages.len().checked_sub(1)),
+            );
+            for (i, message) in turn.messages.iter().enumerate() {
                 let timestamp = message.timestamp.as_deref().and_then(parse_timestamp);
+                let token_usage = if carrier == Some(i) { usage } else { None };
                 let tm = TimedMessage {
                     timestamp,
                     role: message.role,
@@ -86,6 +98,7 @@ fn flatten_messages(sessions: &[ncs::Session]) -> (Vec<TimedMessage>, Vec<TimedM
                     model: session.metadata.model.clone(),
                     agent: Some(crate::model::friendly_agent(&session.format)),
                     session_path: session.path.clone(),
+                    token_usage,
                 };
                 if timestamp.is_some() {
                     timed.push(tm);
@@ -217,6 +230,58 @@ mod tests {
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].provider, "test"); // friendly_agent passes unknown ids through
         assert_eq!(agents[0].model.as_deref(), Some("model-x"));
+    }
+
+    #[test]
+    fn token_usage_is_attributed_to_the_assistant_message_and_summed_per_group() {
+        // One turn: a user message + an assistant reply, with turn-level usage.
+        let mut session = ncs::Session::new(PathBuf::from("test.jsonl"), "test");
+        session.turns.push(ncs::Turn {
+            messages: vec![
+                user_msg("do a thing", Some("2026-01-01T09:00:00Z")),
+                ncs::Message {
+                    role: ncs::Role::Assistant,
+                    content: vec![ncs::ContentBlock::Text { text: "done".into() }],
+                    timestamp: Some("2026-01-01T09:00:01Z".into()),
+                },
+            ],
+            token_usage: Some(ncs::TokenUsage {
+                input: 100,
+                output: 20,
+                cache_read: Some(5),
+                cache_create: None,
+                model: None,
+            }),
+        });
+        // A second turn adds more usage, to prove per-group summing.
+        session.turns.push(ncs::Turn {
+            messages: vec![ncs::Message {
+                role: ncs::Role::Assistant,
+                content: vec![ncs::ContentBlock::Text { text: "more".into() }],
+                timestamp: Some("2026-01-01T09:00:02Z".into()),
+            }],
+            token_usage: Some(ncs::TokenUsage {
+                input: 50,
+                output: 8,
+                cache_read: Some(2),
+                cache_create: None,
+                model: None,
+            }),
+        });
+
+        let history = coalesce(PathBuf::from("/proj"), vec![], &[session], vec![]);
+        let group = &history.groups[0];
+
+        // The user message carries no usage; the assistant messages carry theirs.
+        assert!(group.messages[0].token_usage.is_none());
+        assert_eq!(group.messages[1].token_usage.map(|t| t.input), Some(100));
+        assert_eq!(group.messages[2].token_usage.map(|t| t.output), Some(8));
+
+        // The group total is the exact sum across both turns.
+        let total = group.token_usage().expect("group has usage");
+        assert_eq!(total.input, 150);
+        assert_eq!(total.output, 28);
+        assert_eq!(total.cache_read, Some(7));
     }
 
     #[test]

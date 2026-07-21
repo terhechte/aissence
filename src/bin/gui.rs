@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use aissence::{
     CoalescedHistory, CommitGroup, CommitSummary, DiffView, MessageKind, SummaryStore, Summarizer,
-    analyze, git, persist,
+    TokenCount, analyze, git, persist, summarize,
 };
 use eframe::egui;
 use elegance::{Accent, Button, Callout, CalloutTone, Card, Spinner, Theme};
@@ -172,14 +172,29 @@ impl AissenceApp {
 
     fn on_ready(&mut self, mut history: CoalescedHistory) {
         // Apply summaries cached in `.aissence` (resume without re-summarizing).
+        // Token counts come from the session data, not the model, so backfill
+        // them onto caches that predate token tracking — for display now, and
+        // once back to disk so the `.aissence` output carries them too.
+        let mut backfills: Vec<(String, u64, CommitSummary)> = Vec::new();
         for group in history.groups.iter_mut() {
             let Some(commit_id) = group.commit.as_ref().map(|c| c.id.clone()) else {
                 continue;
             };
             let signature = persist::signature(group);
             if let Some(cached) = self.store.get(&commit_id, signature) {
-                group.summary = Some(cached.clone());
+                let mut summary = cached.clone();
+                let needs_backfill = summary.tokens.is_none() && group.token_usage().is_some();
+                summarize::attach_token_usage(group, &mut summary);
+                if needs_backfill {
+                    backfills.push((commit_id, signature, summary.clone()));
+                }
+                group.summary = Some(summary);
             }
+        }
+        if !backfills.is_empty()
+            && let Err(err) = self.store.backfill_summaries(backfills)
+        {
+            self.notice = Some(format!("Could not write .aissence: {err}"));
         }
 
         // Default to the most recent group that actually has messages.
@@ -478,7 +493,7 @@ impl AissenceApp {
                         .is_some_and(|c| self.store.is_ignored(&c.id));
                     let summarized = group.summary.is_some();
 
-                    let (headline, sub) = match &group.commit {
+                    let (headline, mut sub) = match &group.commit {
                         Some(commit) => {
                             let mut sub =
                                 format!("{}  ·  {} msg", commit.short_id, group.messages.len());
@@ -494,6 +509,14 @@ impl AissenceApp {
                             format!("pending  ·  {} msg", group.messages.len()),
                         ),
                     };
+                    // Token counts (from session data — shown even before summarizing).
+                    if let Some(tokens) = group.token_usage().filter(|t| !t.is_zero()) {
+                        sub.push_str(&format!(
+                            "  ·  ↑{} ↓{}",
+                            fmt_count(tokens.input),
+                            fmt_count(tokens.output)
+                        ));
+                    }
 
                     // Ignored commits render in a faded (disabled) color.
                     let headline_color = if ignored {
@@ -574,6 +597,14 @@ impl AissenceApp {
                                 .collect::<Vec<_>>()
                                 .join(",   ");
                             ui.label(egui::RichText::new(text).color(USER_COLOR).size(11.0));
+                        }
+                        // Token usage for the whole conversation.
+                        if let Some(tokens) = group.token_usage().filter(|t| !t.is_zero()) {
+                            ui.label(
+                                egui::RichText::new(token_detail(&tokens))
+                                    .color(DIM)
+                                    .size(11.0),
+                            );
                         }
                     });
                 }
@@ -669,6 +700,18 @@ impl AissenceApp {
         ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new(prefix).color(color).strong());
             ui.label(egui::RichText::new(message.kind.label()).color(color).strong());
+            // Per-message token counts (turn-level, approximate).
+            if let Some(tokens) = message.tokens.filter(|t| !t.is_zero()) {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "↑{} ↓{}",
+                        fmt_count(tokens.input),
+                        fmt_count(tokens.output)
+                    ))
+                    .color(DIM)
+                    .size(11.0),
+                );
+            }
         });
 
         if message.kind == MessageKind::AiChanged {
@@ -712,6 +755,37 @@ impl AissenceApp {
 /// Join several unified-diff strings into one patch.
 fn join_diffs<'a>(diffs: impl Iterator<Item = &'a str>) -> String {
     diffs.collect::<Vec<_>>().join("\n")
+}
+
+/// Compact token count: `950`, `12.3k`, `1.4M`.
+fn fmt_count(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// One-line token breakdown for a commit header, e.g.
+/// `↑ 12.3k in · ↓ 4.1k out · cache 8.0k r / 1.2k w`.
+fn token_detail(tokens: &TokenCount) -> String {
+    let mut text = format!(
+        "↑ {} in  ·  ↓ {} out",
+        fmt_count(tokens.input),
+        fmt_count(tokens.output)
+    );
+    let cache_read = tokens.cache_read.unwrap_or(0);
+    let cache_create = tokens.cache_create.unwrap_or(0);
+    if cache_read > 0 || cache_create > 0 {
+        text.push_str(&format!(
+            "  ·  cache {} r / {} w",
+            fmt_count(cache_read),
+            fmt_count(cache_create)
+        ));
+    }
+    text
 }
 
 /// Raw message preview (role + first line), shown before a commit is summarized.

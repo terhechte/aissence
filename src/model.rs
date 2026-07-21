@@ -47,6 +47,12 @@ pub struct TimedMessage {
     pub agent: Option<String>,
     /// Path of the session log file this message was read from.
     pub session_path: PathBuf,
+    /// Token usage attributed to this message. The agents report usage per
+    /// *turn*, so this is populated only on the assistant message a turn
+    /// produced (the reply that generated the output tokens); the other
+    /// messages of the turn carry `None`. Summing it across a group yields the
+    /// group's exact total. `None` when the source reported no usage.
+    pub token_usage: Option<TokenCount>,
 }
 
 impl TimedMessage {
@@ -87,6 +93,60 @@ impl TimedMessage {
                 _ => None,
             })
             .collect()
+    }
+}
+
+/// Input/output token counts for a message or a whole commit's conversation.
+///
+/// The agents report usage per *turn* (one request/response cycle), not per
+/// individual message. Per-commit totals are therefore exact sums of those
+/// turns; per-message counts are the turn's usage attributed to the assistant
+/// message the turn produced (approximate — see `DATA.md`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenCount {
+    /// Input (prompt) tokens.
+    pub input: u64,
+    /// Output (completion) tokens.
+    pub output: u64,
+    /// Tokens read from the prompt cache, if the agent reported it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<u64>,
+    /// Tokens written to the prompt cache, if the agent reported it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_create: Option<u64>,
+}
+
+impl TokenCount {
+    /// `true` when every count is zero (no usage recorded).
+    pub fn is_zero(&self) -> bool {
+        self.input == 0
+            && self.output == 0
+            && self.cache_read.unwrap_or(0) == 0
+            && self.cache_create.unwrap_or(0) == 0
+    }
+
+    /// Accumulate another count into this one (summing the optional cache
+    /// fields, which stay `None` only while neither side reported them).
+    pub fn add(&mut self, other: &TokenCount) {
+        self.input += other.input;
+        self.output += other.output;
+        if let Some(v) = other.cache_read {
+            *self.cache_read.get_or_insert(0) += v;
+        }
+        if let Some(v) = other.cache_create {
+            *self.cache_create.get_or_insert(0) += v;
+        }
+    }
+}
+
+impl From<&ncs::TokenUsage> for TokenCount {
+    fn from(usage: &ncs::TokenUsage) -> Self {
+        TokenCount {
+            input: usage.input,
+            output: usage.output,
+            cache_read: usage.cache_read,
+            cache_create: usage.cache_create,
+        }
     }
 }
 
@@ -184,6 +244,10 @@ pub struct MessageSummary {
     /// Non-empty only for [`MessageKind::AiChanged`].
     pub changes: Vec<CodeChange>,
     pub timestamp: Option<chrono::DateTime<chrono::Utc>>,
+    /// Token usage attributed to this message (turn-level, approximate — see
+    /// [`TokenCount`]). Absent when the source reported no usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<TokenCount>,
 }
 
 /// LLM-generated summary of what went into a commit.
@@ -210,6 +274,11 @@ pub struct CommitSummary {
     /// last, from the three fields above.
     #[serde(default)]
     pub meta: String,
+    /// Exact total token usage of the whole conversation that led to this
+    /// commit (the sum of every turn's usage). Absent when no session reported
+    /// usage for this commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<TokenCount>,
 }
 
 /// A commit together with the chat messages that led up to it.
@@ -230,6 +299,22 @@ impl CommitGroup {
     /// `true` for the trailing "work in progress" group.
     pub fn is_pending(&self) -> bool {
         self.commit.is_none()
+    }
+
+    /// Exact total token usage across this group's messages — the conversation
+    /// that led to the commit. `None` when no message recorded any usage. This
+    /// sums the per-turn counts the agents reported and is independent of
+    /// whether the group has been summarized.
+    pub fn token_usage(&self) -> Option<TokenCount> {
+        let mut total = TokenCount::default();
+        let mut any = false;
+        for message in &self.messages {
+            if let Some(tokens) = &message.token_usage {
+                total.add(tokens);
+                any = true;
+            }
+        }
+        any.then_some(total)
     }
 }
 
