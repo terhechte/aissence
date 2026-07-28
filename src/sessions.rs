@@ -2,13 +2,10 @@
 //!
 //! Session logs do not live inside the project folder; each agent stores them
 //! in its own external location (e.g. Claude Code under `~/.claude/projects/…`).
-//! [`normalize_chat_sessions::project_metadata_roots`] tells us where the
-//! file-backed agents keep their logs — but for some agents (notably Codex)
-//! that is a *single global directory* shared by every project, not a
-//! per-project one. OpenCode and Kimi CLI are loaded separately: OpenCode
-//! because current releases use a SQLite database (legacy releases used a
-//! directory of JSON files), and Kimi CLI because it uses an event-sourced
-//! `wire.jsonl` stream that `normalize-chat-sessions` does not (yet) parse.
+//! [`normalize_chat_sessions::project_metadata_roots`] tells us where its
+//! file-backed agents keep their logs. Agent formats not covered there are
+//! loaded by the focused modules in this directory, including SQLite stores,
+//! event-sourced JSONL streams, and VS Code workspace storage.
 //!
 //! Worse, the parsed [`ncs::Session`] does not expose the session's working
 //! directory (`metadata.project` is empty in practice), so we cannot scope on
@@ -28,8 +25,15 @@ use std::path::{Path, PathBuf};
 
 use normalize_chat_sessions as ncs;
 
+mod amp;
+mod antigravity;
+mod codex;
+mod common;
+mod crush;
 mod kimi;
 mod opencode;
+mod pi_like;
+mod vscode_copilot;
 
 /// How many bytes from the start of each candidate file we scan for the folder
 /// path. The working directory is always recorded near the top of a log, so a
@@ -96,6 +100,11 @@ pub fn load_sessions(folder: &Path) -> LoadedSessions {
     let mut warnings = Vec::new();
 
     for file in discover_session_files(folder) {
+        // Current Codex rollouts need the local compatibility parser below.
+        // Skipping them here also prevents the same file appearing twice.
+        if codex::is_codex_session(&file) {
+            continue;
+        }
         if !file_references_folder(&file, &needles) {
             continue;
         }
@@ -112,6 +121,41 @@ pub fn load_sessions(folder: &Path) -> LoadedSessions {
     let loaded_kimi = kimi::load_sessions(folder);
     sessions.extend(loaded_kimi.sessions);
     warnings.extend(loaded_kimi.warnings);
+
+    let loaded_pi = pi_like::load_sessions(folder, pi_like::Flavor::Pi);
+    sessions.extend(loaded_pi.sessions);
+    warnings.extend(loaded_pi.warnings);
+
+    let loaded_omp = pi_like::load_sessions(folder, pi_like::Flavor::Omp);
+    sessions.extend(loaded_omp.sessions);
+    warnings.extend(loaded_omp.warnings);
+
+    let loaded_amp = amp::load_sessions(folder);
+    sessions.extend(loaded_amp.sessions);
+    warnings.extend(loaded_amp.warnings);
+
+    let loaded_crush = crush::load_sessions(folder);
+    sessions.extend(loaded_crush.sessions);
+    warnings.extend(loaded_crush.warnings);
+
+    let loaded_codex = codex::load_sessions(folder);
+    sessions.extend(loaded_codex.sessions);
+    warnings.extend(loaded_codex.warnings);
+
+    let loaded_antigravity = antigravity::load_sessions(folder);
+    sessions.extend(loaded_antigravity.sessions);
+    warnings.extend(loaded_antigravity.warnings);
+
+    let loaded_vscode = vscode_copilot::load_sessions(folder);
+    sessions.extend(loaded_vscode.sessions);
+    warnings.extend(loaded_vscode.warnings);
+
+    sessions.sort_by(|a, b| {
+        a.metadata
+            .timestamp
+            .cmp(&b.metadata.timestamp)
+            .then_with(|| a.path.cmp(&b.path))
+    });
 
     LoadedSessions { sessions, warnings }
 }
@@ -148,5 +192,7 @@ fn file_references_folder(path: &Path, needles: &[String]) -> bool {
         return false;
     }
     let haystack = String::from_utf8_lossy(&buf);
-    needles.iter().any(|needle| haystack.contains(needle.as_str()))
+    needles
+        .iter()
+        .any(|needle| haystack.contains(needle.as_str()))
 }

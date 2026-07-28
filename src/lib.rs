@@ -1,7 +1,8 @@
 //! # aissence
 //!
 //! Correlate the chat history of AI coding agents (Claude Code, Codex,
-//! OpenCode, Kimi CLI, Gemini)
+//! OpenCode, Kimi CLI, Gemini, Pi, Oh My Pi, Amp, Crush, Antigravity, and
+//! VS Code Copilot)
 //! with the git commits of a project, so you can see — for each commit — the
 //! conversation that led up to it.
 //!
@@ -9,7 +10,7 @@
 //!
 //! 1. reads the folder's git commit log ([`git::commit_log`]),
 //! 2. discovers and parses every AI session log belonging to that folder
-//!    ([`sessions::load_sessions`], backed by `normalize-chat-sessions`),
+//!    ([`sessions::load_sessions`]),
 //! 3. assigns each chat message to the first commit at or after it, producing a
 //!    chronological list of [`CommitGroup`]s ([`coalesce::coalesce`]).
 //!
