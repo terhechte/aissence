@@ -196,6 +196,7 @@ pub fn friendly_agent(format: &str) -> String {
         "claude" => "Claude Code",
         "codex" => "Codex",
         "opencode" => "OpenCode",
+        "kimi" => "Kimi CLI",
         "gemini" => "Gemini",
         "normalize" => "Normalize",
         other => other,

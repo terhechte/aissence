@@ -5,8 +5,10 @@
 //! [`normalize_chat_sessions::project_metadata_roots`] tells us where the
 //! file-backed agents keep their logs — but for some agents (notably Codex)
 //! that is a *single global directory* shared by every project, not a
-//! per-project one. OpenCode is loaded separately because current releases use
-//! a SQLite database (legacy releases used a directory of JSON files).
+//! per-project one. OpenCode and Kimi CLI are loaded separately: OpenCode
+//! because current releases use a SQLite database (legacy releases used a
+//! directory of JSON files), and Kimi CLI because it uses an event-sourced
+//! `wire.jsonl` stream that `normalize-chat-sessions` does not (yet) parse.
 //!
 //! Worse, the parsed [`ncs::Session`] does not expose the session's working
 //! directory (`metadata.project` is empty in practice), so we cannot scope on
@@ -26,6 +28,7 @@ use std::path::{Path, PathBuf};
 
 use normalize_chat_sessions as ncs;
 
+mod kimi;
 mod opencode;
 
 /// How many bytes from the start of each candidate file we scan for the folder
@@ -105,6 +108,10 @@ pub fn load_sessions(folder: &Path) -> LoadedSessions {
     let loaded_opencode = opencode::load_sessions(folder);
     sessions.extend(loaded_opencode.sessions);
     warnings.extend(loaded_opencode.warnings);
+
+    let loaded_kimi = kimi::load_sessions(folder);
+    sessions.extend(loaded_kimi.sessions);
+    warnings.extend(loaded_kimi.warnings);
 
     LoadedSessions { sessions, warnings }
 }
