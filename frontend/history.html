@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet data-dc-atomics>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Newsreader:ital,opsz,wght@0,6..72,300;0,6..72,400;0,6..72,500;1,6..72,300;1,6..72,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="./driftlist-data.js"></script>
+<style>
+html,body{margin:0;background:var(--paper,#FBFAF7);color:var(--ink,#16150F);font-family:Newsreader,Georgia,serif;-webkit-font-smoothing:antialiased}
+a{color:var(--ink,#16150F)}
+a:hover{color:var(--accent,#2C4EA8)}
+::selection{background:var(--tint,#DCE4F5)}
+</style>
+</helmet>
+
+<div style="background:var(--paper,#FBFAF7);min-height:100vh">
+<div style="max-width:1180px;margin:0 auto;padding:0 56px 120px">
+
+  <div style="display:flex;align-items:baseline;justify-content:space-between;gap:24px;padding:34px 0 26px;border-bottom:1px solid var(--ink,#16150F)">
+    <a href="Aissence Home.dc.html" style="display:block;line-height:0"><img src="aissence-logo.png" alt="aissence" style="height:21px;width:auto;display:block;filter:var(--logo-filter,none)"></a>
+    <div style="display:flex;align-items:baseline;gap:20px">
+      <div style="font:400 10px/1 'JetBrains Mono',monospace;letter-spacing:.16em;text-transform:uppercase;color:var(--muted,#8C8578)">Ledger №01 — {{ totals.repo }}</div>
+      <button onClick="{{ theme.toggle }}" style="font:400 10px/1 'JetBrains Mono',monospace;letter-spacing:.14em;text-transform:uppercase;color:var(--muted,#8C8578);background:none;border:1px solid var(--rule2,#DDD7CB);border-radius:0;padding:6px 11px;cursor:pointer" style-hover="color:var(--accent,#2C4EA8);border-color:var(--accent,#2C4EA8)">{{ theme.label }}</button>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:minmax(0,1.45fr) minmax(280px,1fr);gap:64px;padding:56px 0 0;align-items:start">
+    <div>
+      <div style="font:400 10px/1 'JetBrains Mono',monospace;letter-spacing:.18em;text-transform:uppercase;color:var(--accent,#2C4EA8);margin-bottom:22px">A project, reconstructed from its commits</div>
+      <div style="font:400 104px/.92 'Instrument Serif',Georgia,serif;letter-spacing:-.02em;margin:0 0 18px">{{ product.name }}</div>
+      <div style="font:italic 300 25px/1.35 Newsreader,serif;color:var(--body2,#3A362C);max-width:15em;margin-bottom:28px">{{ product.tagline }}</div>
+      <div style="font:400 17px/1.62 Newsreader,serif;color:var(--body,#4C4738);max-width:34em;text-wrap:pretty">{{ product.description }}</div>
+      <div style="display:flex;gap:26px;align-items:center;margin-top:30px">
+        <a href="{{ product.url }}" target="_blank" style="font:400 15px/1 Newsreader,serif;border-bottom:1px solid var(--accent,#2C4EA8);padding-bottom:3px;text-decoration:none">{{ product.urlLabel }} ↗</a>
+        <span style="font:400 11px/1 'JetBrains Mono',monospace;color:var(--muted,#8C8578)">{{ totals.spanLabel }}</span>
+      </div>
+    </div>
+
+    <div style="border-top:1px solid var(--ink,#16150F);padding-top:14px">
+      <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:16px">
+        <div style="font:400 10px/1 'JetBrains Mono',monospace;letter-spacing:.16em;text-transform:uppercase;color:var(--muted,#8C8578)">What it became</div>
+        <div style="font:400 10px/1 'JetBrains Mono',monospace;color:var(--faint,#B3AC9C)">{{ gallery.counter }}</div>
+      </div>
+      <div onClick="{{ gallery.openModal }}" style="cursor:zoom-in">
+        <div style="aspect-ratio:4/3;border:1px solid var(--rule2,#DDD7CB);background:{{ gallery.activeBg }};position:relative;overflow:hidden">
+          <div style="position:absolute;right:9px;bottom:8px;font:400 9px/1 'JetBrains Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:var(--muted,#8C8578)">click to enlarge</div>
+        </div>
+        <div style="font:400 10px/1.5 'JetBrains Mono',monospace;color:var(--muted,#8C8578);margin-top:9px">{{ gallery.activeLabel }}</div>
+      </div>
+      <div style="display:flex;gap:8px;margin-top:14px">
+        <sc-for list="{{ gallery.shots }}" as="s" hint-placeholder-count="5">
+          <div onClick="{{ s.select }}" style="flex:1;cursor:pointer">
+            <div style="aspect-ratio:4/3;background:{{ s.bg }};outline:1px solid {{ s.ring }};outline-offset:-1px;opacity:{{ s.opacity }}" style-hover="opacity:1"></div>
+          </div>
+        </sc-for>
+      </div>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:minmax(0,1fr) minmax(300px,.82fr);gap:64px;margin:78px 0 0;align-items:start">
+  <sc-if value="{{ chart.visible }}" hint-placeholder-val="{{ true }}">
+  <div style="border-top:1px solid var(--ink,#16150F);padding-top:16px">
+    <div style="margin-bottom:22px">
+      <div style="font:400 10px/1.5 'JetBrains Mono',monospace;letter-spacing:.16em;text-transform:uppercase;color:var(--muted,#8C8578);max-width:26em">{{ chart.title }}</div>
+      <div style="display:flex;gap:18px;align-items:center;margin-top:10px">
+        <span style="display:flex;align-items:center;gap:7px;font:400 10px/1 'JetBrains Mono',monospace;color:var(--soft,#6A6456)"><span style="width:16px;height:5px;background:var(--ink,#16150F);display:block"></span>{{ chart.upLabel }}</span>
+        <span style="display:flex;align-items:center;gap:7px;font:400 10px/1 'JetBrains Mono',monospace;color:var(--soft,#6A6456)"><span style="width:16px;height:5px;background:var(--accent,#2C4EA8);display:block"></span>{{ chart.downLabel }}</span>
+      </div>
+    </div>
+    <div style="display:flex;align-items:stretch;gap:5px;height:142px">
+      <sc-for list="{{ chart.bars }}" as="b" hint-placeholder-count="18">
+        <div onClick="{{ b.select }}" style="flex:1;display:flex;flex-direction:column;cursor:pointer;opacity:{{ b.opacity }}" style-hover="opacity:1">
+          <div style="flex:1;display:flex;align-items:flex-end"><div style="width:100%;height:{{ b.upH }}px;background:var(--ink,#16150F)"></div></div>
+          <div style="height:1px;background:var(--ink,#16150F)"></div>
+          <div style="height:38px"><div style="width:100%;height:{{ b.downH }}px;background:var(--accent,#2C4EA8)"></div></div>
+        </div>
+      </sc-for>
+    </div>
+    <div style="display:flex;gap:5px;margin-top:9px;height:12px">
+      <sc-for list="{{ chart.bars }}" as="b" hint-placeholder-count="18">
+        <div style="flex:1;position:relative">
+          <div style="position:absolute;top:0;left:50%;transform:translateX(-50%);font:400 9px/1.2 'JetBrains Mono',monospace;color:var(--muted,#8C8578);white-space:nowrap">{{ b.tick }}</div>
+        </div>
+      </sc-for>
+    </div>
+  </div>
+  </sc-if>
+
+    <div style="border-top:1px solid var(--ink,#16150F);padding-top:16px">
+      <div style="font:400 10px/1 'JetBrains Mono',monospace;letter-spacing:.16em;text-transform:uppercase;color:var(--muted,#8C8578);margin-bottom:16px">The whole account</div>
+      <div style="display:flex;flex-direction:column">
+        <sc-for list="{{ totals.rows }}" as="r" hint-placeholder-count="6">
+          <div style="display:flex;align-items:baseline;justify-content:space-between;gap:16px;padding:9px 0;border-bottom:1px solid var(--rule,#E7E2D8)">
+            <span style="font:400 13px/1.3 Newsreader,serif;color:var(--soft,#6A6456)">{{ r.k }}</span>
+            <span style="font:500 15px/1 'JetBrains Mono',monospace;font-variant-numeric:tabular-nums;letter-spacing:-.02em">{{ r.v }}</span>
+          </div>
+        </sc-for>
+      </div>
+      <div style="font:italic 300 14px/1.5 Newsreader,serif;color:var(--muted,#8C8578);margin-top:16px">{{ totals.note }}</div>
+    </div>
+  </div>
+
+  <div style="margin:82px 0 0">
+    <div style="display:flex;align-items:baseline;justify-content:space-between;border-bottom:1px solid var(--ink,#16150F);padding-bottom:12px">
+      <div style="font:400 10px/1 'JetBrains Mono',monospace;letter-spacing:.16em;text-transform:uppercase;color:var(--muted,#8C8578)">The entries</div>
+      <div style="font:italic 300 13px/1 Newsreader,serif;color:var(--muted,#8C8578)">Click any line to read what was asked, decided and built</div>
+    </div>
+
+    <sc-for list="{{ commits }}" as="c" hint-placeholder-count="18">
+      <div>
+        <sc-if value="{{ c.showMonth }}" hint-placeholder-val="{{ false }}">
+          <div style="display:flex;align-items:baseline;gap:18px;padding:44px 0 10px">
+            <div style="font:400 34px/1 'Instrument Serif',Georgia,serif;letter-spacing:-.01em">{{ c.monthLabel }}</div>
+            <div style="flex:1;height:1px;background:#D8D2C6"></div>
+            <div style="font:400 10px/1 'JetBrains Mono',monospace;letter-spacing:.14em;text-transform:uppercase;color:var(--muted,#8C8578)">{{ c.monthMeta }}</div>
+          </div>
+        </sc-if>
+
+        <div onClick="{{ c.toggle }}" style="display:grid;grid-template-columns:74px minmax(0,1fr) 128px 88px 22px;gap:22px;align-items:baseline;padding:17px 8px 17px 0;border-bottom:1px solid var(--rule,#E7E2D8);cursor:pointer;background:{{ c.rowBg }}" style-hover="background:var(--panel2,#F4F1EA)">
+          <div>
+            <div style="font:500 12px/1.2 'JetBrains Mono',monospace;font-variant-numeric:tabular-nums;color:var(--ink,#16150F)">{{ c.dateShort }}</div>
+            <div style="font:400 10px/1.4 'JetBrains Mono',monospace;color:var(--faint,#B3AC9C);margin-top:3px">{{ c.n }}</div>
+          </div>
+          <div>
+            <div style="font:400 22px/1.25 'Instrument Serif',Georgia,serif;letter-spacing:-.005em">{{ c.title }}</div>
+            <div style="font:400 14px/1.5 Newsreader,serif;color:var(--soft,#6A6456);margin-top:4px;max-width:46em">{{ c.blurb }}</div>
+            <div style="font:400 10px/1 'JetBrains Mono',monospace;letter-spacing:.08em;text-transform:uppercase;color:var(--accent,#2C4EA8);margin-top:9px">{{ c.agentLabel }}</div>
+          </div>
+          <div>
+            <div style="display:flex;align-items:baseline;justify-content:space-between;gap:8px;font:500 12px/1 'JetBrains Mono',monospace;font-variant-numeric:tabular-nums">
+              <span style="color:var(--ink,#16150F)">{{ c.tokensInLabel }}</span>
+              <span style="color:var(--accent,#2C4EA8)">{{ c.tokensOutLabel }}</span>
+            </div>
+            <div style="height:4px;background:var(--rule,#E7E2D8);margin-top:8px;position:relative">
+              <div style="position:absolute;left:0;top:0;bottom:0;width:{{ c.inPct }}%;background:var(--ink,#16150F)"></div>
+            </div>
+            <div style="height:4px;background:var(--tint,#F1EDE4);margin-top:2px;position:relative">
+              <div style="position:absolute;left:0;top:0;bottom:0;width:{{ c.outPct }}%;background:var(--accent,#2C4EA8)"></div>
+            </div>
+            <div style="font:400 9px/1 'JetBrains Mono',monospace;letter-spacing:.08em;text-transform:uppercase;color:var(--faint,#B3AC9C);margin-top:7px">tokens in / out</div>
+          </div>
+          <div style="text-align:right;font:500 12px/1.5 'JetBrains Mono',monospace;font-variant-numeric:tabular-nums">
+            <div style="color:var(--ink,#16150F)">+{{ c.linesAdded }}</div>
+            <div style="color:var(--faint2,#A79F8E)">−{{ c.linesDeleted }}</div>
+            <div style="font:400 9px/1 'JetBrains Mono',monospace;letter-spacing:.08em;text-transform:uppercase;color:var(--faint,#B3AC9C);margin-top:5px">{{ c.filesLabel }}</div>
+          </div>
+          <div style="font:400 15px/1 'JetBrains Mono',monospace;color:var(--accent,#2C4EA8);text-align:right;transform:{{ c.caretTransform }}">↓</div>
+        </div>
+
+        <sc-if value="{{ c.expanded }}" hint-placeholder-val="{{ false }}">
+          <div style="border-bottom:1px solid var(--rule,#E7E2D8);background:var(--panel,#F7F4ED);padding:34px 0 38px">
+            <div style="display:grid;grid-template-columns:74px minmax(0,1fr);gap:22px">
+              <div>
+                <div style="font:400 10px/1.5 'JetBrains Mono',monospace;color:var(--muted,#8C8578)">{{ c.dateFull }}</div>
+                <div style="font:400 10px/1.5 'JetBrains Mono',monospace;color:var(--faint,#B3AC9C);margin-top:8px">{{ c.hashShort }}</div>
+              </div>
+              <div>
+                <div style="font:italic 300 20px/1.5 Newsreader,serif;color:var(--body3,#2E2A20);max-width:36em;margin-bottom:32px;text-wrap:pretty">{{ c.meta }}</div>
+                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:30px;border-top:1px solid var(--rule2,#DDD7CB);padding-top:22px">
+                  <div>
+                    <div style="font:400 10px/1 'JetBrains Mono',monospace;letter-spacing:.14em;text-transform:uppercase;color:var(--accent,#2C4EA8);margin-bottom:9px">Asked</div>
+                    <div style="font:400 14px/1.6 Newsreader,serif;color:var(--body,#4C4738)">{{ c.userRequested }}</div>
+                  </div>
+                  <div>
+                    <div style="font:400 10px/1 'JetBrains Mono',monospace;letter-spacing:.14em;text-transform:uppercase;color:var(--accent,#2C4EA8);margin-bottom:9px">Decided</div>
+                    <div style="font:400 14px/1.6 Newsreader,serif;color:var(--body,#4C4738)">{{ c.aiAnswered }}</div>
+                  </div>
+                  <div>
+                    <div style="font:400 10px/1 'JetBrains Mono',monospace;letter-spacing:.14em;text-transform:uppercase;color:var(--accent,#2C4EA8);margin-bottom:9px">Built</div>
+                    <div style="font:400 14px/1.6 Newsreader,serif;color:var(--body,#4C4738)">{{ c.aiImplemented }}</div>
+                  </div>
+                </div>
+                <sc-if value="{{ c.showLog }}" hint-placeholder-val="{{ true }}">
+                  <div style="margin-top:30px;border-top:1px solid var(--rule2,#DDD7CB);padding-top:20px">
+                    <div style="font:400 10px/1 'JetBrains Mono',monospace;letter-spacing:.14em;text-transform:uppercase;color:var(--muted,#8C8578);margin-bottom:14px">Transcript, abridged</div>
+                    <div style="display:flex;flex-direction:column;gap:11px">
+                      <sc-for list="{{ c.messages }}" as="m" hint-placeholder-count="3">
+                        <div style="display:grid;grid-template-columns:78px 54px minmax(0,1fr);gap:16px;align-items:baseline">
+                          <span style="font:400 10px/1.4 'JetBrains Mono',monospace;letter-spacing:.08em;text-transform:uppercase;color:{{ m.kindColor }}">{{ m.kindLabel }}</span>
+                          <span style="font:400 10px/1.4 'JetBrains Mono',monospace;color:var(--faint,#B3AC9C)">{{ m.timeLabel }}</span>
+                          <span style="font:400 14px/1.55 Newsreader,serif;color:var(--body,#4C4738)">{{ m.summary }}</span>
+                        </div>
+                      </sc-for>
+                    </div>
+                  </div>
+                </sc-if>
+                <div style="display:flex;gap:34px;flex-wrap:wrap;margin-top:28px;border-top:1px solid var(--rule2,#DDD7CB);padding-top:18px">
+                  <sc-for list="{{ c.factRows }}" as="f" hint-placeholder-count="4">
+                    <div>
+                      <div style="font:400 9px/1 'JetBrains Mono',monospace;letter-spacing:.12em;text-transform:uppercase;color:var(--faint,#B3AC9C);margin-bottom:6px">{{ f.k }}</div>
+                      <div style="font:500 14px/1 'JetBrains Mono',monospace;font-variant-numeric:tabular-nums;color:var(--ink,#16150F)">{{ f.v }}</div>
+                    </div>
+                  </sc-for>
+                </div>
+              </div>
+            </div>
+          </div>
+        </sc-if>
+      </div>
+    </sc-for>
+  </div>
+
+  <div style="margin:88px 0 0;border-top:1px solid var(--ink,#16150F);padding-top:18px;display:flex;align-items:baseline;justify-content:space-between;gap:30px;flex-wrap:wrap">
+    <div style="font:italic 300 19px/1.5 Newsreader,serif;color:var(--body,#4C4738);max-width:30em">Every line above came out of a conversation. aissence keeps the two together, so a repository can still explain itself a year from now.</div>
+    <a href="Aissence Home.dc.html" style="font:400 14px/1 Newsreader,serif;border-bottom:1px solid var(--accent,#2C4EA8);padding-bottom:3px;text-decoration:none;white-space:nowrap">About aissence ↗</a>
+  </div>
+</div>
+</div>
+
+<sc-if value="{{ gallery.modalOpen }}" hint-placeholder-val="{{ false }}">
+  <div onClick="{{ gallery.closeModal }}" style="position:fixed;inset:0;background:rgba(20,19,14,.86);z-index:80;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;padding:5vh 5vw;cursor:zoom-out">
+    <div style="width:min(1100px,90vw);aspect-ratio:4/3;background:{{ gallery.activeBg }};border:1px solid rgba(251,250,247,.22);max-height:78vh"></div>
+    <div style="display:flex;align-items:baseline;justify-content:space-between;width:min(1100px,90vw);gap:24px">
+      <div style="font:400 11px/1 'JetBrains Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:#EDE7DB">{{ gallery.activeLabel }}</div>
+      <div style="font:400 10px/1 'JetBrains Mono',monospace;color:rgba(237,231,219,.55)">{{ gallery.counter }} — click anywhere to close</div>
+    </div>
+  </div>
+</sc-if>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;theme&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;light&quot;,&quot;dark&quot;],&quot;default&quot;:&quot;light&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Ledger&quot;},&quot;showChart&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Ledger&quot;},&quot;chartMode&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;tokens&quot;,&quot;lines&quot;],&quot;default&quot;:&quot;tokens&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Ledger&quot;},&quot;showConversationLog&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Ledger&quot;}}">
+const MONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+const KIND = {
+  UserWrote: { label: "asked", color: "var(--ink,#16150F)" },
+  AiWrote: { label: "replied", color: "var(--accent,#2C4EA8)" },
+  AiChanged: { label: "changed", color: "var(--soft,#6A6456)" }
+};
+
+function k(n) {
+  if (n >= 1000000) return (n / 1000000).toFixed(2) + "M";
+  if (n >= 1000) return (n / 1000).toFixed(n >= 100000 ? 0 : 1).replace(/\.0$/, "") + "k";
+  return String(n);
+}
+
+const THEMES = {
+  light: {
+    paper: "#FBFAF7", ink: "#16150F", body: "#4C4738", body2: "#3A362C", body3: "#2E2A20",
+    soft: "#6A6456", muted: "#8C8578", faint: "#B3AC9C", faint2: "#A79F8E",
+    rule: "#E7E2D8", rule2: "#DDD7CB", panel: "#F7F4ED", panel2: "#F4F1EA", tint: "#F1EDE4",
+    accent: "#2C4EA8", "logo-filter": "none"
+  },
+  dark: {
+    paper: "#121310", ink: "#EFECE4", body: "#BEB9AD", body2: "#D4CFC4", body3: "#DCD7CC",
+    soft: "#A29C90", muted: "#8A8578", faint: "#6C6759", faint2: "#7D7769",
+    rule: "#2A2A24", rule2: "#3A3A32", panel: "#1A1A16", panel2: "#22221D", tint: "#24241F",
+    accent: "#7FA8FF", "logo-filter": "invert(1)"
+  }
+};
+
+const SHOTS_LIGHT = [
+  "repeating-linear-gradient(0deg,#F5F2EB 0 26px,#EFEBE1 26px 28px)",
+  "linear-gradient(90deg,#F1EDE3 0 32%,#F7F4ED 32% 66%,#EDE9DF 66% 100%)",
+  "radial-gradient(circle at 40% 44%,#DEE6F2 0 9%,rgba(0,0,0,0) 9%),linear-gradient(160deg,#F4F1E9,#EBE8DD)",
+  "linear-gradient(#FDFCF9 0 40%,#F1EDE4 40% 100%)",
+  "repeating-linear-gradient(90deg,#F6F3EC 0 44px,#EEEAE0 44px 46px)"
+];
+const SHOTS_DARK = [
+  "repeating-linear-gradient(0deg,#232320 0 26px,#1C1C19 26px 28px)",
+  "linear-gradient(90deg,#1E1E1A 0 32%,#26261F 32% 66%,#1A1A16 66% 100%)",
+  "radial-gradient(circle at 40% 44%,#2E3A55 0 9%,rgba(0,0,0,0) 9%),linear-gradient(160deg,#242420,#1A1A17)",
+  "linear-gradient(#2A2A24 0 40%,#1C1C18 40% 100%)",
+  "repeating-linear-gradient(90deg,#242420 0 44px,#1B1B18 44px 46px)"
+];
+
+class Component extends DCLogic {
+  state = { open: null, shot: 0, modal: false, dark: null };
+
+  isDark() {
+    if (this.state.dark !== null) return this.state.dark;
+    return this.props.theme === "dark";
+  }
+
+  applyTheme() {
+    if (typeof document === "undefined") return;
+    const t = THEMES[this.isDark() ? "dark" : "light"];
+    Object.keys(t).forEach(key => document.documentElement.style.setProperty("--" + key, t[key]));
+    document.body.style.background = t.paper;
+    document.body.style.color = t.ink;
+  }
+
+  componentDidMount() { this.applyTheme(); }
+  componentDidUpdate() { this.applyTheme(); }
+
+  toggle(i) {
+    this.setState(s => ({ open: s.open === i ? null : i }));
+  }
+
+  renderVals() {
+    const data = (typeof window !== "undefined" && window.DRIFTLIST_DATA) || null;
+    if (!data) return {};
+    const p = data.product;
+    const list = data.commits;
+    const showLog = this.props.showConversationLog !== false;
+    const chartMode = this.props.chartMode || "tokens";
+    const open = this.state.open;
+
+    const maxIn = Math.max.apply(null, list.map(c => c.tokensIn));
+    const maxOut = Math.max.apply(null, list.map(c => c.tokensOut));
+    const maxAdd = Math.max.apply(null, list.map(c => c.linesAdded));
+    const maxDel = Math.max.apply(null, list.map(c => c.linesDeleted));
+
+    const monthCounts = {};
+    list.forEach(c => {
+      const key = new Date(c.date).getUTCMonth();
+      monthCounts[key] = (monthCounts[key] || 0) + 1;
+    });
+
+    let lastMonth = null;
+    const commits = list.map((c, i) => {
+      const d = new Date(c.date);
+      const mo = d.getUTCMonth();
+      const showMonth = mo !== lastMonth;
+      lastMonth = mo;
+      return {
+        n: String(i + 1).padStart(2, "0"),
+        showMonth,
+        monthLabel: MONTHS[mo] + " " + d.getUTCFullYear(),
+        monthMeta: monthCounts[mo] + " entries",
+        dateShort: MONTHS[mo].slice(0, 3) + " " + d.getUTCDate(),
+        dateFull: d.getUTCDate() + " " + MONTHS[mo] + " " + d.getUTCFullYear(),
+        title: c.title,
+        blurb: c.summary.user_requested,
+        agentLabel: c.agent.provider + " · " + c.agent.model,
+        hashShort: c.hash.slice(0, 10),
+        tokensInLabel: k(c.tokensIn) + " in",
+        tokensOutLabel: k(c.tokensOut) + " out",
+        inPct: Math.round((c.tokensIn / maxIn) * 100),
+        outPct: Math.round((c.tokensOut / maxOut) * 100),
+        linesAdded: c.linesAdded,
+        linesDeleted: c.linesDeleted,
+        filesLabel: c.filesChanged + " files",
+        meta: c.summary.meta,
+        userRequested: c.summary.user_requested,
+        aiAnswered: c.summary.ai_answered,
+        aiImplemented: c.summary.ai_implemented,
+        showLog,
+        messages: (c.messages || []).map(m => ({
+          kindLabel: (KIND[m.kind] || { label: m.kind }).label,
+          kindColor: (KIND[m.kind] || { color: "var(--soft,#6A6456)" }).color,
+          timeLabel: new Date(m.timestamp).toISOString().slice(11, 16),
+          summary: m.summary
+        })),
+        factRows: [
+          { k: "tokens in", v: c.tokensIn.toLocaleString() },
+          { k: "tokens out", v: c.tokensOut.toLocaleString() },
+          { k: "lines", v: "+" + c.linesAdded + " / −" + c.linesDeleted },
+          { k: "files touched", v: String(c.filesChanged) },
+          { k: "minutes to build", v: c.minutesSincePrompt + " min" }
+        ],
+        expanded: open === i,
+        rowBg: open === i ? "var(--panel,#F7F4ED)" : "transparent",
+        caretTransform: open === i ? "rotate(180deg)" : "rotate(0deg)",
+        toggle: () => this.toggle(i)
+      };
+    });
+
+    const first = new Date(list[0].date);
+    const last = new Date(list[list.length - 1].date);
+    const days = Math.round((last - first) / 86400000) + 1;
+    const sum = key => list.reduce((a, c) => a + c[key], 0);
+    const models = {};
+    list.forEach(c => { models[c.agent.provider] = (models[c.agent.provider] || 0) + 1; });
+    const modelNames = Object.keys(models).sort((a, b) => models[b] - models[a]);
+
+    const totals = {
+      repo: data.product.repo,
+      spanLabel: MONTHS[first.getUTCMonth()].slice(0, 3) + " " + first.getUTCDate() + " – " + MONTHS[last.getUTCMonth()].slice(0, 3) + " " + last.getUTCDate() + ", " + last.getUTCFullYear(),
+      rows: [
+        { k: "Commits from a conversation", v: String(list.length) },
+        { k: "Days from empty to launch", v: String(days) },
+        { k: "Tokens read by the models", v: k(sum("tokensIn")) },
+        { k: "Tokens written back", v: k(sum("tokensOut")) },
+        { k: "Lines added / removed", v: "+" + sum("linesAdded").toLocaleString() + " / −" + sum("linesDeleted").toLocaleString() },
+        { k: "Agents at the keyboard", v: String(modelNames.length) }
+      ],
+      note: modelNames.join(", ") + " — one repository, " + list.length + " conversations, no two the same."
+    };
+
+    const barKeyUp = chartMode === "lines" ? "linesAdded" : "tokensIn";
+    const barKeyDown = chartMode === "lines" ? "linesDeleted" : "tokensOut";
+    const upMax = chartMode === "lines" ? maxAdd : maxIn;
+    const downMax = chartMode === "lines" ? maxDel : maxOut;
+
+    const chart = {
+      visible: this.props.showChart !== false,
+      title: chartMode === "lines" ? "Lines added above the line, removed below" : "Tokens read above the line, tokens written below",
+      upLabel: chartMode === "lines" ? "added" : "in",
+      downLabel: chartMode === "lines" ? "removed" : "out",
+      bars: list.map((c, i) => ({
+        upH: Math.max(2, Math.round((c[barKeyUp] / upMax) * 104)),
+        downH: Math.max(2, Math.round((c[barKeyDown] / downMax) * 32)),
+        opacity: open === null ? 1 : (open === i ? 1 : 0.32),
+        tick: i % 4 === 2 ? MONTHS[new Date(c.date).getUTCMonth()].slice(0, 3) + " " + new Date(c.date).getUTCDate() : "",
+        select: () => this.toggle(i)
+      }))
+    };
+
+    const dark = this.isDark();
+    const SHOT_BG = dark ? SHOTS_DARK : SHOTS_LIGHT;
+    const shots = p.screenshots;
+    const si = Math.min(this.state.shot, shots.length - 1);
+    const gallery = {
+      shots: shots.map((s, i) => ({
+        bg: SHOT_BG[i % SHOT_BG.length],
+        ring: i === si ? "var(--accent,#2C4EA8)" : "var(--rule2,#DDD7CB)",
+        opacity: i === si ? 1 : 0.55,
+        select: () => this.setState({ shot: i })
+      })),
+      activeBg: SHOT_BG[si % SHOT_BG.length],
+      activeLabel: shots[si].label,
+      counter: String(si + 1).padStart(2, "0") + " / " + String(shots.length).padStart(2, "0"),
+      modalOpen: this.state.modal,
+      openModal: () => this.setState({ modal: true }),
+      closeModal: () => this.setState({ modal: false })
+    };
+
+    const theme = {
+      label: dark ? "light" : "dark",
+      toggle: () => this.setState({ dark: !dark })
+    };
+
+    return {
+      theme,
+      gallery,
+      product: { name: p.name, tagline: p.tagline, description: p.description, url: p.url, urlLabel: p.url.replace(/^https?:\/\//, ""), screenshots: p.screenshots },
+      commits,
+      totals,
+      chart
+    };
+  }
+}
+
+</script>
+</body>
+</html>
