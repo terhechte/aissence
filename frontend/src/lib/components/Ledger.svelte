@@ -37,6 +37,11 @@
     const agentNames = new Set(
       commits.flatMap((commit: any) => commit.commit_agents.map((agent: any) => agent.provider))
     );
+    const prompts = commits.reduce(
+      (total: number, commit: any) =>
+        total + commit.messages.filter((message: any) => message.kind === 'UserWrote').length,
+      0
+    );
     const dated = commits.filter((commit: any) => commit.committed_at);
     const first = dated[0]?.committed_at;
     const last = dated.at(-1)?.committed_at;
@@ -54,6 +59,7 @@
       linesDeleted: sum('lines_deleted'),
       files: sum('files_changed'),
       agents: agentNames,
+      prompts,
       first,
       last,
       span
@@ -217,11 +223,17 @@
     {#if commits.length}
       {#each commits as commit, index}
         {#if index === 0 || monthKey(commit) !== monthKey(commits[index - 1])}
-          <div class="month"><h2>{monthLabel(commit)}</h2><i></i><span>{commits.filter((item: any) => monthKey(item) === monthKey(commit)).length} entries</span></div>
+          <div class="month"><h2>{monthLabel(commit)}</h2><i></i><span>{commits.filter((item: any) => monthKey(item) === monthKey(commit)).length} entries · {totals.prompts} prompts</span></div>
         {/if}
         <article class:open={openCommit === commit.id}>
           <button class="commit-row" onclick={() => toggleCommit(commit.id)} aria-expanded={openCommit === commit.id}>
-            <div><time>{formatDate(commit.committed_at, { month: 'short', day: 'numeric', year: undefined })}</time><small>{String(index + 1).padStart(2, '0')}</small></div>
+            <div class="commit-date">
+              <span class="commit-date-dash" aria-hidden="true">—</span>
+              <span class="commit-date-values">
+                <time>{formatDate(commit.committed_at, { month: 'short', day: 'numeric', year: undefined })}</time>
+                <small>{String(index + 1).padStart(2, '0')}</small>
+              </span>
+            </div>
             <div><h3>{commit.title || `Commit ${commit.commit_hash.slice(0, 10)}`}</h3><p>{commit.user_requested}</p><span>{commit.commit_agents.map((agent: any) => `${agent.provider}${agent.model ? ` · ${agent.model}` : ''}`).join(' / ') || 'Agent unknown'}</span></div>
             <div class="token-cell">
               <strong>{formatCount(commit.token_input)} in <em>{formatUsd(commit.input_cost_usd)}</em></strong>
@@ -630,6 +642,21 @@
     display: grid;
     gap: 4px;
   }
+  .commit-row .commit-date {
+    grid-template-columns: 12px minmax(0, 1fr);
+    column-gap: 8px;
+  }
+  .commit-date-dash {
+    color: var(--muted);
+    transition: opacity 0.25s ease;
+  }
+  article.open .commit-date-dash {
+    opacity: 0;
+  }
+  .commit-date-values {
+    display: grid;
+    gap: 4px;
+  }
   .commit-row > div:first-child time {
     font-size: 11px;
   }
@@ -707,6 +734,7 @@
     display: flex;
     flex-direction: column;
     gap: 8px;
+    padding-left: 20px;
     color: var(--muted);
     font: 400 9px/1.4 'JetBrains Mono', monospace;
   }
@@ -918,6 +946,7 @@
     }
     .commit-meta {
       flex-direction: row;
+      padding-left: 20px;
     }
     .message {
       grid-template-columns: 60px 1fr;
