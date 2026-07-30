@@ -24,10 +24,12 @@
 //! # Ok(()) }
 //! ```
 
+use std::sync::Mutex;
+
 use futures::stream::{self, StreamExt};
+use openrouter_rs::OpenRouterClient;
 use openrouter_rs::api::chat::{ChatCompletionRequest, Message};
 use openrouter_rs::types::Role as OrRole;
-use openrouter_rs::OpenRouterClient;
 
 use crate::error::Error;
 use crate::model::{
@@ -48,6 +50,43 @@ pub const DEFAULT_MODEL: &str = "inclusionai/ling-2.6-flash";
 /// chunk because their complete synthesized diffs are persisted separately.
 const SUMMARY_CHUNK_CHARS: usize = 6_000;
 const CHANGE_SUMMARY_CHARS: usize = 6_000;
+
+/// Actual billing reported by OpenRouter for one summarization operation.
+///
+/// Costs are denominated in US dollars. A request is counted as unpriced when
+/// it succeeds but the provider response omits billing data.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SummarizationCost {
+    pub usd: f64,
+    pub request_count: usize,
+    pub unpriced_request_count: usize,
+}
+
+impl SummarizationCost {
+    pub fn add(&mut self, other: Self) {
+        self.usd += other.usd;
+        self.request_count += other.request_count;
+        self.unpriced_request_count += other.unpriced_request_count;
+    }
+}
+
+#[derive(Default)]
+struct CostTracker(Mutex<SummarizationCost>);
+
+impl CostTracker {
+    fn record(&self, cost: Option<f64>) {
+        let mut total = self.0.lock().expect("summarization cost lock");
+        total.request_count += 1;
+        match cost.filter(|value| value.is_finite() && *value >= 0.0) {
+            Some(cost) => total.usd += cost,
+            None => total.unpriced_request_count += 1,
+        }
+    }
+
+    fn total(&self) -> SummarizationCost {
+        *self.0.lock().expect("summarization cost lock")
+    }
+}
 
 /// Summarizes commit groups using an OpenRouter-hosted model.
 pub struct Summarizer {
@@ -106,6 +145,25 @@ impl Summarizer {
     /// Summarize a single commit group: a per-message breakdown plus the three
     /// aggregated overviews.
     pub async fn summarize_group(&self, group: &CommitGroup) -> Result<CommitSummary, Error> {
+        self.summarize_group_with_cost(group).await.0
+    }
+
+    /// Summarize one group and return the actual OpenRouter cost incurred,
+    /// including costs from requests made before a later request failed.
+    pub async fn summarize_group_with_cost(
+        &self,
+        group: &CommitGroup,
+    ) -> (Result<CommitSummary, Error>, SummarizationCost) {
+        let costs = CostTracker::default();
+        let outcome = self.summarize_group_tracked(group, &costs).await;
+        (outcome, costs.total())
+    }
+
+    async fn summarize_group_tracked(
+        &self,
+        group: &CommitGroup,
+        costs: &CostTracker,
+    ) -> Result<CommitSummary, Error> {
         // Consecutive messages of the same kind (e.g. several "ai changed" in a
         // row) are merged so they become a single summary entry.
         let items = coalesce_consecutive(raw_items(group));
@@ -116,7 +174,7 @@ impl Summarizer {
             .unwrap_or_else(|| "(uncommitted work in progress)".to_string());
 
         // Stage 1 (map): summarize every message, concurrently.
-        let per_item = self.map_raw_items(&items).await?;
+        let per_item = self.map_raw_items(&items, costs).await?;
 
         // Per-message breakdown (drives the app's middle pane).
         let messages: Vec<MessageSummary> = items
@@ -149,14 +207,20 @@ impl Summarizer {
 
         // The three categories are independent — run them concurrently.
         let (user_requested, ai_answered, ai_implemented) = futures::try_join!(
-            self.reduce_items(&user, Category::User, &commit_context),
-            self.reduce_items(&answered, Category::Response, &commit_context),
-            self.reduce_items(&changed, Category::Change, &commit_context),
+            self.reduce_items(&user, Category::User, &commit_context, costs),
+            self.reduce_items(&answered, Category::Response, &commit_context, costs),
+            self.reduce_items(&changed, Category::Change, &commit_context, costs),
         )?;
 
         // Finally, synthesize the three into one longer overview.
         let meta = self
-            .meta_summary(&user_requested, &ai_answered, &ai_implemented, &commit_context)
+            .meta_summary(
+                &user_requested,
+                &ai_answered,
+                &ai_implemented,
+                &commit_context,
+                costs,
+            )
             .await?;
 
         Ok(CommitSummary {
@@ -179,6 +243,7 @@ impl Summarizer {
         ai_answered: &str,
         ai_implemented: &str,
         commit_context: &str,
+        costs: &CostTracker,
     ) -> Result<String, Error> {
         if user_requested.trim().is_empty()
             && ai_answered.trim().is_empty()
@@ -199,12 +264,16 @@ impl Summarizer {
              What the assistant implemented:\n{ai_implemented}\n\n\
              Write the overview (up to 20 sentences)."
         );
-        self.complete(system, user, 1200).await
+        self.complete(system, user, 1200, costs).await
     }
 
     /// Stage 1: summarize each message, concurrently and order-preserving.
     /// Messages shorter than [`Self::passthrough_chars`] are used verbatim.
-    async fn map_raw_items(&self, items: &[RawItem]) -> Result<Vec<String>, Error> {
+    async fn map_raw_items(
+        &self,
+        items: &[RawItem],
+        costs: &CostTracker,
+    ) -> Result<Vec<String>, Error> {
         // Build the futures in a plain loop (not `.map`) so each one captures
         // owned data and a uniform `&self` borrow — avoids the higher-ranked
         // closure-lifetime bound that breaks `tokio::spawn`'s `Send + 'static`.
@@ -212,7 +281,7 @@ impl Summarizer {
         for item in items {
             let kind = item.kind;
             let text = item.text.clone();
-            jobs.push(async move { self.summarize_raw_item(kind, text).await });
+            jobs.push(async move { self.summarize_raw_item(kind, text, costs).await });
         }
         let results: Vec<Result<String, Error>> = stream::iter(jobs)
             .buffered(self.max_concurrency)
@@ -225,7 +294,12 @@ impl Summarizer {
     /// bounded chunks, each chunk is summarized, and the partials are reduced
     /// into one entry summary. This lets the full source contribute without
     /// depending on an arbitrarily large model context window.
-    async fn summarize_raw_item(&self, kind: MessageKind, text: String) -> Result<String, Error> {
+    async fn summarize_raw_item(
+        &self,
+        kind: MessageKind,
+        text: String,
+        costs: &CostTracker,
+    ) -> Result<String, Error> {
         if text.chars().count() <= self.passthrough_chars {
             return Ok(text);
         }
@@ -242,8 +316,13 @@ impl Summarizer {
                 format!("Part {} of {chunk_count}:\n\n{chunk}", index + 1)
             };
             partials.push(
-                self.complete(category.item_system(), category.item_user(&labeled), 300)
-                    .await?,
+                self.complete(
+                    category.item_system(),
+                    category.item_user(&labeled),
+                    300,
+                    costs,
+                )
+                .await?,
             );
         }
 
@@ -265,6 +344,7 @@ impl Summarizer {
                  Write the combined summary."
             ),
             500,
+            costs,
         )
         .await
     }
@@ -275,6 +355,7 @@ impl Summarizer {
         per_item: &[String],
         category: Category,
         commit_context: &str,
+        costs: &CostTracker,
     ) -> Result<String, Error> {
         let joined = per_item
             .iter()
@@ -296,6 +377,7 @@ impl Summarizer {
             category.reduce_system(),
             category.reduce_user(&joined, commit_context),
             500,
+            costs,
         )
         .await
     }
@@ -306,6 +388,7 @@ impl Summarizer {
         system: &'static str,
         user: String,
         max_tokens: u32,
+        costs: &CostTracker,
     ) -> Result<String, Error> {
         let request = ChatCompletionRequest::builder()
             .model(self.model.as_str())
@@ -324,6 +407,7 @@ impl Summarizer {
             .create(&request)
             .await
             .map_err(|e| Error::Llm(e.to_string()))?;
+        costs.record(response.usage.as_ref().and_then(|usage| usage.cost));
 
         let text = response
             .choices
@@ -926,5 +1010,18 @@ mod tests {
 
         assert_eq!(change.file, "src/lib.rs");
         assert!(change.diff.contains("-old\n+new"));
+    }
+
+    #[test]
+    fn cost_tracker_sums_reported_costs_and_counts_unpriced_requests() {
+        let tracker = CostTracker::default();
+        tracker.record(Some(0.001));
+        tracker.record(None);
+        tracker.record(Some(0.002));
+
+        let total = tracker.total();
+        assert!((total.usd - 0.003).abs() < f64::EPSILON);
+        assert_eq!(total.request_count, 3);
+        assert_eq!(total.unpriced_request_count, 1);
     }
 }

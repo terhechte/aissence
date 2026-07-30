@@ -47,7 +47,7 @@ pub use model::{
     MessageKind, MessageSummary, TimedMessage, TokenCount, agents_for, friendly_agent,
 };
 pub use persist::SummaryStore;
-pub use summarize::Summarizer;
+pub use summarize::{SummarizationCost, Summarizer};
 pub use ui::{CodeView, DiffView};
 
 /// Re-export of the underlying session-parsing crate, so consumers (such as the

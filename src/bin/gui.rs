@@ -21,8 +21,8 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use aissence::{
-    CoalescedHistory, CommitGroup, CommitSummary, DiffView, MessageKind, Summarizer, SummaryStore,
-    TokenCount, analyze, git, persist, summarize,
+    CoalescedHistory, CommitGroup, CommitSummary, DiffView, MessageKind, SummarizationCost,
+    Summarizer, SummaryStore, TokenCount, analyze, git, persist, summarize,
 };
 use eframe::egui;
 use elegance::{Accent, Button, Callout, CalloutTone, Card, Spinner, Theme};
@@ -91,7 +91,23 @@ enum Phase {
 struct SummarizeResult {
     group_index: usize,
     signature: u64,
+    batch_id: Option<u64>,
+    cost: SummarizationCost,
     outcome: Result<CommitSummary, String>,
+}
+
+#[derive(Clone, Copy)]
+struct QueuedSummary {
+    group_index: usize,
+    batch_id: u64,
+}
+
+struct SummaryBatch {
+    id: u64,
+    total_groups: usize,
+    remaining_groups: usize,
+    failed_groups: usize,
+    cost: SummarizationCost,
 }
 
 struct AissenceApp {
@@ -123,7 +139,10 @@ struct AissenceApp {
     // On-demand summarization.
     in_progress: HashSet<usize>,
     /// Group indices queued by "Summarize all", pumped with bounded concurrency.
-    queue: VecDeque<usize>,
+    queue: VecDeque<QueuedSummary>,
+    next_batch_id: u64,
+    active_batch: Option<SummaryBatch>,
+    batch_report: Option<(String, CalloutTone)>,
     results_tx: Sender<SummarizeResult>,
     results_rx: Receiver<SummarizeResult>,
 }
@@ -165,6 +184,9 @@ impl AissenceApp {
             patch_cache: HashMap::new(),
             in_progress: HashSet::new(),
             queue: VecDeque::new(),
+            next_batch_id: 1,
+            active_batch: None,
+            batch_report: None,
             results_tx,
             results_rx,
         }
@@ -221,6 +243,7 @@ impl AissenceApp {
     fn drain_results(&mut self, history: &mut CoalescedHistory) {
         while let Ok(result) = self.results_rx.try_recv() {
             self.in_progress.remove(&result.group_index);
+            let failed = result.outcome.is_err();
             match result.outcome {
                 Ok(summary) => {
                     if let Some(group) = history.groups.get_mut(result.group_index) {
@@ -239,11 +262,20 @@ impl AissenceApp {
                 }
                 Err(err) => self.notice = Some(format!("Summarization failed: {err}")),
             }
+            if let Some(batch_id) = result.batch_id {
+                self.finish_batch_item(batch_id, result.cost, failed);
+            }
         }
     }
 
     /// Spawn summarization for one group (also un-ignores it).
-    fn start_summarize(&mut self, group_index: usize, group: &CommitGroup, ctx: egui::Context) {
+    fn start_summarize(
+        &mut self,
+        group_index: usize,
+        group: &CommitGroup,
+        batch_id: Option<u64>,
+        ctx: egui::Context,
+    ) {
         let Some(summarizer) = self.summarizer.clone() else {
             return;
         };
@@ -263,17 +295,35 @@ impl AissenceApp {
         let tx = self.results_tx.clone();
         self.in_progress.insert(group_index);
         self.runtime.spawn(async move {
-            let outcome = summarizer
-                .summarize_group(&group)
-                .await
-                .map_err(|e| e.to_string());
+            let (outcome, cost) = summarizer.summarize_group_with_cost(&group).await;
             let _ = tx.send(SummarizeResult {
                 group_index,
                 signature,
-                outcome,
+                batch_id,
+                cost,
+                outcome: outcome.map_err(|e| e.to_string()),
             });
             ctx.request_repaint();
         });
+    }
+
+    fn finish_batch_item(&mut self, batch_id: u64, cost: SummarizationCost, failed: bool) {
+        let Some(batch) = self
+            .active_batch
+            .as_mut()
+            .filter(|batch| batch.id == batch_id)
+        else {
+            return;
+        };
+        batch.cost.add(cost);
+        batch.remaining_groups = batch.remaining_groups.saturating_sub(1);
+        batch.failed_groups += usize::from(failed);
+        if batch.remaining_groups != 0 {
+            return;
+        }
+
+        let batch = self.active_batch.take().expect("completed batch");
+        self.batch_report = Some(batch_report(&batch));
     }
 
     /// Mark a commit ignored / un-ignored.
@@ -303,7 +353,10 @@ impl AissenceApp {
             .groups
             .iter()
             .enumerate()
-            .filter(|(i, g)| self.is_summarizable(*i, g) && !self.queue.contains(i))
+            .filter(|(i, g)| {
+                self.is_summarizable(*i, g)
+                    && !self.queue.iter().any(|queued| queued.group_index == *i)
+            })
             .map(|(i, _)| i)
             .collect()
     }
@@ -311,13 +364,20 @@ impl AissenceApp {
     /// Start summarizing queued commits, up to [`MAX_CONCURRENT_SUMMARIES`].
     fn pump_queue(&mut self, history: &CoalescedHistory, ctx: &egui::Context) {
         while self.in_progress.len() < MAX_CONCURRENT_SUMMARIES {
-            let Some(idx) = self.queue.pop_front() else {
+            let Some(queued) = self.queue.pop_front() else {
                 break;
             };
-            if let Some(group) = history.groups.get(idx)
-                && self.is_summarizable(idx, group)
+            if let Some(group) = history.groups.get(queued.group_index)
+                && self.is_summarizable(queued.group_index, group)
             {
-                self.start_summarize(idx, group, ctx.clone());
+                self.start_summarize(
+                    queued.group_index,
+                    group,
+                    Some(queued.batch_id),
+                    ctx.clone(),
+                );
+            } else {
+                self.finish_batch_item(queued.batch_id, SummarizationCost::default(), false);
             }
         }
     }
@@ -425,14 +485,30 @@ impl AissenceApp {
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let pending = self.pending_for_all(&history);
-                    let enabled = self.summarizer.is_some() && !pending.is_empty();
+                    let enabled = self.summarizer.is_some()
+                        && self.active_batch.is_none()
+                        && !pending.is_empty();
                     let button = ui.add_enabled(
                         enabled,
                         Button::new(format!("Summarize all ({})", pending.len()))
                             .accent(Accent::Blue),
                     );
                     if button.clicked() {
-                        self.queue.extend(pending);
+                        let batch_id = self.next_batch_id;
+                        self.next_batch_id = self.next_batch_id.wrapping_add(1);
+                        self.active_batch = Some(SummaryBatch {
+                            id: batch_id,
+                            total_groups: pending.len(),
+                            remaining_groups: pending.len(),
+                            failed_groups: 0,
+                            cost: SummarizationCost::default(),
+                        });
+                        self.batch_report = None;
+                        self.queue
+                            .extend(pending.into_iter().map(|group_index| QueuedSummary {
+                                group_index,
+                                batch_id,
+                            }));
                     }
                     if self.summarizer.is_none() {
                         button.on_disabled_hover_text("Set OPENROUTER_API_KEY");
@@ -458,6 +534,9 @@ impl AissenceApp {
                 Callout::new(CalloutTone::Warning)
                     .body(notice.clone())
                     .show(ui, |_| {});
+            }
+            if let Some((report, tone)) = &self.batch_report {
+                Callout::new(*tone).body(report.clone()).show(ui, |_| {});
             }
             ui.add_space(2.0);
         });
@@ -644,7 +723,7 @@ impl AissenceApp {
                         let summarize =
                             ui.add_enabled(can_summarize, Button::new(label).accent(Accent::Blue));
                         if summarize.clicked() {
-                            self.start_summarize(group_idx, group, ui.ctx().clone());
+                            self.start_summarize(group_idx, group, None, ui.ctx().clone());
                         }
                         if self.summarizer.is_none() {
                             summarize.on_disabled_hover_text("Set OPENROUTER_API_KEY");
@@ -785,6 +864,65 @@ fn fmt_count(n: u64) -> String {
     }
 }
 
+fn batch_report(batch: &SummaryBatch) -> (String, CalloutTone) {
+    let groups = if batch.total_groups == 1 {
+        "1 commit".to_string()
+    } else {
+        format!("{} commits", batch.total_groups)
+    };
+    let requests = if batch.cost.request_count == 1 {
+        "1 API request".to_string()
+    } else {
+        format!("{} API requests", batch.cost.request_count)
+    };
+
+    let mut report = format!("Summarize all finished for {groups}. ");
+    if batch.cost.request_count == 0 {
+        report.push_str("No API requests were needed; cost $0.");
+    } else if batch.cost.unpriced_request_count == 0 {
+        report.push_str(&format!("{requests} cost {}.", fmt_usd(batch.cost.usd)));
+    } else if batch.cost.unpriced_request_count == batch.cost.request_count {
+        report.push_str(&format!(
+            "Cost unavailable: none of the {requests} returned billing data."
+        ));
+    } else {
+        report.push_str(&format!(
+            "Reported cost is {} across {requests}; {} did not return billing data, so the actual total may be higher.",
+            fmt_usd(batch.cost.usd),
+            batch.cost.unpriced_request_count
+        ));
+    }
+    if batch.failed_groups > 0 {
+        report.push_str(&format!(
+            " {} failed before completing.",
+            if batch.failed_groups == 1 {
+                "1 commit".to_string()
+            } else {
+                format!("{} commits", batch.failed_groups)
+            }
+        ));
+    }
+
+    let tone = if batch.failed_groups > 0 {
+        CalloutTone::Warning
+    } else if batch.cost.unpriced_request_count > 0 {
+        CalloutTone::Info
+    } else {
+        CalloutTone::Success
+    };
+    (report, tone)
+}
+
+fn fmt_usd(cost: f64) -> String {
+    if cost >= 1.0 {
+        format!("${cost:.4}")
+    } else if cost >= 0.01 {
+        format!("${cost:.6}")
+    } else {
+        format!("${cost:.8}")
+    }
+}
+
 fn prompt_count_label(count: usize) -> String {
     if count == 1 {
         "1 prompt".to_string()
@@ -868,4 +1006,49 @@ async fn load(folder: PathBuf, phase: Arc<Mutex<Phase>>, ctx: egui::Context) {
         Err(err) => Phase::Failed(format!("Worker crashed: {err}")),
     };
     ctx.request_repaint();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_report_shows_the_exact_reported_cost() {
+        let batch = SummaryBatch {
+            id: 1,
+            total_groups: 2,
+            remaining_groups: 0,
+            failed_groups: 0,
+            cost: SummarizationCost {
+                usd: 0.001234,
+                request_count: 7,
+                unpriced_request_count: 0,
+            },
+        };
+
+        let (report, _) = batch_report(&batch);
+        assert_eq!(
+            report,
+            "Summarize all finished for 2 commits. 7 API requests cost $0.00123400."
+        );
+    }
+
+    #[test]
+    fn batch_report_warns_when_some_requests_have_no_price() {
+        let batch = SummaryBatch {
+            id: 1,
+            total_groups: 1,
+            remaining_groups: 0,
+            failed_groups: 0,
+            cost: SummarizationCost {
+                usd: 0.02,
+                request_count: 3,
+                unpriced_request_count: 1,
+            },
+        };
+
+        let (report, _) = batch_report(&batch);
+        assert!(report.contains("Reported cost is $0.020000"));
+        assert!(report.contains("actual total may be higher"));
+    }
 }
