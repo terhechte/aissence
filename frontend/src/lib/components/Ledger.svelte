@@ -229,7 +229,7 @@
       <dl>
         <div><dt>Tokens read by model</dt><dd><strong>{formatCount(totals.tokenInput)}</strong><small>{totals.pricedCommits ? formatUsd(totals.inputCost) : 'Cost unavailable'}</small></dd></div>
         <div><dt>Tokens written back</dt><dd><strong>{formatCount(totals.tokenOutput)}</strong><small>{totals.pricedCommits ? formatUsd(totals.outputCost) : 'Cost unavailable'}</small></dd></div>
-        <div><dt>Potential API costs</dt><dd><strong>{totalCostLabel()}</strong><small>USD estimate</small></dd></div>
+        <div><dt>Estimated API costs</dt><dd><strong>{totalCostLabel()}</strong><small>USD estimate</small></dd></div>
         <div><dt>Commits from a conversation</dt><dd><strong>{commits.length}</strong></dd></div>
         <div><dt>Total user prompts</dt><dd><strong>{totals.prompts}</strong></dd></div>
         <div><dt>Days represented</dt><dd><strong>{totals.span ?? 'unknown'}</strong></dd></div>
@@ -266,7 +266,7 @@
             <div class="token-cell">
               <strong>{formatCount(commit.token_input)} in <em>{formatUsd(commit.input_cost_usd)}</em></strong>
               <strong>{formatCount(commit.token_output)} out <em>{formatUsd(commit.output_cost_usd)}</em></strong>
-              <small>{formatUsd(commit.potential_cost_usd)} potential</small>
+              <small>{formatUsd(commit.potential_cost_usd)} estimated</small>
             </div>
             <div class="line-cell">
               {#if commit.lines_added !== null}<span>+{commit.lines_added}</span><span>−{commit.lines_deleted}</span><small>{commit.files_changed} files · {promptCount(commit)} prompts</small>{:else}<small>{promptCount(commit)} prompts · stats unavailable</small>{/if}
@@ -330,10 +330,17 @@
                             </summary>
                             <div class="activity-rows">
                               {#each turn.activity as message}
+                                {@const content = messagePreview(message)}
                                 <div class="message">
                                   <span class:ai={message.kind === 'AiWrote'}>{kindLabel(message.kind)}</span>
                                   <time>{messageTime(message)}</time>
-                                  <div><p>{message.kind === 'AiChanged' ? changeDescription(message) : messagePreview(message)}</p></div>
+                                  <div>
+                                    {#if message.kind === 'AiChanged'}
+                                      <p>{changeDescription(message)}</p>
+                                    {:else}
+                                      <PromptMarkdown content={content} />
+                                    {/if}
+                                  </div>
                                 </div>
                               {/each}
                             </div>
@@ -354,7 +361,7 @@
                 <div class="facts">
                   <div><span>tokens in</span><strong>{formatCount(commit.token_input)} · {formatUsd(commit.input_cost_usd)}</strong></div>
                   <div><span>tokens out</span><strong>{formatCount(commit.token_output)} · {formatUsd(commit.output_cost_usd)}</strong></div>
-                  <div><span>potential API cost</span><strong>{formatUsd(commit.potential_cost_usd)}</strong></div>
+                  <div><span>estimated API cost</span><strong>{formatUsd(commit.potential_cost_usd)}</strong></div>
                   <div><span>prompts written</span><strong>{promptCount(commit)}</strong></div>
                   <div><span>lines</span><strong>{commit.lines_added === null ? 'unknown' : `+${commit.lines_added} / −${commit.lines_deleted}`}</strong></div>
                   <div><span>files changed</span><strong>{commit.files_changed ?? 'unknown'}</strong></div>
