@@ -43,6 +43,12 @@ pub const ENV_MODEL: &str = "OPENROUTER_MODEL";
 /// Model used when [`ENV_MODEL`] is unset.
 pub const DEFAULT_MODEL: &str = "inclusionai/ling-2.6-flash";
 
+/// Long prose is summarized in bounded chunks so all of it contributes without
+/// requiring one unbounded model context. Code-change renderings use one such
+/// chunk because their complete synthesized diffs are persisted separately.
+const SUMMARY_CHUNK_CHARS: usize = 6_000;
+const CHANGE_SUMMARY_CHARS: usize = 6_000;
+
 /// Summarizes commit groups using an OpenRouter-hosted model.
 pub struct Summarizer {
     client: OpenRouterClient,
@@ -51,8 +57,6 @@ pub struct Summarizer {
     max_concurrency: usize,
     /// Items at most this many characters are used verbatim (no model call).
     passthrough_chars: usize,
-    /// Items longer than this are truncated before being sent to the model.
-    item_char_budget: usize,
 }
 
 impl Summarizer {
@@ -77,7 +81,6 @@ impl Summarizer {
             model: model.into(),
             max_concurrency: 6,
             passthrough_chars: 320,
-            item_char_budget: 6_000,
         })
     }
 
@@ -119,12 +122,16 @@ impl Summarizer {
         let messages: Vec<MessageSummary> = items
             .into_iter()
             .zip(per_item)
-            .map(|(item, summary)| MessageSummary {
-                kind: item.kind,
-                summary,
-                changes: item.changes,
-                timestamp: item.timestamp,
-                tokens: item.tokens,
+            .map(|(item, summary)| {
+                let content = retained_content(&item);
+                MessageSummary {
+                    kind: item.kind,
+                    summary,
+                    content,
+                    changes: item.changes,
+                    timestamp: item.timestamp,
+                    tokens: item.tokens,
+                }
             })
             .collect();
 
@@ -205,21 +212,61 @@ impl Summarizer {
         for item in items {
             let kind = item.kind;
             let text = item.text.clone();
-            jobs.push(async move {
-                if text.chars().count() <= self.passthrough_chars {
-                    return Ok::<String, Error>(text);
-                }
-                let category = Category::for_kind(kind);
-                let truncated = truncate_chars(&text, self.item_char_budget);
-                self.complete(category.item_system(), category.item_user(&truncated), 300)
-                    .await
-            });
+            jobs.push(async move { self.summarize_raw_item(kind, text).await });
         }
         let results: Vec<Result<String, Error>> = stream::iter(jobs)
             .buffered(self.max_concurrency)
             .collect()
             .await;
         results.into_iter().collect()
+    }
+
+    /// Summarize one source entry. Long user/assistant prose is split into
+    /// bounded chunks, each chunk is summarized, and the partials are reduced
+    /// into one entry summary. This lets the full source contribute without
+    /// depending on an arbitrarily large model context window.
+    async fn summarize_raw_item(&self, kind: MessageKind, text: String) -> Result<String, Error> {
+        if text.chars().count() <= self.passthrough_chars {
+            return Ok(text);
+        }
+
+        let category = Category::for_kind(kind);
+        let input = summary_input(kind, &text);
+        let chunks = chunk_chars(&input, SUMMARY_CHUNK_CHARS);
+        let chunk_count = chunks.len();
+        let mut partials = Vec::with_capacity(chunk_count);
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            let labeled = if chunk_count == 1 {
+                chunk
+            } else {
+                format!("Part {} of {chunk_count}:\n\n{chunk}", index + 1)
+            };
+            partials.push(
+                self.complete(category.item_system(), category.item_user(&labeled), 300)
+                    .await?,
+            );
+        }
+
+        if partials.len() == 1 {
+            return Ok(partials.pop().unwrap_or_default());
+        }
+        let joined = partials
+            .iter()
+            .enumerate()
+            .map(|(index, summary)| format!("{}. {summary}", index + 1))
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.complete(
+            "You combine ordered partial summaries of one long message from a coding \
+             session. Preserve all important requests, decisions, caveats, and conclusions \
+             while removing repetition. Reply with one concise summary and no preamble.",
+            format!(
+                "Ordered partial summaries of one message:\n\n{joined}\n\n\
+                 Write the combined summary."
+            ),
+            500,
+        )
+        .await
     }
 
     /// Stage 2: condense per-item summaries into one final summary.
@@ -382,20 +429,90 @@ fn coalesce_consecutive(items: Vec<RawItem>) -> Vec<RawItem> {
 /// session data — without calling the model.
 ///
 /// Token usage is a pure function of the parsed sessions, so this fills in the
-/// per-commit total and the per-message counts on summaries created before
-/// token tracking existed (e.g. a cached `.aissence` entry). It re-derives the
-/// same per-message item structure [`Summarizer::summarize_group`] built the
-/// summary from, so the counts line up with the existing `messages` by index;
-/// if that structure no longer matches (the group changed), only the exact
-/// per-commit total is set.
+/// per-commit total, per-agent/model totals, and per-message counts on summaries
+/// created before token tracking existed (e.g. a cached `.aissence` entry). It
+/// re-derives the same per-message item structure
+/// [`Summarizer::summarize_group`] built the summary from, so the counts line up
+/// with the existing `messages` by index; if that structure no longer matches
+/// (the group changed), the exact commit and agent/model totals are still set.
 pub fn attach_token_usage(group: &CommitGroup, summary: &mut CommitSummary) {
     summary.tokens = group.token_usage();
+    summary.agents = crate::model::agents_for(group);
     let items = coalesce_consecutive(raw_items(group));
-    if items.len() == summary.messages.len() {
+    if items_match_summary(&items, summary) {
         for (item, message) in items.iter().zip(summary.messages.iter_mut()) {
             message.tokens = item.tokens;
         }
     }
+}
+
+/// Backfill retained user/assistant source text onto a cached summary without
+/// calling the model. Returns whether the summary changed.
+///
+/// Old `.aissence` files remain readable because the fields are optional. When
+/// their message structure still matches the current source sessions, this
+/// function upgrades them in place by attaching the complete user and assistant
+/// text to each corresponding summary entry.
+pub fn attach_source_content(group: &CommitGroup, summary: &mut CommitSummary) -> bool {
+    let items = coalesce_consecutive(raw_items(group));
+    if !items_match_summary(&items, summary) {
+        return false;
+    }
+
+    let mut changed = false;
+    for (item, message) in items.iter().zip(summary.messages.iter_mut()) {
+        let content = retained_content(item);
+        if message.content != content {
+            message.content = content;
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn items_match_summary(items: &[RawItem], summary: &CommitSummary) -> bool {
+    items.len() == summary.messages.len()
+        && items
+            .iter()
+            .zip(&summary.messages)
+            .all(|(item, message)| item.kind == message.kind)
+}
+
+/// Source text persisted next to a message summary.
+fn retained_content(item: &RawItem) -> Option<String> {
+    match item.kind {
+        MessageKind::UserWrote | MessageKind::AiWrote => Some(item.text.clone()),
+        MessageKind::AiChanged => None,
+    }
+}
+
+/// Text supplied to the stage-1 model. Preserve user and assistant prose in
+/// full, and keep the existing bounded rendering for code changes (whose full
+/// synthesized diffs are persisted separately).
+fn summary_input(kind: MessageKind, text: &str) -> String {
+    match kind {
+        MessageKind::UserWrote | MessageKind::AiWrote => text.to_string(),
+        MessageKind::AiChanged => truncate_chars(text, CHANGE_SUMMARY_CHARS),
+    }
+}
+
+fn chunk_chars(text: &str, max_chars: usize) -> Vec<String> {
+    assert!(max_chars > 0);
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut count = 0;
+    for character in text.chars() {
+        current.push(character);
+        count += 1;
+        if count == max_chars {
+            chunks.push(std::mem::take(&mut current));
+            count = 0;
+        }
+    }
+    if !current.is_empty() || chunks.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 /// Extract the file-editing tool calls of `message` as [`CodeChange`]s.
@@ -666,6 +783,42 @@ mod tests {
         assert_eq!(merged[3].text, "g"); // separated by the other kinds
     }
 
+    #[test]
+    fn retains_and_summarizes_user_and_assistant_text_without_a_length_cap() {
+        let long_user = "u".repeat(30_000);
+        let long_ai = "a".repeat(30_000);
+        let user = item(MessageKind::UserWrote, &long_user);
+        let ai = item(MessageKind::AiWrote, &long_ai);
+
+        assert_eq!(retained_content(&user).as_deref(), Some(long_user.as_str()));
+        assert_eq!(retained_content(&ai).as_deref(), Some(long_ai.as_str()));
+        assert_eq!(summary_input(user.kind, &user.text), long_user);
+        assert_eq!(summary_input(ai.kind, &ai.text), long_ai);
+    }
+
+    #[test]
+    fn long_summary_input_is_chunked_without_losing_content() {
+        let text = format!("{}🦀{}", "a".repeat(6_003), "b".repeat(6_004));
+        let chunks = chunk_chars(&text, SUMMARY_CHUNK_CHARS);
+
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 6_000));
+        assert_eq!(chunks.concat(), text);
+    }
+
+    #[test]
+    fn retained_content_preserves_coalesced_source_text() {
+        let merged = coalesce_consecutive(vec![
+            item(MessageKind::UserWrote, "first"),
+            item(MessageKind::UserWrote, "second"),
+        ]);
+
+        assert_eq!(
+            retained_content(&merged[0]).as_deref(),
+            Some("first\n\nsecond")
+        );
+    }
+
     fn timed(role: ncs::Role, text: &str, tokens: Option<TokenCount>) -> TimedMessage {
         TimedMessage {
             timestamp: Some(chrono::Utc::now()),
@@ -731,6 +884,7 @@ mod tests {
                 MessageSummary {
                     kind: MessageKind::UserWrote,
                     summary: "hi".into(),
+                    content: None,
                     changes: vec![],
                     timestamp: None,
                     tokens: None,
@@ -738,6 +892,7 @@ mod tests {
                 MessageSummary {
                     kind: MessageKind::AiWrote,
                     summary: "hello".into(),
+                    content: None,
                     changes: vec![],
                     timestamp: None,
                     tokens: None,
@@ -747,10 +902,17 @@ mod tests {
         };
 
         attach_token_usage(&group, &mut summary);
+        let content_changed = attach_source_content(&group, &mut summary);
 
         assert_eq!(summary.tokens, Some(usage)); // exact conversation total
+        assert_eq!(summary.agents.len(), 1);
+        assert_eq!(summary.agents[0].tokens, Some(usage));
         assert_eq!(summary.messages[0].tokens, None); // user
         assert_eq!(summary.messages[1].tokens, Some(usage)); // assistant reply
+        assert!(content_changed);
+        assert_eq!(summary.messages[0].content.as_deref(), Some("hi"));
+        assert_eq!(summary.messages[1].content.as_deref(), Some("hello there"));
+        assert!(!attach_source_content(&group, &mut summary));
     }
 
     #[test]

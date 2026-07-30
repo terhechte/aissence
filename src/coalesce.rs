@@ -75,7 +75,18 @@ fn flatten_messages(sessions: &[ncs::Session]) -> (Vec<TimedMessage>, Vec<TimedM
 
     for session in sessions {
         for turn in &session.turns {
-            let usage = turn.token_usage.as_ref().map(crate::model::TokenCount::from);
+            let usage = turn
+                .token_usage
+                .as_ref()
+                .map(crate::model::TokenCount::from);
+            // Prefer the model attached to this turn's usage. Session metadata
+            // is only a fallback: several formats can switch models between
+            // turns while retaining one session id.
+            let turn_model = turn
+                .token_usage
+                .as_ref()
+                .and_then(|usage| usage.model.clone())
+                .or_else(|| session.metadata.model.clone());
             // A turn's usage covers the reply it produced, so attribute it to the
             // turn's assistant message (falling back to its last message). Every
             // other message of the turn carries `None`, so summing across a group
@@ -95,7 +106,7 @@ fn flatten_messages(sessions: &[ncs::Session]) -> (Vec<TimedMessage>, Vec<TimedM
                     content: message.content.clone(),
                     session_id: session.metadata.session_id.clone(),
                     provider: session.metadata.provider.clone(),
-                    model: session.metadata.model.clone(),
+                    model: turn_model.clone(),
                     agent: Some(crate::model::friendly_agent(&session.format)),
                     session_path: session.path.clone(),
                     token_usage,
@@ -153,6 +164,7 @@ mod tests {
             author_name: "tester".into(),
             author_email: "t@example.com".into(),
             time: Utc.with_ymd_and_hms(2026, 1, 1, hour, 0, 0).unwrap(),
+            stats: Default::default(),
         }
     }
 
@@ -241,7 +253,9 @@ mod tests {
                 user_msg("do a thing", Some("2026-01-01T09:00:00Z")),
                 ncs::Message {
                     role: ncs::Role::Assistant,
-                    content: vec![ncs::ContentBlock::Text { text: "done".into() }],
+                    content: vec![ncs::ContentBlock::Text {
+                        text: "done".into(),
+                    }],
                     timestamp: Some("2026-01-01T09:00:01Z".into()),
                 },
             ],
@@ -250,14 +264,16 @@ mod tests {
                 output: 20,
                 cache_read: Some(5),
                 cache_create: None,
-                model: None,
+                model: Some("model-a".into()),
             }),
         });
         // A second turn adds more usage, to prove per-group summing.
         session.turns.push(ncs::Turn {
             messages: vec![ncs::Message {
                 role: ncs::Role::Assistant,
-                content: vec![ncs::ContentBlock::Text { text: "more".into() }],
+                content: vec![ncs::ContentBlock::Text {
+                    text: "more".into(),
+                }],
                 timestamp: Some("2026-01-01T09:00:02Z".into()),
             }],
             token_usage: Some(ncs::TokenUsage {
@@ -265,7 +281,7 @@ mod tests {
                 output: 8,
                 cache_read: Some(2),
                 cache_create: None,
-                model: None,
+                model: Some("model-b".into()),
             }),
         });
 
@@ -276,12 +292,28 @@ mod tests {
         assert!(group.messages[0].token_usage.is_none());
         assert_eq!(group.messages[1].token_usage.map(|t| t.input), Some(100));
         assert_eq!(group.messages[2].token_usage.map(|t| t.output), Some(8));
+        assert_eq!(group.messages[1].model.as_deref(), Some("model-a"));
+        assert_eq!(group.messages[2].model.as_deref(), Some("model-b"));
+        assert_eq!(group.prompt_count(), 1);
 
         // The group total is the exact sum across both turns.
         let total = group.token_usage().expect("group has usage");
         assert_eq!(total.input, 150);
         assert_eq!(total.output, 28);
         assert_eq!(total.cache_read, Some(7));
+
+        // Per-model totals retain the same exact turn usage.
+        let agents = crate::model::agents_for(group);
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents[0].model.as_deref(), Some("model-a"));
+        assert_eq!(agents[0].tokens.map(|tokens| tokens.input), Some(100));
+        assert_eq!(agents[1].model.as_deref(), Some("model-b"));
+        assert_eq!(agents[1].tokens.map(|tokens| tokens.output), Some(8));
+        let mut by_model_total = crate::model::TokenCount::default();
+        for usage in &agents {
+            by_model_total.add(&usage.tokens.expect("model has usage"));
+        }
+        assert_eq!(by_model_total, total);
     }
 
     #[test]

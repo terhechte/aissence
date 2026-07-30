@@ -3,6 +3,9 @@
 //! The upstream normalizer bundled by the project targets an older payload
 //! shape. Current rollouts use `session_meta.payload.id`, event messages for
 //! real user prompts, array-valued response content, and `last_token_usage`.
+//! Internal approval-guardian rollouts are skipped: their synthetic
+//! user/assistant exchange is implementation metadata, not part of the user's
+//! coding conversation.
 
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -105,6 +108,10 @@ fn parse_file(path: &Path) -> Result<Option<ncs::Session>, String> {
         return Ok(None);
     };
 
+    if is_approval_guardian(meta) {
+        return Ok(None);
+    }
+
     let has_user_events = entries.iter().any(|entry| {
         string_at(entry, &["type"]) == Some("event_msg")
             && string_at(entry, &["payload", "type"]) == Some("user_message")
@@ -127,6 +134,7 @@ fn parse_file(path: &Path) -> Result<Option<ncs::Session>, String> {
     session.subagent_type = Some("interactive".to_string());
 
     let mut current = ncs::Turn::default();
+    let mut current_model = session.metadata.model.clone();
     for entry in &entries {
         let outer_type = string_at(entry, &["type"]).unwrap_or("");
         let payload = entry.get("payload").unwrap_or(&Value::Null);
@@ -134,8 +142,11 @@ fn parse_file(path: &Path) -> Result<Option<ncs::Session>, String> {
         let timestamp = timestamp_at(entry, &["timestamp"]);
 
         if outer_type == "turn_context" {
-            if session.metadata.model.is_none() {
-                session.metadata.model = string_at(payload, &["model"]).map(str::to_string);
+            if let Some(model) = string_at(payload, &["model"]) {
+                current_model = Some(model.to_string());
+                if session.metadata.model.is_none() {
+                    session.metadata.model = Some(model.to_string());
+                }
             }
             continue;
         }
@@ -164,12 +175,11 @@ fn parse_file(path: &Path) -> Result<Option<ncs::Session>, String> {
                 }
                 "token_count" => {
                     if let Some(usage) = value_at(payload, &["info", "last_token_usage"])
-                        .and_then(|usage| token_usage(usage, &session))
+                        .and_then(|usage| token_usage(usage, current_model.as_deref()))
                     {
                         add_usage(&mut current.token_usage, usage);
-                    } else if let Some(usage) =
-                        value_at(payload, &["info", "total_token_usage"])
-                            .and_then(|usage| token_usage(usage, &session))
+                    } else if let Some(usage) = value_at(payload, &["info", "total_token_usage"])
+                        .and_then(|usage| token_usage(usage, current_model.as_deref()))
                     {
                         // Older rollouts only expose a cumulative snapshot.
                         // Replace rather than add repeated snapshots.
@@ -284,6 +294,11 @@ fn parse_file(path: &Path) -> Result<Option<ncs::Session>, String> {
     Ok((!session.turns.is_empty()).then_some(session))
 }
 
+fn is_approval_guardian(meta: &Value) -> bool {
+    string_at(meta, &["thread_source"]) == Some("subagent")
+        && string_at(meta, &["source", "subagent", "other"]) == Some("guardian")
+}
+
 fn start_user_turn(
     session: &mut ncs::Session,
     current: &mut ncs::Turn,
@@ -324,7 +339,7 @@ fn response_message_blocks(payload: &Value) -> Vec<ncs::ContentBlock> {
     }
 }
 
-fn token_usage(value: &Value, session: &ncs::Session) -> Option<ncs::TokenUsage> {
+fn token_usage(value: &Value, model: Option<&str>) -> Option<ncs::TokenUsage> {
     let input = integer_at(value, &["input_tokens"]).unwrap_or(0).max(0) as u64;
     let output = integer_at(value, &["output_tokens"]).unwrap_or(0).max(0) as u64
         + integer_at(value, &["reasoning_output_tokens"])
@@ -336,7 +351,7 @@ fn token_usage(value: &Value, session: &ncs::Session) -> Option<ncs::TokenUsage>
         output,
         cache_read,
         cache_create: None,
-        model: session.metadata.model.clone(),
+        model: model.map(str::to_string),
     })
 }
 
@@ -378,6 +393,71 @@ mod tests {
         assert_eq!(session.metadata.model.as_deref(), Some("gpt-5.4"));
         assert_eq!(session.tool_uses().next().unwrap().1["path"], "x");
         assert_eq!(session.total_tokens().output, 6);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn preserves_the_model_for_each_turn_when_a_session_switches_models() {
+        let directory = std::env::temp_dir().join(format!(
+            "aissence-codex-model-switch-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&directory);
+        let path = directory.join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"s1","cwd":"/project","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-01-01T00:00:01Z","type":"turn_context","payload":{"model":"gpt-a"}}"#,
+                r#"{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"First"}}"#,
+                r#"{"timestamp":"2026-01-01T00:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"One"}]}}"#,
+                r#"{"timestamp":"2026-01-01T00:00:04Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":2}}}}"#,
+                r#"{"timestamp":"2026-01-01T00:00:05Z","type":"turn_context","payload":{"model":"gpt-b"}}"#,
+                r#"{"timestamp":"2026-01-01T00:00:06Z","type":"event_msg","payload":{"type":"user_message","message":"Second"}}"#,
+                r#"{"timestamp":"2026-01-01T00:00:07Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Two"}]}}"#,
+                r#"{"timestamp":"2026-01-01T00:00:08Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":20,"output_tokens":3}}}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_file(&path).unwrap().unwrap();
+        assert_eq!(session.turns.len(), 2);
+        assert_eq!(
+            session.turns[0]
+                .token_usage
+                .as_ref()
+                .and_then(|usage| usage.model.as_deref()),
+            Some("gpt-a")
+        );
+        assert_eq!(
+            session.turns[1]
+                .token_usage
+                .as_ref()
+                .and_then(|usage| usage.model.as_deref()),
+            Some("gpt-b")
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn skips_internal_approval_guardian_rollouts() {
+        let directory =
+            std::env::temp_dir().join(format!("aissence-codex-guardian-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&directory);
+        let path = directory.join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"guardian","cwd":"/project","thread_source":"subagent","source":{"subagent":{"other":"guardian"}}}}"#,
+                r#"{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"The following is the Codex agent history added since your last approval assessment."}}"#,
+                r#"{"timestamp":"2026-01-01T00:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"outcome\":\"allow\"}"}]}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        assert!(parse_file(&path).unwrap().is_none());
         let _ = std::fs::remove_dir_all(directory);
     }
 }

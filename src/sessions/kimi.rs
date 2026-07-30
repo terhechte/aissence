@@ -293,6 +293,9 @@ fn parse_wire(
                     total.output += usage.output;
                     add_optional(&mut total.cache_read, usage.cache_read);
                     add_optional(&mut total.cache_create, usage.cache_create);
+                    if total.model.is_none() {
+                        total.model = usage.model;
+                    }
                 }
             }
             _ => {}

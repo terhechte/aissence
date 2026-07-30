@@ -12,7 +12,8 @@
 //! - **right** (toggleable, hidden by default): syntax-highlighted code changes
 //!   — the whole commit diff, or the edits of a selected "ai changed" message.
 //!
-//! Generated summaries and ignore flags persist to `<folder>/.aissence`.
+//! Generated summaries, git metadata, and ignore flags persist to
+//! `<folder>/.aissence`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -20,7 +21,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use aissence::{
-    CoalescedHistory, CommitGroup, CommitSummary, DiffView, MessageKind, SummaryStore, Summarizer,
+    CoalescedHistory, CommitGroup, CommitSummary, DiffView, MessageKind, Summarizer, SummaryStore,
     TokenCount, analyze, git, persist, summarize,
 };
 use eframe::egui;
@@ -89,7 +90,6 @@ enum Phase {
 /// Result of one background summarization, sent back to the UI thread.
 struct SummarizeResult {
     group_index: usize,
-    commit_id: Option<String>,
     signature: u64,
     outcome: Result<CommitSummary, String>,
 }
@@ -100,7 +100,7 @@ struct AissenceApp {
     phase: Arc<Mutex<Phase>>,
     /// `None` when `OPENROUTER_API_KEY` is unset (Summarize disabled).
     summarizer: Option<Arc<Summarizer>>,
-    /// On-disk cache of summaries + ignore flags (lives on the UI thread).
+    /// On-disk cache of summaries, git metadata, and ignore flags.
     store: SummaryStore,
 
     // Populated once parsing finishes (moved out of `phase`).
@@ -172,8 +172,8 @@ impl AissenceApp {
 
     fn on_ready(&mut self, mut history: CoalescedHistory) {
         // Apply summaries cached in `.aissence` (resume without re-summarizing).
-        // Token counts come from the session data, not the model, so backfill
-        // them onto caches that predate token tracking — for display now, and
+        // Token counts and retained source text come from the session data, not
+        // the model, so backfill them onto older caches — for display now, and
         // once back to disk so the `.aissence` output carries them too.
         let mut backfills: Vec<(String, u64, CommitSummary)> = Vec::new();
         for group in history.groups.iter_mut() {
@@ -183,9 +183,12 @@ impl AissenceApp {
             let signature = persist::signature(group);
             if let Some(cached) = self.store.get(&commit_id, signature) {
                 let mut summary = cached.clone();
-                let needs_backfill = summary.tokens.is_none() && group.token_usage().is_some();
+                let current_agents = aissence::agents_for(group);
+                let token_backfill = (summary.tokens.is_none() && group.token_usage().is_some())
+                    || summary.agents != current_agents;
                 summarize::attach_token_usage(group, &mut summary);
-                if needs_backfill {
+                let content_backfill = summarize::attach_source_content(group, &mut summary);
+                if token_backfill || content_backfill {
                     backfills.push((commit_id, signature, summary.clone()));
                 }
                 group.summary = Some(summary);
@@ -194,6 +197,14 @@ impl AissenceApp {
         if !backfills.is_empty()
             && let Err(err) = self.store.backfill_summaries(backfills)
         {
+            self.notice = Some(format!("Could not write .aissence: {err}"));
+        }
+        if let Err(err) = self.store.backfill_commit_metadata(
+            history
+                .groups
+                .iter()
+                .filter_map(|group| group.commit.as_ref()),
+        ) {
             self.notice = Some(format!("Could not write .aissence: {err}"));
         }
 
@@ -215,9 +226,13 @@ impl AissenceApp {
                     if let Some(group) = history.groups.get_mut(result.group_index) {
                         group.summary = Some(summary.clone());
                     }
-                    if let Some(commit_id) = &result.commit_id
+                    if let Some(commit) = history
+                        .groups
+                        .get(result.group_index)
+                        .and_then(|group| group.commit.as_ref())
                         && let Err(err) =
-                            self.store.insert_and_save(commit_id, result.signature, summary)
+                            self.store
+                                .insert_and_save(commit, result.signature, summary)
                     {
                         self.notice = Some(format!("Could not write .aissence: {err}"));
                     }
@@ -254,7 +269,6 @@ impl AissenceApp {
                 .map_err(|e| e.to_string());
             let _ = tx.send(SummarizeResult {
                 group_index,
-                commit_id,
                 signature,
                 outcome,
             });
@@ -495,8 +509,11 @@ impl AissenceApp {
 
                     let (headline, mut sub) = match &group.commit {
                         Some(commit) => {
-                            let mut sub =
-                                format!("{}  ·  {} msg", commit.short_id, group.messages.len());
+                            let mut sub = format!(
+                                "{}  ·  {}",
+                                commit.short_id,
+                                prompt_count_label(group.prompt_count())
+                            );
                             if ignored {
                                 sub.push_str("  ·  ignored");
                             } else if summarized {
@@ -506,7 +523,7 @@ impl AissenceApp {
                         }
                         None => (
                             "Uncommitted work".to_string(),
-                            format!("pending  ·  {} msg", group.messages.len()),
+                            format!("pending  ·  {}", prompt_count_label(group.prompt_count())),
                         ),
                     };
                     // Token counts (from session data — shown even before summarizing).
@@ -765,6 +782,14 @@ fn fmt_count(n: u64) -> String {
         format!("{:.1}k", n as f64 / 1_000.0)
     } else {
         n.to_string()
+    }
+}
+
+fn prompt_count_label(count: usize) -> String {
+    if count == 1 {
+        "1 prompt".to_string()
+    } else {
+        format!("{count} prompts")
     }
 }
 

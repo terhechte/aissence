@@ -1,5 +1,6 @@
-//! Persisting commit summaries to `<folder>/.aissence` so the app can resume
-//! where it left off instead of re-summarizing on every launch.
+//! Persisting commit summaries and their supporting git metadata to
+//! `<folder>/.aissence` so the app can resume where it left off instead of
+//! re-summarizing on every launch.
 //!
 //! Summaries are keyed by full commit id — a commit (and the conversation that
 //! led to it) is immutable, so a cached summary stays valid forever. A content
@@ -16,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{CommitGroup, CommitSummary};
+use crate::model::{CommitGroup, CommitInfo, CommitStats, CommitSummary};
 
 /// File name (inside the analyzed folder) where summaries are cached.
 pub const CACHE_FILE: &str = ".aissence";
@@ -26,6 +27,14 @@ const VERSION: u32 = 1;
 #[derive(Serialize, Deserialize, Clone)]
 struct CacheEntry {
     signature: u64,
+    /// Git metadata copied into the cache so consumers do not need repository
+    /// access for common commit-list data. Optional for old version-1 files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    date: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stats: Option<CommitStats>,
     summary: CommitSummary,
 }
 
@@ -39,8 +48,8 @@ struct CacheFile {
     ignored: BTreeSet<String>,
 }
 
-/// In-memory + on-disk store of commit summaries (and ignore flags) for one
-/// folder.
+/// In-memory + on-disk store of commit summaries, git metadata, and ignore
+/// flags for one folder.
 pub struct SummaryStore {
     path: PathBuf,
     commits: BTreeMap<String, CacheEntry>,
@@ -102,8 +111,8 @@ impl SummaryStore {
     ///
     /// Each tuple is `(commit_id, signature, summary)`; an entry is updated only
     /// when a cached one with a matching signature exists. Used to backfill
-    /// token counts — derived from session data, not the model — onto summaries
-    /// that predate token tracking, in a single write rather than one per commit.
+    /// session-derived data such as token counts and retained source text onto
+    /// older summaries, in a single write rather than one per commit.
     pub fn backfill_summaries(
         &mut self,
         updates: Vec<(String, u64, CommitSummary)>,
@@ -120,15 +129,47 @@ impl SummaryStore {
         if changed { self.save() } else { Ok(()) }
     }
 
+    /// Populate or refresh immutable git metadata on existing cached entries
+    /// and persist once. This upgrades older version-1 files without requiring
+    /// their conversations to be summarized again.
+    pub fn backfill_commit_metadata<'a>(
+        &mut self,
+        commits: impl IntoIterator<Item = &'a CommitInfo>,
+    ) -> std::io::Result<()> {
+        let mut changed = false;
+        for commit in commits {
+            if let Some(entry) = self.commits.get_mut(&commit.id) {
+                let title = Some(commit.summary.clone());
+                let date = Some(commit.time);
+                let stats = Some(commit.stats);
+                if entry.title != title || entry.date != date || entry.stats != stats {
+                    entry.title = title;
+                    entry.date = date;
+                    entry.stats = stats;
+                    changed = true;
+                }
+            }
+        }
+        if changed { self.save() } else { Ok(()) }
+    }
+
     /// Insert (or replace) a summary and persist the whole store to disk.
     pub fn insert_and_save(
         &mut self,
-        commit_id: &str,
+        commit: &CommitInfo,
         signature: u64,
         summary: CommitSummary,
     ) -> std::io::Result<()> {
-        self.commits
-            .insert(commit_id.to_string(), CacheEntry { signature, summary });
+        self.commits.insert(
+            commit.id.clone(),
+            CacheEntry {
+                signature,
+                title: Some(commit.summary.clone()),
+                date: Some(commit.time),
+                stats: Some(commit.stats),
+                summary,
+            },
+        );
         self.save()
     }
 
@@ -176,7 +217,10 @@ fn role_index(role: crate::ncs::Role) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{CommitSummary, MessageKind, MessageSummary};
+    use crate::model::{
+        AgentUsage, CommitInfo, CommitStats, CommitSummary, MessageKind, MessageSummary, TokenCount,
+    };
+    use chrono::TimeZone;
 
     fn tmp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("aissence-persist-{}-{tag}", std::process::id()));
@@ -193,13 +237,43 @@ mod tests {
             messages: vec![MessageSummary {
                 kind: MessageKind::UserWrote,
                 summary: "hello".into(),
+                content: Some("hello".into()),
                 changes: vec![],
                 timestamp: None,
                 tokens: None,
             }],
-            agents: vec![],
+            agents: vec![AgentUsage {
+                provider: "Codex".into(),
+                model: Some("gpt-test".into()),
+                tokens: Some(TokenCount {
+                    input: 10,
+                    output: 4,
+                    cache_read: Some(2),
+                    cache_create: None,
+                }),
+            }],
             meta: "an overview".into(),
             tokens: None,
+        }
+    }
+
+    fn commit() -> CommitInfo {
+        CommitInfo {
+            id: "abc123".into(),
+            short_id: "abc123".into(),
+            summary: "Add useful metadata".into(),
+            body: None,
+            message: "Add useful metadata".into(),
+            author_name: "tester".into(),
+            author_email: "t@example.com".into(),
+            time: chrono::Utc
+                .with_ymd_and_hms(2026, 7, 29, 10, 30, 0)
+                .unwrap(),
+            stats: CommitStats {
+                files_changed: 3,
+                lines_added: 21,
+                lines_deleted: 4,
+            },
         }
     }
 
@@ -208,20 +282,107 @@ mod tests {
         let dir = tmp_dir("rt");
         {
             let mut store = SummaryStore::load(&dir);
-            store.insert_and_save("abc123", 42, sample()).unwrap();
+            store.insert_and_save(&commit(), 42, sample()).unwrap();
         }
         // The file actually lands in the folder.
         assert!(dir.join(CACHE_FILE).exists());
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join(CACHE_FILE)).unwrap()).unwrap();
+        let entry = &json["commits"]["abc123"];
+        assert_eq!(entry["title"], "Add useful metadata");
+        assert_eq!(entry["date"], "2026-07-29T10:30:00Z");
+        assert_eq!(entry["stats"]["files_changed"], 3);
+        assert_eq!(entry["stats"]["lines_added"], 21);
+        assert_eq!(entry["stats"]["lines_deleted"], 4);
+        assert_eq!(entry["summary"]["agents"][0]["model"], "gpt-test");
+        assert_eq!(entry["summary"]["agents"][0]["tokens"]["input"], 10);
+        assert_eq!(entry["summary"]["agents"][0]["tokens"]["output"], 4);
 
         let store = SummaryStore::load(&dir);
         let got = store.get("abc123", 42).expect("cached entry");
         assert_eq!(got.user_requested, "did things");
         assert_eq!(got.meta, "an overview");
         assert_eq!(got.messages.len(), 1);
+        assert_eq!(got.messages[0].content.as_deref(), Some("hello"));
+        assert_eq!(got.agents[0].model.as_deref(), Some("gpt-test"));
+        assert_eq!(got.agents[0].tokens.map(|tokens| tokens.input), Some(10));
 
         // Signature mismatch and unknown id both miss.
         assert!(store.get("abc123", 99).is_none());
         assert!(store.get("missing", 42).is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn backfills_git_metadata_onto_an_older_entry() {
+        let dir = tmp_dir("old-metadata");
+        let json = serde_json::json!({
+            "version": 1,
+            "commits": {
+                "abc123": {
+                    "signature": 42,
+                    "summary": sample()
+                }
+            }
+        });
+        std::fs::write(
+            dir.join(CACHE_FILE),
+            serde_json::to_string_pretty(&json).unwrap(),
+        )
+        .unwrap();
+
+        let mut store = SummaryStore::load(&dir);
+        store.backfill_commit_metadata([&commit()]).unwrap();
+
+        let upgraded: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join(CACHE_FILE)).unwrap()).unwrap();
+        let entry = &upgraded["commits"]["abc123"];
+        assert_eq!(entry["title"], "Add useful metadata");
+        assert_eq!(entry["date"], "2026-07-29T10:30:00Z");
+        assert_eq!(entry["stats"]["files_changed"], 3);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn older_messages_without_source_content_still_load() {
+        let dir = tmp_dir("old-content");
+        let json = serde_json::json!({
+            "version": 1,
+            "commits": {
+                "abc123": {
+                    "signature": 42,
+                    "summary": {
+                        "user_requested": "asked",
+                        "ai_answered": "",
+                        "ai_implemented": "",
+                        "agents": [{
+                            "provider": "Codex",
+                            "model": "gpt-old"
+                        }],
+                        "messages": [{
+                            "kind": "UserWrote",
+                            "summary": "asked",
+                            "changes": [],
+                            "timestamp": null
+                        }]
+                    }
+                }
+            },
+            "ignored": []
+        });
+        std::fs::write(
+            dir.join(CACHE_FILE),
+            serde_json::to_string_pretty(&json).unwrap(),
+        )
+        .unwrap();
+
+        let store = SummaryStore::load(&dir);
+        let summary = store.get("abc123", 42).unwrap();
+        let message = &summary.messages[0];
+        assert_eq!(message.content, None);
+        assert_eq!(summary.agents[0].tokens, None);
 
         std::fs::remove_dir_all(&dir).ok();
     }

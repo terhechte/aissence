@@ -6,6 +6,20 @@ use chrono::{DateTime, Utc};
 use normalize_chat_sessions as ncs;
 use serde::{Deserialize, Serialize};
 
+/// Authoritative statistics for the tree change introduced by a git commit.
+///
+/// Counts are calculated from the committed trees (against the first parent,
+/// or the empty tree for a root commit), not from assistant tool calls.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitStats {
+    /// Number of changed files, including binary files and submodules.
+    pub files_changed: u64,
+    /// Number of text lines added.
+    pub lines_added: u64,
+    /// Number of text lines deleted.
+    pub lines_deleted: u64,
+}
+
 /// A single git commit, normalized for correlation with chat messages.
 #[derive(Debug, Clone)]
 pub struct CommitInfo {
@@ -23,6 +37,8 @@ pub struct CommitInfo {
     pub author_email: String,
     /// Committer time, in UTC. This is the timestamp used for correlation.
     pub time: DateTime<Utc>,
+    /// Authoritative file/line statistics from the committed tree diff.
+    pub stats: CommitStats,
 }
 
 /// One chat message lifted out of a parsed session, carrying just enough
@@ -40,7 +56,8 @@ pub struct TimedMessage {
     pub session_id: Option<String>,
     /// LLM provider that produced the session (e.g. `anthropic`, `openai`).
     pub provider: Option<String>,
-    /// Model id reported by the session (e.g. `claude-opus-4-8`), if known.
+    /// Model id reported for this message's turn (e.g. `claude-opus-4-8`),
+    /// falling back to the session-wide model when turn-level data is absent.
     pub model: Option<String>,
     /// Friendly coding-agent name (e.g. `Claude Code`, `Codex`, `OpenCode`),
     /// derived from the session format. See [`friendly_agent`].
@@ -96,7 +113,8 @@ impl TimedMessage {
     }
 }
 
-/// Input/output token counts for a message or a whole commit's conversation.
+/// Input/output token counts for a message, agent/model pair, or whole
+/// commit's conversation.
 ///
 /// The agents report usage per *turn* (one request/response cycle), not per
 /// individual message. Per-commit totals are therefore exact sums of those
@@ -178,6 +196,9 @@ pub struct AgentUsage {
     pub provider: String,
     /// Model id reported by the session (e.g. `claude-opus-4-8`), if known.
     pub model: Option<String>,
+    /// Exact token usage from turns attributed to this agent/model pair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<TokenCount>,
 }
 
 impl AgentUsage {
@@ -211,19 +232,30 @@ pub fn friendly_agent(format: &str) -> String {
 }
 
 /// The distinct (agent, model) pairs used across a commit group's messages, in
-/// first-seen order.
+/// first-seen order, with exact per-pair token totals where reported.
 pub fn agents_for(group: &CommitGroup) -> Vec<AgentUsage> {
     let mut usages: Vec<AgentUsage> = Vec::new();
     for message in &group.messages {
-        let usage = AgentUsage {
-            provider: message
-                .agent
-                .clone()
-                .unwrap_or_else(|| "Unknown".to_string()),
-            model: message.model.clone(),
-        };
-        if !usages.contains(&usage) {
-            usages.push(usage);
+        let provider = message
+            .agent
+            .clone()
+            .unwrap_or_else(|| "Unknown".to_string());
+        if let Some(usage) = usages
+            .iter_mut()
+            .find(|usage| usage.provider == provider && usage.model == message.model)
+        {
+            if let Some(tokens) = message.token_usage {
+                usage
+                    .tokens
+                    .get_or_insert_with(TokenCount::default)
+                    .add(&tokens);
+            }
+        } else {
+            usages.push(AgentUsage {
+                provider,
+                model: message.model.clone(),
+                tokens: message.token_usage,
+            });
         }
     }
     usages
@@ -248,6 +280,12 @@ pub struct MessageSummary {
     pub kind: MessageKind,
     /// 2-3 sentence summary of this message (or the message verbatim if short).
     pub summary: String,
+    /// Complete source text for user and assistant-text entries, regardless of
+    /// length. Consecutive source messages represented by one coalesced entry
+    /// are joined with blank lines. Absent for code-change entries and caches
+    /// written before source retention was added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
     /// Non-empty only for [`MessageKind::AiChanged`].
     pub changes: Vec<CodeChange>,
     pub timestamp: Option<chrono::DateTime<chrono::Utc>>,
@@ -273,7 +311,8 @@ pub struct CommitSummary {
     pub ai_implemented: String,
     /// Per-message summaries, in chronological order.
     pub messages: Vec<MessageSummary>,
-    /// Coding agent(s) + model(s) that produced this commit's sessions.
+    /// Coding agent(s) + model(s) that produced this commit's sessions,
+    /// including exact per-pair token totals when reported.
     #[serde(default)]
     pub agents: Vec<AgentUsage>,
     /// A single cohesive overview (up to ~20 sentences) synthesizing what the
@@ -306,6 +345,18 @@ impl CommitGroup {
     /// `true` for the trailing "work in progress" group.
     pub fn is_pending(&self) -> bool {
         self.commit.is_none()
+    }
+
+    /// Number of user prompts in this group.
+    ///
+    /// Assistant replies, tool activity, and system records remain available
+    /// in [`messages`](Self::messages), but do not inflate this user-facing
+    /// conversation count.
+    pub fn prompt_count(&self) -> usize {
+        self.messages
+            .iter()
+            .filter(|message| message.role == ncs::Role::User)
+            .count()
     }
 
     /// Exact total token usage across this group's messages — the conversation
@@ -345,5 +396,10 @@ impl CoalescedHistory {
     /// Total number of chat messages placed into commit groups.
     pub fn message_count(&self) -> usize {
         self.groups.iter().map(|g| g.messages.len()).sum()
+    }
+
+    /// Total number of user prompts placed into commit groups.
+    pub fn prompt_count(&self) -> usize {
+        self.groups.iter().map(CommitGroup::prompt_count).sum()
     }
 }

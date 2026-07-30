@@ -6,7 +6,7 @@ use std::path::Path;
 use chrono::DateTime;
 
 use crate::error::Error;
-use crate::model::CommitInfo;
+use crate::model::{CommitInfo, CommitStats};
 
 /// Return every commit reachable from `HEAD` for the repository containing
 /// `folder`, sorted oldest-first by committer time.
@@ -35,7 +35,7 @@ pub fn commit_log(folder: &Path) -> Result<Vec<CommitInfo>, Error> {
         if !seen.insert(oid) {
             continue;
         }
-        commits.push(to_commit_info(&commit)?);
+        commits.push(to_commit_info(&repo, &commit)?);
 
         let parents: Vec<gix::ObjectId> = commit.parent_ids().map(|id| id.detach()).collect();
         for parent in parents {
@@ -72,7 +72,7 @@ pub fn commit_patch(folder: &Path, commit_id: &str) -> Result<String, Error> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn to_commit_info(commit: &gix::Commit<'_>) -> Result<CommitInfo, Error> {
+fn to_commit_info(repo: &gix::Repository, commit: &gix::Commit<'_>) -> Result<CommitInfo, Error> {
     let map_git = |e: &dyn std::fmt::Display| Error::Git(e.to_string());
 
     let id = commit.id().detach().to_hex().to_string();
@@ -92,6 +92,7 @@ fn to_commit_info(commit: &gix::Commit<'_>) -> Result<CommitInfo, Error> {
     let summary = message.summary().to_string();
     let body = message.body.map(|b| b.to_string());
     let full = commit.message_raw_sloppy().to_string();
+    let stats = commit_stats(repo, commit)?;
 
     Ok(CommitInfo {
         id,
@@ -102,5 +103,148 @@ fn to_commit_info(commit: &gix::Commit<'_>) -> Result<CommitInfo, Error> {
         author_name,
         author_email,
         time: when,
+        stats,
     })
+}
+
+/// Calculate the committed tree diff against the first parent. Root commits
+/// are compared with the empty tree. This is the same source of truth as a git
+/// commit diff and deliberately does not use synthesized assistant edit data.
+fn commit_stats(repo: &gix::Repository, commit: &gix::Commit<'_>) -> Result<CommitStats, Error> {
+    let map_git = |e: &dyn std::fmt::Display| Error::Git(e.to_string());
+
+    let current_tree = commit.tree().map_err(|e| map_git(&e))?;
+    let previous_tree = match commit.parent_ids().next() {
+        Some(parent_id) => repo
+            .find_commit(parent_id.detach())
+            .map_err(|e| map_git(&e))?
+            .tree()
+            .map_err(|e| map_git(&e))?,
+        None => repo.empty_tree(),
+    };
+
+    let mut platform = previous_tree.changes().map_err(|e| map_git(&e))?;
+    platform.options(|options| {
+        // Make rename handling deterministic rather than dependent on the
+        // repository's `diff.renames` configuration.
+        options.track_rewrites(Some(Default::default()));
+    });
+    let lines = platform.stats(&current_tree).map_err(|e| map_git(&e))?;
+
+    // `gix` line stats intentionally omit binary files from `files_changed`.
+    // Count changed non-tree entries separately so binary files and submodules
+    // are represented in the authoritative file total.
+    let mut options = gix::diff::Options::default();
+    options.track_rewrites(Some(Default::default()));
+    let changes = repo
+        .diff_tree_to_tree(Some(&previous_tree), Some(&current_tree), Some(options))
+        .map_err(|e| map_git(&e))?;
+    let files_changed = changes
+        .iter()
+        .filter(|change| {
+            use gix::object::tree::diff::ChangeDetached;
+            let mode = match change {
+                ChangeDetached::Addition { entry_mode, .. }
+                | ChangeDetached::Deletion { entry_mode, .. }
+                | ChangeDetached::Modification { entry_mode, .. }
+                | ChangeDetached::Rewrite { entry_mode, .. } => entry_mode,
+            };
+            !mode.is_tree()
+        })
+        .count() as u64;
+
+    Ok(CommitStats {
+        files_changed,
+        lines_added: lines.lines_added,
+        lines_deleted: lines.lines_removed,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("aissence-git-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn commit_log_reports_tree_based_text_and_binary_stats() {
+        let dir = tmp_dir("stats");
+        git(&dir, &["init", "-q"]);
+        git(&dir, &["config", "user.name", "Tester"]);
+        git(&dir, &["config", "user.email", "tester@example.com"]);
+
+        std::fs::write(dir.join("notes.txt"), "one\n").unwrap();
+        git(&dir, &["add", "notes.txt"]);
+        git(&dir, &["commit", "-qm", "Initial notes"]);
+
+        std::fs::write(dir.join("notes.txt"), "one\ntwo\n").unwrap();
+        std::fs::write(dir.join("image.bin"), [0, 1, 2, 3]).unwrap();
+        git(&dir, &["add", "notes.txt", "image.bin"]);
+        git(&dir, &["commit", "-qm", "Add a line and binary"]);
+
+        git(&dir, &["mv", "notes.txt", "renamed.txt"]);
+        git(&dir, &["commit", "-qm", "Rename notes"]);
+
+        let commits = commit_log(&dir).unwrap();
+        assert_eq!(commits.len(), 3);
+        let initial = commits
+            .iter()
+            .find(|commit| commit.summary == "Initial notes")
+            .unwrap();
+        assert_eq!(
+            initial.stats,
+            CommitStats {
+                files_changed: 1,
+                lines_added: 1,
+                lines_deleted: 0,
+            }
+        );
+        let second = commits
+            .iter()
+            .find(|commit| commit.summary == "Add a line and binary")
+            .unwrap();
+        assert_eq!(
+            second.stats,
+            CommitStats {
+                files_changed: 2,
+                lines_added: 1,
+                lines_deleted: 0,
+            }
+        );
+        let renamed = commits
+            .iter()
+            .find(|commit| commit.summary == "Rename notes")
+            .unwrap();
+        assert_eq!(
+            renamed.stats,
+            CommitStats {
+                files_changed: 1,
+                lines_added: 0,
+                lines_deleted: 0,
+            }
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
