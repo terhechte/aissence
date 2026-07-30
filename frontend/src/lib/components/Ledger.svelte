@@ -101,6 +101,23 @@
     return kind === 'UserWrote' ? 'asked' : kind === 'AiWrote' ? 'replied' : 'changed';
   }
 
+  function messagePreview(message: any) {
+    return sourceContent(message) || message.preview || 'Text unavailable.';
+  }
+
+  function changeDescription(message: any) {
+    const files = [...new Set((message.changes ?? []).map((change: any) => change.file_path))];
+    if (files.length) {
+      const shown = files.slice(0, 4).join(', ');
+      const remaining = files.length - 4;
+      return `Changed ${shown}${remaining > 0 ? ` and ${remaining} more` : ''}.`;
+    }
+    const count = Number(message.changed_file_count ?? 0);
+    return count
+      ? `Changed ${count} ${count === 1 ? 'file' : 'files'}.`
+      : 'Recorded a code change.';
+  }
+
   function promptCount(commit: any) {
     return commit.messages.filter((message: any) => message.kind === 'UserWrote').length;
   }
@@ -154,7 +171,7 @@
       <p class="tagline">{project.tagline}</p>
       <p class="description">{project.description}</p>
       <div class="project-links">
-        <a href={project.product_url} target="_blank" rel="noreferrer">Visit project ↗</a>
+        {#if project.product_url}<a href={project.product_url} target="_blank" rel="noreferrer">Visit project ↗</a>{/if}
         {#if project.repository_url}<a href={project.repository_url} target="_blank" rel="noreferrer">Repository ↗</a>{/if}
         {#if totals.first && totals.last}<span>{formatDate(totals.first)} – {formatDate(totals.last)}</span>{/if}
       </div>
@@ -316,7 +333,7 @@
                                 <div class="message">
                                   <span class:ai={message.kind === 'AiWrote'}>{kindLabel(message.kind)}</span>
                                   <time>{messageTime(message)}</time>
-                                  <div><p>{message.summary}</p></div>
+                                  <div><p>{message.kind === 'AiChanged' ? changeDescription(message) : messagePreview(message)}</p></div>
                                 </div>
                               {/each}
                             </div>

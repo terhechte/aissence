@@ -11,7 +11,9 @@ export const projectMetadataSchema = z.object({
     .regex(/^[a-z0-9][a-z0-9-]+$/, 'Use lowercase letters, numbers, and hyphens'),
   tagline: z.string().trim().min(1).max(240),
   description: z.string().trim().min(1).max(3000),
-  product_url: z.string().url().startsWith('https://', 'Use an HTTPS URL'),
+  product_url: z
+    .union([z.literal(''), z.string().url().startsWith('https://', 'Use an HTTPS URL')])
+    .transform((value) => value || null),
   repository_label: z
     .string()
     .trim()

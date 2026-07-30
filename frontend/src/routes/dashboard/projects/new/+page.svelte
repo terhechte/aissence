@@ -74,11 +74,6 @@
       error = 'Choose a valid .aissence file.';
       return;
     }
-    if (!screenshots.length) {
-      error = 'Add at least one screenshot.';
-      return;
-    }
-
     const form = new FormData(event.currentTarget as HTMLFormElement);
     busy = true;
     try {
@@ -118,39 +113,41 @@
       );
       issues = imported.warnings ?? [];
 
-      status = 'Uploading screenshots…';
-      const screenshotTicket = await responseJson(
-        await fetch(`/api/projects/${projectId}/screenshots/prepare`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            files: screenshots.map(({ file }) => ({ type: file.type, size: file.size }))
+      if (screenshots.length) {
+        status = 'Uploading screenshots…';
+        const screenshotTicket = await responseJson(
+          await fetch(`/api/projects/${projectId}/screenshots/prepare`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              files: screenshots.map(({ file }) => ({ type: file.type, size: file.size }))
+            })
           })
-        })
-      );
-      for (let index = 0; index < screenshots.length; index += 1) {
-        const shot = screenshots[index];
-        const ticket = screenshotTicket.uploads[index];
-        const { error: uploadError } = await supabase.storage
-          .from('project-media')
-          .uploadToSignedUrl(ticket.path, ticket.token, shot.file, { contentType: shot.file.type });
-        if (uploadError) throw uploadError;
-      }
+        );
+        for (let index = 0; index < screenshots.length; index += 1) {
+          const shot = screenshots[index];
+          const ticket = screenshotTicket.uploads[index];
+          const { error: uploadError } = await supabase.storage
+            .from('project-media')
+            .uploadToSignedUrl(ticket.path, ticket.token, shot.file, { contentType: shot.file.type });
+          if (uploadError) throw uploadError;
+        }
 
-      await responseJson(
-        await fetch(`/api/projects/${projectId}/screenshots/complete`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            screenshots: screenshots.map((shot, index) => ({
-              storage_path: screenshotTicket.uploads[index].path,
-              alt_text: shot.alt,
-              caption: shot.caption,
-              sort_order: index
-            }))
+        await responseJson(
+          await fetch(`/api/projects/${projectId}/screenshots/complete`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              screenshots: screenshots.map((shot, index) => ({
+                storage_path: screenshotTicket.uploads[index].path,
+                alt_text: shot.alt,
+                caption: shot.caption,
+                sort_order: index
+              }))
+            })
           })
-        })
-      );
+        );
+      }
 
       status = 'Draft ready.';
       await goto(`/dashboard/projects/${projectId}`);
@@ -218,8 +215,8 @@
           <textarea id="description" name="description" required maxlength="3000"></textarea>
         </div>
         <div class="field">
-          <label for="product_url">Product URL</label>
-          <input id="product_url" name="product_url" type="url" required pattern="https://.*" placeholder="https://" />
+          <label for="product_url">Product URL <span>(optional)</span></label>
+          <input id="product_url" name="product_url" type="url" pattern="https://.*" placeholder="https://" />
         </div>
         <div class="field">
           <label for="repository_label">Repository label <span>(optional)</span></label>
@@ -233,7 +230,7 @@
     </section>
 
     <section>
-      <div class="step-head"><span>03</span><div><h2>What it became</h2><p>Add one to eight screenshots. Alt text is optional.</p></div></div>
+      <div class="step-head"><span>03</span><div><h2>What it became</h2><p>Add up to eight optional screenshots. Alt text is optional.</p></div></div>
       <label class="screenshot-picker">
         <input
           type="file"

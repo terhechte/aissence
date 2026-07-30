@@ -57,6 +57,23 @@ describe('parseAissence', () => {
     });
   });
 
+  it('retains a summary for every user prompt without a per-commit cap', () => {
+    const input = validFile();
+    (input.commits[hash] as any).summary.messages = Array.from({ length: 20 }, (_, index) => ({
+      kind: 'UserWrote',
+      summary: `Prompt summary ${index + 1}`,
+      content: `Complete prompt ${index + 1}`,
+      changes: [],
+      timestamp: `2026-06-20T09:${String(index).padStart(2, '0')}:00Z`
+    }));
+
+    const messages = parseAissence(JSON.stringify(input)).snapshot.commits[0].summary.messages;
+    expect(messages).toHaveLength(20);
+    expect(messages.map((message) => message.summary)).toEqual(
+      Array.from({ length: 20 }, (_, index) => `Prompt summary ${index + 1}`)
+    );
+  });
+
   it('accepts legacy v1 entries and emits warnings', () => {
     const input = validFile();
     delete (input.commits[hash] as any).title;
@@ -145,6 +162,19 @@ describe('optional project metadata', () => {
       repository_url: ''
     });
     expect(parsed.repository_label).toBeNull();
+  });
+
+  it('accepts a project without a product URL', () => {
+    const parsed = projectMetadataSchema.parse({
+      name: 'Project',
+      slug: 'project',
+      tagline: 'A project',
+      description: 'Description',
+      product_url: '',
+      repository_label: '',
+      repository_url: ''
+    });
+    expect(parsed.product_url).toBeNull();
   });
 
   it('accepts a screenshot without alt text', () => {

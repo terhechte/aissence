@@ -22,7 +22,7 @@ export const POST = async (event) => {
     p_slug: parsed.data.slug,
     p_tagline: parsed.data.tagline,
     p_description: parsed.data.description,
-    p_product_url: parsed.data.product_url,
+    p_product_url: parsed.data.product_url ?? '',
     p_repository_label: parsed.data.repository_label ?? '',
     p_repository_url: parsed.data.repository_url ?? ''
   });

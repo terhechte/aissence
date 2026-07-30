@@ -68,21 +68,15 @@ export const actions: Actions = {
     return { saved: true };
   },
   publish: async ({ locals, params }) => {
-    const [{ count: screenshots }, { data: imported }] = await Promise.all([
-      locals.supabase!
-        .from('project_screenshots')
-        .select('*', { count: 'exact', head: true })
-        .eq('project_id', params.id),
-      locals.supabase!
-        .from('imports')
-        .select('id')
-        .eq('project_id', params.id)
-        .in('status', ['succeeded', 'noop'])
-        .limit(1)
-        .maybeSingle()
-    ]);
-    if (!screenshots || !imported) {
-      return fail(400, { error: 'A successful import and at least one screenshot are required.' });
+    const { data: imported } = await locals.supabase!
+      .from('imports')
+      .select('id')
+      .eq('project_id', params.id)
+      .in('status', ['succeeded', 'noop'])
+      .limit(1)
+      .maybeSingle();
+    if (!imported) {
+      return fail(400, { error: 'A successful import is required.' });
     }
     const { error } = await locals.supabase!
       .from('projects')

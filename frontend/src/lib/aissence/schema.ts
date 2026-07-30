@@ -40,7 +40,7 @@ export const agentSchema = z
 export const messageSchema = z
   .object({
     kind: z.enum(['UserWrote', 'AiWrote', 'AiChanged']),
-    summary: z.string(),
+    summary: z.string().optional(),
     content: z.string().optional(),
     changes: z.array(changeSchema),
     timestamp: nullableDate,
@@ -48,6 +48,20 @@ export const messageSchema = z
   })
   .strip()
   .superRefine((message, context) => {
+    if (message.kind === 'UserWrote' && message.summary === undefined) {
+      context.addIssue({
+        code: 'custom',
+        path: ['summary'],
+        message: 'Every UserWrote message must contain a summary'
+      });
+    }
+    if (message.kind !== 'UserWrote' && message.summary !== undefined) {
+      context.addIssue({
+        code: 'custom',
+        path: ['summary'],
+        message: 'Only UserWrote messages contain per-message summaries'
+      });
+    }
     if (message.kind !== 'AiChanged' && message.changes.length > 0) {
       context.addIssue({
         code: 'custom',
@@ -60,6 +74,13 @@ export const messageSchema = z
         code: 'custom',
         path: ['content'],
         message: 'AiChanged messages do not contain retained text'
+      });
+    }
+    if (message.kind !== 'AiChanged' && message.content === undefined) {
+      context.addIssue({
+        code: 'custom',
+        path: ['content'],
+        message: 'UserWrote and AiWrote messages must contain retained text'
       });
     }
   });

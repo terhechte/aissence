@@ -95,7 +95,8 @@ create table public.messages (
   id uuid primary key default gen_random_uuid(),
   commit_id uuid not null references public.commits(id) on delete cascade,
   kind public.message_kind not null,
-  summary text not null,
+  summary text,
+  preview text,
   occurred_at timestamptz,
   token_input numeric(20,0),
   token_output numeric(20,0),
@@ -109,6 +110,19 @@ create table public.message_sources (
   message_id uuid primary key references public.messages(id) on delete cascade,
   content text not null
 );
+
+create or replace function public.message_preview(p_content text)
+returns text
+language sql
+immutable
+set search_path = public
+as $$
+  select case
+    when p_content is null then null
+    when char_length(p_content) <= 320 then p_content
+    else rtrim(left(p_content, 319)) || '…'
+  end;
+$$;
 
 create table public.changes (
   id uuid primary key default gen_random_uuid(),
@@ -405,11 +419,12 @@ begin
       loop
         v_message_id := gen_random_uuid();
         insert into public.messages (
-          id, commit_id, kind, summary, occurred_at,
+          id, commit_id, kind, summary, preview, occurred_at,
           token_input, token_output, token_cache_read, token_cache_create, sort_order
         ) values (
           v_message_id, v_commit_id, (v_message->>'kind')::public.message_kind,
-          v_message->>'summary', nullif(v_message->>'timestamp', '')::timestamptz,
+          v_message->>'summary', public.message_preview(v_message->>'content'),
+          nullif(v_message->>'timestamp', '')::timestamptz,
           (v_message->'tokens'->>'input')::numeric,
           (v_message->'tokens'->>'output')::numeric,
           (v_message->'tokens'->>'cache_read')::numeric,

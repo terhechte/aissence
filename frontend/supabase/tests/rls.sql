@@ -25,9 +25,9 @@ insert into public.commits (
   '8f2a1c4e9b7d6a5f0c3e2b1a4d8c7e6f9a0b1c2d',
   'Asked', 'Answered', 'Built', 0
 );
-insert into public.messages (id, commit_id, kind, summary, sort_order) values
-  ('30000000-0000-0000-0000-000000000001', '20000000-0000-0000-0000-000000000001', 'UserWrote', 'User summary', 0),
-  ('30000000-0000-0000-0000-000000000002', '20000000-0000-0000-0000-000000000001', 'AiWrote', 'AI summary', 1);
+insert into public.messages (id, commit_id, kind, summary, preview, sort_order) values
+  ('30000000-0000-0000-0000-000000000001', '20000000-0000-0000-0000-000000000001', 'UserWrote', 'User summary', 'private prompt', 0),
+  ('30000000-0000-0000-0000-000000000002', '20000000-0000-0000-0000-000000000001', 'AiWrote', null, 'private reply', 1);
 insert into public.message_sources (message_id, content) values
   ('30000000-0000-0000-0000-000000000001', 'private prompt'),
   ('30000000-0000-0000-0000-000000000002', 'private reply');
@@ -75,7 +75,6 @@ select lives_ok(
           "agents": [{"provider": "Codex", "model": "gpt-test"}],
           "messages": [{
             "kind": "AiChanged",
-            "summary": "Changed two files.",
             "changes": [
               {"tool": "Edit", "file": "src/a.ts", "diff": "+a"},
               {"tool": "Edit", "file": "src/b.ts", "diff": "+b"},

@@ -142,12 +142,13 @@ begin
         from jsonb_array_elements(coalesce(v_message->'changes', '[]'::jsonb)) change;
 
         insert into public.messages (
-          id, commit_id, kind, summary, occurred_at,
+          id, commit_id, kind, summary, preview, occurred_at,
           token_input, token_output, token_cache_read, token_cache_create,
           changed_file_count, sort_order
         ) values (
           v_message_id, v_commit_id, (v_message->>'kind')::public.message_kind,
-          v_message->>'summary', nullif(v_message->>'timestamp', '')::timestamptz,
+          v_message->>'summary', public.message_preview(v_message->>'content'),
+          nullif(v_message->>'timestamp', '')::timestamptz,
           (v_message->'tokens'->>'input')::numeric,
           (v_message->'tokens'->>'output')::numeric,
           (v_message->'tokens'->>'cache_read')::numeric,
