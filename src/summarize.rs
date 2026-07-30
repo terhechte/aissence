@@ -1,10 +1,10 @@
 //! LLM summarization of a commit's conversation and code changes, via
 //! [OpenRouter](https://openrouter.ai/).
 //!
-//! For each [`CommitGroup`] we summarize every user entry, retain assistant
-//! entries locally, and ask the model for the three commit-level summaries —
-//! *user requested*, *ai answered*, and *ai implemented* — plus one cohesive
-//! overview.
+//! For each [`CommitGroup`] we summarize every user entry and retain assistant
+//! entries locally. An optional commit-level pipeline adds *user requested*,
+//! *ai answered*, *ai implemented*, and one cohesive `meta` overview when
+//! explicitly enabled.
 //!
 //! The three categories are derived from the chat itself:
 //! - **user**: [`ncs::Role::User`] message text,
@@ -22,10 +22,12 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use futures::stream::{self, StreamExt, TryStreamExt};
 use openrouter_rs::OpenRouterClient;
 use openrouter_rs::api::chat::{ChatCompletionRequest, Message};
+use openrouter_rs::error::OpenRouterError;
 use openrouter_rs::types::{ProviderPreferences, Role as OrRole};
 use tokio::sync::Semaphore;
 
@@ -46,11 +48,14 @@ pub const ENV_PROVIDER: &str = "OPENROUTER_PROVIDER";
 pub const DEFAULT_MODEL: &str = "inclusionai/ling-2.6-flash";
 /// Maximum number of commit groups summarized concurrently.
 ///
-/// Each group can issue up to three concurrent aggregate requests before its
-/// dependent `meta` request.
+/// Request concurrency across those groups is bounded separately.
 pub const MAX_CONCURRENT_GROUPS: usize = 8;
 /// Maximum number of OpenRouter requests in flight across all commit groups.
 pub const MAX_CONCURRENT_REQUESTS: usize = 24;
+/// Number of retries after the initial request for transient failures.
+const MAX_REQUEST_RETRIES: usize = 3;
+/// Initial grace period before retrying; subsequent waits double.
+const RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
 
 /// Actual billing reported by OpenRouter for one summarization operation.
 ///
@@ -94,6 +99,7 @@ pub struct Summarizer {
     client: OpenRouterClient,
     model: String,
     provider: Option<String>,
+    meta_summaries: bool,
     request_limit: Arc<Semaphore>,
 }
 
@@ -134,6 +140,7 @@ impl Summarizer {
             client,
             model: model.into(),
             provider,
+            meta_summaries: false,
             request_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
         })
     }
@@ -146,6 +153,18 @@ impl Summarizer {
     /// The preferred OpenRouter provider, if configured.
     pub fn provider(&self) -> Option<&str> {
         self.provider.as_deref()
+    }
+
+    /// Enable or disable the optional commit-level aggregate and `meta`
+    /// summaries. Disabled by default; per-user-entry summaries are unaffected.
+    pub fn with_meta_summaries(mut self, enabled: bool) -> Self {
+        self.meta_summaries = enabled;
+        self
+    }
+
+    /// Whether the optional aggregate and `meta` pipeline is enabled.
+    pub fn meta_summaries_enabled(&self) -> bool {
+        self.meta_summaries
     }
 
     /// Summarize every non-empty group in `history`, filling in
@@ -204,28 +223,31 @@ impl Summarizer {
             .map(|c| c.summary.clone())
             .unwrap_or_else(|| "(uncommitted work in progress)".to_string());
 
-        // Feed each category's complete retained source directly into its one
-        // commit-level summary call.
-        let by_kind = |kind: MessageKind| -> Vec<String> {
-            items
-                .iter()
-                .filter(|item| item.kind == kind)
-                .map(|item| item.text.clone())
-                .collect()
-        };
-        let user = by_kind(MessageKind::UserWrote);
-        let answered = by_kind(MessageKind::AiWrote);
-        let changed = by_kind(MessageKind::AiChanged);
-
-        // User-entry summaries and the three aggregate categories are
-        // independent, so run all of them concurrently. The shared semaphore
-        // bounds total request pressure across every concurrently active group.
-        let (entry_summaries, user_requested, ai_answered, ai_implemented) = futures::try_join!(
-            self.summarize_user_entries(&items, costs),
-            self.reduce_items(&user, Category::User, &commit_context, costs),
-            self.reduce_items(&answered, Category::Response, &commit_context, costs),
-            self.reduce_items(&changed, Category::Change, &commit_context, costs),
-        )?;
+        let (entry_summaries, user_requested, ai_answered, ai_implemented, meta) =
+            if self.meta_summaries {
+                // User-entry summaries and the optional commit-level pipeline
+                // are independent. The shared semaphore bounds request pressure
+                // across every concurrently active group.
+                let (entries, aggregates) = futures::try_join!(
+                    self.summarize_user_entries(&items, costs),
+                    self.summarize_commit_overview(&items, &commit_context, costs),
+                )?;
+                (
+                    entries,
+                    aggregates.0,
+                    aggregates.1,
+                    aggregates.2,
+                    aggregates.3,
+                )
+            } else {
+                (
+                    self.summarize_user_entries(&items, costs).await?,
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                )
+            };
 
         let messages: Vec<MessageSummary> = items
             .iter()
@@ -240,17 +262,6 @@ impl Summarizer {
             })
             .collect();
 
-        // Finally, synthesize the three into one longer overview.
-        let meta = self
-            .meta_summary(
-                &user_requested,
-                &ai_answered,
-                &ai_implemented,
-                &commit_context,
-                costs,
-            )
-            .await?;
-
         Ok(CommitSummary {
             user_requested,
             ai_answered,
@@ -260,6 +271,42 @@ impl Summarizer {
             meta,
             tokens: group.token_usage(),
         })
+    }
+
+    /// Generate the optional three aggregate fields and their dependent `meta`
+    /// overview. This entire pipeline is disabled by default.
+    async fn summarize_commit_overview(
+        &self,
+        items: &[RawItem],
+        commit_context: &str,
+        costs: &CostTracker,
+    ) -> Result<(String, String, String, String), Error> {
+        let by_kind = |kind: MessageKind| -> Vec<String> {
+            items
+                .iter()
+                .filter(|item| item.kind == kind)
+                .map(|item| item.text.clone())
+                .collect()
+        };
+        let user = by_kind(MessageKind::UserWrote);
+        let answered = by_kind(MessageKind::AiWrote);
+        let changed = by_kind(MessageKind::AiChanged);
+
+        let (user_requested, ai_answered, ai_implemented) = futures::try_join!(
+            self.reduce_items(&user, Category::User, commit_context, costs),
+            self.reduce_items(&answered, Category::Response, commit_context, costs),
+            self.reduce_items(&changed, Category::Change, commit_context, costs),
+        )?;
+        let meta = self
+            .meta_summary(
+                &user_requested,
+                &ai_answered,
+                &ai_implemented,
+                commit_context,
+                costs,
+            )
+            .await?;
+        Ok((user_requested, ai_answered, ai_implemented, meta))
     }
 
     /// Generate exactly one summary for every coalesced user entry. The full
@@ -367,11 +414,6 @@ impl Summarizer {
         max_tokens: u32,
         costs: &CostTracker,
     ) -> Result<String, Error> {
-        let _permit = self
-            .request_limit
-            .acquire()
-            .await
-            .map_err(|_| Error::Llm("summarization request limiter closed".to_string()))?;
         let mut request = ChatCompletionRequest::builder();
         request
             .model(self.model.as_str())
@@ -390,12 +432,33 @@ impl Summarizer {
             .build()
             .map_err(|e| Error::Llm(format!("request build: {e}")))?;
 
-        let response = self
-            .client
-            .chat()
-            .create(&request)
-            .await
-            .map_err(|e| Error::Llm(e.to_string()))?;
+        let response = {
+            let mut retry = 0;
+            loop {
+                let result = {
+                    let _permit = self.request_limit.acquire().await.map_err(|_| {
+                        Error::Llm("summarization request limiter closed".to_string())
+                    })?;
+                    self.client.chat().create(&request).await
+                };
+                match result {
+                    Ok(response) => break response,
+                    Err(error)
+                        if is_retryable_request_error(&error) && retry < MAX_REQUEST_RETRIES =>
+                    {
+                        tokio::time::sleep(retry_delay(retry)).await;
+                        retry += 1;
+                    }
+                    Err(error) => {
+                        let attempts = retry + 1;
+                        let suffix = (attempts > 1)
+                            .then(|| format!(" after {attempts} attempts"))
+                            .unwrap_or_default();
+                        return Err(Error::Llm(format!("{error}{suffix}")));
+                    }
+                }
+            }
+        };
         costs.record(response.usage.as_ref().and_then(|usage| usage.cost));
 
         let text = response
@@ -407,6 +470,22 @@ impl Summarizer {
             .to_string();
         Ok(text)
     }
+}
+
+fn is_retryable_request_error(error: &OpenRouterError) -> bool {
+    match error {
+        OpenRouterError::Api(context) => is_retryable_status(context.status.as_u16()),
+        OpenRouterError::HttpRequest(_) => true,
+        _ => false,
+    }
+}
+
+fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+}
+
+fn retry_delay(retry: usize) -> Duration {
+    RETRY_BASE_DELAY.saturating_mul(1_u32 << retry.min(10))
 }
 
 /// One source message turned into a locally retained conversation entry and
@@ -563,6 +642,40 @@ pub fn has_required_user_summaries(group: &CommitGroup, summary: &CommitSummary)
                     .as_deref()
                     .is_some_and(|text| !text.trim().is_empty())
             })
+}
+
+/// Whether all source categories and their dependent `meta` overview are
+/// populated for the optional commit-level summary pipeline.
+pub fn has_required_commit_overview(group: &CommitGroup, summary: &CommitSummary) -> bool {
+    let items = coalesce_consecutive(raw_items(group));
+    let has_user = items.iter().any(|item| item.kind == MessageKind::UserWrote);
+    let has_answer = items.iter().any(|item| item.kind == MessageKind::AiWrote);
+    let has_change = items.iter().any(|item| item.kind == MessageKind::AiChanged);
+    let present = |text: &str| !text.trim().is_empty();
+
+    (!has_user || present(&summary.user_requested))
+        && (!has_answer || present(&summary.ai_answered))
+        && (!has_change || present(&summary.ai_implemented))
+        && (!(has_user || has_answer || has_change) || present(&summary.meta))
+}
+
+/// Clear the optional commit-level aggregate and `meta` fields.
+///
+/// Returns whether any value changed.
+pub fn clear_commit_overview(summary: &mut CommitSummary) -> bool {
+    let changed = [
+        &summary.user_requested,
+        &summary.ai_answered,
+        &summary.ai_implemented,
+        &summary.meta,
+    ]
+    .iter()
+    .any(|text| !text.is_empty());
+    summary.user_requested.clear();
+    summary.ai_answered.clear();
+    summary.ai_implemented.clear();
+    summary.meta.clear();
+    changed
 }
 
 fn items_match_summary(items: &[RawItem], summary: &CommitSummary) -> bool {
@@ -955,6 +1068,17 @@ mod tests {
     }
 
     #[test]
+    fn transient_failures_use_exponential_retry_delays() {
+        assert!(is_retryable_status(429));
+        assert!(is_retryable_status(503));
+        assert!(!is_retryable_status(400));
+        assert!(!is_retryable_status(401));
+        assert_eq!(retry_delay(0), Duration::from_secs(2));
+        assert_eq!(retry_delay(1), Duration::from_secs(4));
+        assert_eq!(retry_delay(2), Duration::from_secs(8));
+    }
+
+    #[test]
     fn preferred_provider_uses_openrouter_order_format() {
         let mut preferences = ProviderPreferences::default();
         preferences.order = Some(vec!["deepinfra".to_string()]);
@@ -976,5 +1100,37 @@ mod tests {
 
         assert_eq!(summarizer.model(), "example/model");
         assert_eq!(summarizer.provider(), Some("deepinfra"));
+        assert!(!summarizer.meta_summaries_enabled());
+
+        let summarizer = summarizer.with_meta_summaries(true);
+        assert!(summarizer.meta_summaries_enabled());
+    }
+
+    #[test]
+    fn optional_commit_overview_can_be_validated_and_cleared() {
+        let group = CommitGroup {
+            commit: None,
+            messages: vec![
+                timed(ncs::Role::User, "please fix it", None),
+                timed(ncs::Role::Assistant, "I fixed it", None),
+            ],
+            summary: None,
+        };
+        let mut summary = CommitSummary {
+            user_requested: "Asked for a fix.".into(),
+            ai_answered: "Confirmed the fix.".into(),
+            ai_implemented: String::new(),
+            meta: "The user requested a fix and the assistant completed it.".into(),
+            ..Default::default()
+        };
+
+        assert!(has_required_commit_overview(&group, &summary));
+        assert!(clear_commit_overview(&mut summary));
+        assert_eq!(summary.user_requested, "");
+        assert_eq!(summary.ai_answered, "");
+        assert_eq!(summary.ai_implemented, "");
+        assert_eq!(summary.meta, "");
+        assert!(!clear_commit_overview(&mut summary));
+        assert!(!has_required_commit_overview(&group, &summary));
     }
 }

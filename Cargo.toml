@@ -50,5 +50,5 @@ rusqlite = { version = "0.40.1", features = ["bundled"] }
 # LLM summarization of conversations + code changes via OpenRouter.
 openrouter-rs = "0.10"
 # Async runtime + concurrency for the (async) summarization layer.
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 futures = "0.3"

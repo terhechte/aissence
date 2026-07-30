@@ -295,30 +295,31 @@ pub struct MessageSummary {
     pub tokens: Option<TokenCount>,
 }
 
-/// LLM-generated summary of what went into a commit.
+/// Summary data for what went into a commit.
 ///
-/// Produced by the [`crate::summarize::Summarizer`]. The three top-level fields
-/// are the *aggregated* overview; [`messages`](Self::messages) holds a
-/// breakdown that drives the middle pane of the app. Only user entries receive
-/// per-entry LLM summaries. A field is empty when the commit group has nothing
-/// of that kind.
+/// Produced by the [`crate::summarize::Summarizer`]. The three aggregate fields
+/// and `meta` are empty unless the optional meta-summary pipeline is enabled.
+/// [`messages`](Self::messages) holds the conversation breakdown; only user
+/// entries receive per-entry LLM summaries.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CommitSummary {
-    /// 3-5 sentences: what the user asked for across all their messages.
+    /// Optional 3-5 sentence aggregate of what the user asked for.
+    /// Empty unless the meta-summary pipeline is enabled.
     pub user_requested: String,
-    /// 3-5 sentences: what the assistant explained/answered in its replies.
+    /// Optional 3-5 sentence aggregate of what the assistant explained.
+    /// Empty unless the meta-summary pipeline is enabled.
     pub ai_answered: String,
-    /// 3-5 sentences: what the assistant implemented in code (file edits).
+    /// Optional 3-5 sentence aggregate of code edits.
+    /// Empty unless the meta-summary pipeline is enabled.
     pub ai_implemented: String,
-    /// Locally-derived conversation entries, in chronological order.
+    /// Conversation entries in chronological order.
     pub messages: Vec<MessageSummary>,
     /// Coding agent(s) + model(s) that produced this commit's sessions,
     /// including exact per-pair token totals when reported.
     #[serde(default)]
     pub agents: Vec<AgentUsage>,
-    /// A single cohesive overview (up to ~20 sentences) synthesizing what the
-    /// user wanted, what the AI implemented, and any important caveats. Built
-    /// last, from the three fields above.
+    /// Optional cohesive overview synthesizing the three aggregate fields.
+    /// Empty unless the meta-summary pipeline is enabled.
     #[serde(default)]
     pub meta: String,
     /// Exact total token usage of the whole conversation that led to this

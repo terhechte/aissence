@@ -35,6 +35,7 @@ const DIM: egui::Color32 = egui::Color32::from_gray(140);
 const DISABLED: egui::Color32 = egui::Color32::from_gray(90); // faded / ignored
 
 fn main() -> eframe::Result {
+    let meta_summaries = meta_summaries_from_args();
     let folder = match folder_from_args() {
         Some(folder) => folder,
         None => match rfd::FileDialog::new()
@@ -58,7 +59,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "aissence",
         options,
-        Box::new(move |cc| Ok(Box::new(AissenceApp::new(cc, folder)))),
+        Box::new(move |cc| Ok(Box::new(AissenceApp::new(cc, folder, meta_summaries)))),
     )
 }
 
@@ -74,6 +75,10 @@ fn folder_from_args() -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn meta_summaries_from_args() -> bool {
+    std::env::args().any(|arg| arg == "--meta-summaries")
 }
 
 /// Parse lifecycle, shared between the worker task and the UI thread.
@@ -112,6 +117,7 @@ struct AissenceApp {
     phase: Arc<Mutex<Phase>>,
     /// `None` when `OPENROUTER_API_KEY` is unset (Summarize disabled).
     summarizer: Option<Arc<Summarizer>>,
+    meta_summaries_enabled: bool,
     /// On-disk cache of summaries, git metadata, and ignore flags.
     store: SummaryStore,
 
@@ -144,7 +150,11 @@ struct AissenceApp {
 }
 
 impl AissenceApp {
-    fn new(cc: &eframe::CreationContext<'_>, folder: PathBuf) -> Self {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        folder: PathBuf,
+        meta_summaries_enabled: bool,
+    ) -> Self {
         Theme::slate().install(&cc.egui_ctx);
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -157,7 +167,10 @@ impl AissenceApp {
         // thread (summaries are kicked off on demand).
         runtime.spawn(load(folder.clone(), phase.clone(), cc.egui_ctx.clone()));
         let store = SummaryStore::load(&folder);
-        let summarizer = Summarizer::from_env().ok().map(Arc::new);
+        let summarizer = Summarizer::from_env()
+            .ok()
+            .map(|summarizer| summarizer.with_meta_summaries(meta_summaries_enabled))
+            .map(Arc::new);
         let notice = summarizer
             .is_none()
             .then(|| "Set OPENROUTER_API_KEY to enable AI summaries.".to_string());
@@ -169,6 +182,7 @@ impl AissenceApp {
             runtime,
             phase,
             summarizer,
+            meta_summaries_enabled,
             store,
             history: None,
             notice,
@@ -209,7 +223,14 @@ impl AissenceApp {
                 if !summarize::has_required_user_summaries(group, &summary) {
                     continue;
                 }
-                if token_backfill || content_backfill {
+                if self.meta_summaries_enabled
+                    && !summarize::has_required_commit_overview(group, &summary)
+                {
+                    continue;
+                }
+                let overview_cleared =
+                    !self.meta_summaries_enabled && summarize::clear_commit_overview(&mut summary);
+                if token_backfill || content_backfill || overview_cleared {
                     backfills.push((commit_id, signature, summary.clone()));
                 }
                 group.summary = Some(summary);
@@ -838,13 +859,16 @@ impl AissenceApp {
                 self.selected_message = Some(index);
             }
         } else if message.kind == MessageKind::UserWrote {
-            let text = message
-                .summary
-                .as_deref()
-                .or(message.content.as_deref())
-                .map(message_preview)
-                .unwrap_or_else(|| "Source text unavailable.".to_string());
-            ui.label(text);
+            if let Some(summary) = message.summary.as_deref() {
+                ui.label(summary);
+            } else {
+                let preview = message
+                    .content
+                    .as_deref()
+                    .map(message_preview)
+                    .unwrap_or_else(|| "Source text unavailable.".to_string());
+                ui.label(preview);
+            }
         } else {
             let preview = message
                 .content

@@ -8,6 +8,7 @@
 //! ```text
 //! cargo run -- /path/to/project
 //! cargo run -- /path/to/project --summarize
+//! cargo run -- /path/to/project --summarize --meta-summaries
 //! ```
 
 use std::path::PathBuf;
@@ -19,9 +20,11 @@ use aissence::{CommitGroup, Summarizer, TimedMessage, analyze};
 async fn main() {
     let mut folder = None;
     let mut summarize = false;
+    let mut meta_summaries = false;
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--summarize" | "-s" => summarize = true,
+            "--meta-summaries" => meta_summaries = true,
             _ if folder.is_none() => folder = Some(PathBuf::from(arg)),
             _ => {}
         }
@@ -42,6 +45,7 @@ async fn main() {
     if summarize {
         match Summarizer::from_env() {
             Ok(summarizer) => {
+                let summarizer = summarizer.with_meta_summaries(meta_summaries);
                 if let Some(provider) = summarizer.provider() {
                     eprintln!(
                         "Summarizing with model `{}` (preferring provider `{provider}`) …",

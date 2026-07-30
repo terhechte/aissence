@@ -103,10 +103,10 @@ the best-effort, tool-call-derived `Change.diff` strings.
 
 | Field            | JSON type | Meaning |
 |------------------|-----------|---------|
-| `user_requested` | string | A concise aggregate summary of what the user asked for across the conversation that led to this commit. Usually 3–5 sentences. Plain prose. |
-| `ai_answered`    | string | A concise aggregate summary of what the assistant explained, decided, or concluded in its replies. Usually 3–5 sentences. |
-| `ai_implemented` | string | A concise aggregate summary of what was implemented through recognized file-editing tool calls. Usually 3–5 sentences. |
-| `meta`           | string | A single, longer cohesive overview (up to ~20 sentences) synthesizing the three fields above: what the user wanted, what was implemented, and anything important the assistant noted (limitations, caveats, trade-offs, follow-ups). **May be an empty string** (and may be absent in older files). When present it's the most complete single-text description of the commit. |
+| `user_requested` | string | Optional aggregate summary of what the user asked for. Empty by default; generated only with `--meta-summaries`. |
+| `ai_answered`    | string | Optional aggregate summary of what the assistant explained or concluded. Empty by default; generated only with `--meta-summaries`. |
+| `ai_implemented` | string | Optional aggregate summary of recognized file-editing activity. Empty by default; generated only with `--meta-summaries`. |
+| `meta`           | string | Optional cohesive overview synthesized from the three aggregate fields. Empty by default; generated only with `--meta-summaries`. It may be absent in older files. |
 | `messages`       | array  | A chronological breakdown of conversation entries. Every `UserWrote` entry has an LLM summary; assistant entries remain locally derived. Entries can be split or coalesced relative to source messages; see "Message". May be empty. |
 | `agents`         | array  | The coding agent(s) and model(s) that produced this commit's sessions ("provenance"), including exact per-agent/model token totals where reported. See "Agent". May be empty or absent. |
 | `tokens`         | object | The **exact total** token usage of the whole conversation that led to this commit — the sum of every turn's usage. See "TokenCount". **Absent** when no session reported usage for this commit (treat absent as unknown). |
@@ -115,11 +115,13 @@ Any of the three text fields may be empty if the conversation had nothing of
 that kind (e.g. a commit whose conversation contained no code edits has an empty
 `ai_implemented`).
 
-Generation uses one model request for every `UserWrote` entry, one for each
-non-empty aggregate category, and one for `meta`. There is no cap on the number
-of user entries summarized, and each call receives the complete retained prompt.
-Batch generation processes up to eight commits concurrently; individual requests
-are globally limited to 24 in flight.
+By default, generation uses one model request for every `UserWrote` entry and
+leaves all four commit-level fields above as empty strings. `--meta-summaries`
+additionally enables one request for each non-empty aggregate category and one
+for `meta`. There is no cap on the number of user entries summarized, and each
+call receives the complete retained prompt. Batch generation processes up to
+eight commits concurrently; individual requests are globally limited to 24 in
+flight.
 
 ## Message (an element of `messages`)
 
@@ -284,9 +286,9 @@ A consumer should know the file's boundaries:
         "lines_deleted": 7
       },
       "summary": {
-        "user_requested": "The user asked to add a retry wrapper around the network client and make the timeout configurable.",
-        "ai_answered": "The assistant proposed an exponential-backoff retry helper and explained that the timeout would be read from an environment variable with a sensible default.",
-        "ai_implemented": "Added a retry() helper in net/retry.rs, wired it into the client's request path, and read REQUEST_TIMEOUT from the environment in config.rs.",
+        "user_requested": "",
+        "ai_answered": "",
+        "ai_implemented": "",
         "messages": [
           {
             "kind": "UserWrote",
@@ -327,7 +329,7 @@ A consumer should know the file's boundaries:
             "tokens": { "input": 12830, "output": 752, "cache_read": 10496 }
           }
         ],
-        "meta": "The user wanted the network client to be more resilient: a retry wrapper plus a configurable request timeout. The assistant settled on exponential backoff and a timeout sourced from the REQUEST_TIMEOUT environment variable, defaulting when unset. It implemented a small retry() helper, integrated it into the request path, and replaced the hard-coded timeout with an environment lookup. The assistant noted that the backoff parameters are fixed for now and could later be made configurable.",
+        "meta": "",
         "tokens": { "input": 12830, "output": 752, "cache_read": 10496 }
       }
     },
@@ -341,9 +343,9 @@ A consumer should know the file's boundaries:
         "lines_deleted": 1
       },
       "summary": {
-        "user_requested": "The user asked to fix a typo in the README.",
+        "user_requested": "",
         "ai_answered": "",
-        "ai_implemented": "Corrected a misspelling in README.md.",
+        "ai_implemented": "",
         "messages": [
           {
             "kind": "UserWrote",
@@ -367,7 +369,7 @@ A consumer should know the file's boundaries:
         "agents": [
           { "provider": "Codex", "model": "gpt-5.1-codex" }
         ],
-        "meta": "A small documentation fix: the user pointed out a typo in the README, and the assistant corrected \"recieve\" to \"receive\". No code behavior changed."
+        "meta": ""
       }
     }
   },
