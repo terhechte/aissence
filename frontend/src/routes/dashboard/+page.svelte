@@ -13,7 +13,10 @@
       <p class="eyebrow">Creator dashboard</p>
       <h1>{data.profile ? `Good to see you, ${data.profile.display_name}.` : 'Choose your creator identity.'}</h1>
     </div>
-    <form method="POST" action="/auth/signout"><button class="theme-toggle">Sign out</button></form>
+    <div class="dashboard-actions">
+      {#if data.profile}<a class="button secondary" href="/dashboard/profile">Edit creator profile</a>{/if}
+      <form method="POST" action="/auth/signout"><button class="theme-toggle">Sign out</button></form>
+    </div>
   </div>
 
   {#if !data.profile}
@@ -89,6 +92,12 @@
     align-items: flex-start;
     gap: 30px;
   }
+  .dashboard-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
   h1 {
     margin: 16px 0 55px;
     font: 400 clamp(48px, 7vw, 80px) / 0.98 'Instrument Serif', Georgia, serif;
@@ -157,6 +166,10 @@
     margin-top: 30px;
   }
   @media (max-width: 720px) {
+    .dashboard-head {
+      align-items: flex-start;
+      flex-direction: column;
+    }
     .project-list a {
       grid-template-columns: 1fr auto;
     }
