@@ -1,6 +1,6 @@
 <script lang="ts">
   import PromptMarkdown from '$lib/components/PromptMarkdown.svelte';
-  import { groupTranscript } from '$lib/ledger';
+  import { abridgeTranscript, groupTranscript } from '$lib/ledger';
   import { formatCount, formatDate } from '$lib/utils';
 
   let {
@@ -109,6 +109,16 @@
     return `The agent replied ${replyCount} ${replyCount === 1 ? 'time' : 'times'} and changed ${changedFileCount} ${changedFileCount === 1 ? 'file' : 'files'}.`;
   }
 
+  function transcriptItems(commit: any) {
+    const turns = groupTranscript(commit.messages);
+    if (isEntitled) return turns.map((turn) => ({ kind: 'turn' as const, turn }));
+    return abridgeTranscript(turns, sourceContent, commit.commit_hash);
+  }
+
+  function hiddenActivityText(promptCount: number, replyCount: number, changedFileCount: number) {
+    return `${promptCount} hidden user ${promptCount === 1 ? 'prompt' : 'prompts'} and ${activityText(replyCount, changedFileCount)}`;
+  }
+
   function formatUsd(value: number | string | null | undefined) {
     if (value === null || value === undefined || !Number.isFinite(Number(value))) return 'Unavailable';
     const amount = Number(value);
@@ -204,6 +214,7 @@
         <div><dt>Tokens written back</dt><dd><strong>{formatCount(totals.tokenOutput)}</strong><small>{totals.pricedCommits ? formatUsd(totals.outputCost) : 'Cost unavailable'}</small></dd></div>
         <div><dt>Potential API costs</dt><dd><strong>{totalCostLabel()}</strong><small>USD estimate</small></dd></div>
         <div><dt>Commits from a conversation</dt><dd><strong>{commits.length}</strong></dd></div>
+        <div><dt>Total user prompts</dt><dd><strong>{totals.prompts}</strong></dd></div>
         <div><dt>Days represented</dt><dd><strong>{totals.span ?? 'unknown'}</strong></dd></div>
         <div><dt>Lines added / removed</dt><dd><strong>+{formatCount(totals.linesAdded)} / −{formatCount(totals.linesDeleted)}</strong></dd></div>
         <div><dt>Agents at the keyboard</dt><dd><strong>{totals.agents.size}</strong></dd></div>
@@ -223,7 +234,7 @@
     {#if commits.length}
       {#each commits as commit, index}
         {#if index === 0 || monthKey(commit) !== monthKey(commits[index - 1])}
-          <div class="month"><h2>{monthLabel(commit)}</h2><i></i><span>{commits.filter((item: any) => monthKey(item) === monthKey(commit)).length} entries · {totals.prompts} prompts</span></div>
+          <div class="month"><h2>{monthLabel(commit)}</h2><i></i><span>{commits.filter((item: any) => monthKey(item) === monthKey(commit)).length} entries</span></div>
         {/if}
         <article class:open={openCommit === commit.id}>
           <button class="commit-row" onclick={() => toggleCommit(commit.id)} aria-expanded={openCommit === commit.id}>
@@ -258,7 +269,15 @@
                 {#if commit.messages.length}
                   <div class="transcript">
                     <h4>{isEntitled ? 'Transcript' : 'Transcript, abridged'}</h4>
-                    {#each groupTranscript(commit.messages) as turn}
+                    {#each transcriptItems(commit) as item}
+                      {#if item.kind === 'hidden'}
+                        <div class="message activity-summary hidden-summary">
+                          <span>hidden</span>
+                          <time></time>
+                          <div><p>{hiddenActivityText(item.promptCount, item.replyCount, item.changedFileCount)}</p></div>
+                        </div>
+                      {:else}
+                        {@const turn = item.turn}
                       {#if turn.asked}
                         <div class="message asked-message">
                           <span>asked</span>
@@ -309,6 +328,7 @@
                           <time></time>
                           <div><p>{activityText(turn.replyCount, turn.changedFileCount)}</p></div>
                         </div>
+                      {/if}
                       {/if}
                     {/each}
                   </div>
