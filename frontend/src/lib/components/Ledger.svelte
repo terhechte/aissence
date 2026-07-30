@@ -90,7 +90,7 @@
 
 <div class="ledger page-shell">
   <div class="ledger-top">
-    <span>Ledger — {project.repository_label}</span>
+    <span>{project.repository_label ? `Ledger — ${project.repository_label}` : 'Project ledger'}</span>
     <a href={`/creators/${profile.handle}`}>{profile.display_name}</a>
   </div>
 
@@ -111,9 +111,11 @@
       <div class="gallery-head"><span>What it became</span><span>{String(activeShot + 1).padStart(2, '0')} / {String(screenshots.length).padStart(2, '0')}</span></div>
       {#if screenshots.length}
         <button class="hero-shot" onclick={() => (modal = true)} aria-label="Enlarge active screenshot">
-          <img src={screenshots[activeShot].url} alt={screenshots[activeShot].alt_text} />
+          <img src={screenshots[activeShot].url} alt={screenshots[activeShot].alt_text || ''} />
         </button>
-        <p>{screenshots[activeShot].caption || screenshots[activeShot].alt_text}</p>
+        {#if screenshots[activeShot].caption || screenshots[activeShot].alt_text}
+          <p>{screenshots[activeShot].caption || screenshots[activeShot].alt_text}</p>
+        {/if}
         <div class="thumbnails">
           {#each screenshots as shot, index}
             <button
@@ -263,8 +265,10 @@
 
 {#if modal && screenshots.length}
   <button class="modal" onclick={() => (modal = false)} aria-label="Close enlarged screenshot">
-    <img src={screenshots[activeShot].url} alt={screenshots[activeShot].alt_text} />
-    <span>{screenshots[activeShot].caption || screenshots[activeShot].alt_text}</span>
+    <img src={screenshots[activeShot].url} alt={screenshots[activeShot].alt_text || ''} />
+    {#if screenshots[activeShot].caption || screenshots[activeShot].alt_text}
+      <span>{screenshots[activeShot].caption || screenshots[activeShot].alt_text}</span>
+    {/if}
   </button>
 {/if}
 

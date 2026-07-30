@@ -74,8 +74,8 @@
       error = 'Choose a valid .aissence file.';
       return;
     }
-    if (!screenshots.length || screenshots.some((shot) => !shot.alt.trim())) {
-      error = 'Add at least one screenshot and describe every image.';
+    if (!screenshots.length) {
+      error = 'Add at least one screenshot.';
       return;
     }
 
@@ -222,8 +222,8 @@
           <input id="product_url" name="product_url" type="url" required pattern="https://.*" placeholder="https://" />
         </div>
         <div class="field">
-          <label for="repository_label">Repository label</label>
-          <input id="repository_label" name="repository_label" required placeholder="owner/repository" />
+          <label for="repository_label">Repository label <span>(optional)</span></label>
+          <input id="repository_label" name="repository_label" placeholder="owner/repository" />
         </div>
         <div class="field wide">
           <label for="repository_url">Repository URL <span>(optional)</span></label>
@@ -233,7 +233,7 @@
     </section>
 
     <section>
-      <div class="step-head"><span>03</span><div><h2>What it became</h2><p>Add one to eight screenshots. Each needs useful alt text.</p></div></div>
+      <div class="step-head"><span>03</span><div><h2>What it became</h2><p>Add one to eight screenshots. Alt text is optional.</p></div></div>
       <label class="screenshot-picker">
         <input
           type="file"
@@ -249,8 +249,8 @@
             <article>
               <img src={URL.createObjectURL(shot.file)} alt="" />
               <div class="field">
-                <label for={`alt-${index}`}>Alt text</label>
-                <input id={`alt-${index}`} required bind:value={shot.alt} />
+                <label for={`alt-${index}`}>Alt text <span>(optional)</span></label>
+                <input id={`alt-${index}`} bind:value={shot.alt} />
               </div>
               <div class="field">
                 <label for={`caption-${index}`}>Caption <span>(optional)</span></label>

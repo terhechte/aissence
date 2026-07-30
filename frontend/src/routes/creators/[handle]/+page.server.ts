@@ -5,7 +5,7 @@ export const load: PageServerLoad = async ({ locals, params }) => {
   if (!locals.supabase) error(503, 'Supabase is not configured');
   const { data: profile } = await locals.supabase
     .from('profiles')
-    .select('id,handle,display_name,bio,created_at')
+    .select('id,handle,display_name,bio,avatar_path,created_at')
     .eq('handle', params.handle)
     .maybeSingle();
   if (!profile) error(404, 'Creator not found');
@@ -15,5 +15,13 @@ export const load: PageServerLoad = async ({ locals, params }) => {
     .eq('owner_id', profile.id)
     .eq('visibility', 'published')
     .order('published_at', { ascending: false });
-  return { profile, projects: projects ?? [] };
+  return {
+    profile: {
+      ...profile,
+      avatar_url: profile.avatar_path
+        ? locals.supabase.storage.from('profile-images').getPublicUrl(profile.avatar_path).data.publicUrl
+        : null
+    },
+    projects: projects ?? []
+  };
 };

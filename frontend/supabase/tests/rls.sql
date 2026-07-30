@@ -1,6 +1,6 @@
 begin;
 create extension if not exists pgtap with schema extensions;
-select plan(8);
+select plan(9);
 
 insert into auth.users (id, email)
 values
@@ -36,6 +36,12 @@ set local role authenticated;
 select set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000001', true);
 select is((select count(*)::integer from public.projects), 1, 'creator can read published project');
 select is((select count(*)::integer from public.message_sources), 2, 'creator can read all source');
+select lives_ok(
+  $$select public.create_owned_project(
+    'Draft', 'draft', 'Tagline', 'Description', 'https://draft.test', '', ''
+  )$$,
+  'creator can create a private draft through the owner-bound function'
+);
 
 select set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000002', true);
 select is((select count(*)::integer from public.commits), 1, 'unrelated reader can read summaries');

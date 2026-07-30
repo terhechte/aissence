@@ -19,7 +19,7 @@
   {#if !data.profile}
     <section class="panel onboarding">
       <p>Your public creator profile owns projects and is the unit readers subscribe to.</p>
-      <form method="POST" action="?/saveProfile" use:enhance>
+      <form method="POST" action="?/saveProfile" enctype="multipart/form-data" use:enhance>
         <div class="form-grid">
           <div class="field">
             <label for="display_name">Display name</label>
@@ -32,6 +32,11 @@
           <div class="field wide">
             <label for="bio">Short bio <span>(optional)</span></label>
             <textarea id="bio" name="bio">{profileValues.bio ?? ''}</textarea>
+          </div>
+          <div class="field wide">
+            <label for="avatar">Profile image <span>(optional)</span></label>
+            <input id="avatar" name="avatar" type="file" accept="image/jpeg,image/png,image/webp" />
+            <small>JPEG, PNG, or WebP · up to 5 MB</small>
           </div>
         </div>
         {#if form?.profileError}<p class="error">{form.profileError}</p>{/if}
@@ -103,6 +108,9 @@
   }
   .field span {
     color: var(--faint);
+  }
+  .field small {
+    color: var(--muted);
   }
   .section-title {
     align-items: center;

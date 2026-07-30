@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { projectMetadataSchema, screenshotMetadataSchema } from './project';
 import { AissenceValidationError, parseAissence } from './schema';
 
 const hash = '8f2a1c4e9b7d6a5f0c3e2b1a4d8c7e6f9a0b1c2d';
@@ -110,5 +111,30 @@ describe('parseAissence', () => {
 
   it('reports malformed JSON cleanly', () => {
     expect(() => parseAissence('{nope')).toThrow('not valid JSON');
+  });
+});
+
+describe('optional project metadata', () => {
+  it('accepts a project without a repository label', () => {
+    const parsed = projectMetadataSchema.parse({
+      name: 'Project',
+      slug: 'project',
+      tagline: 'A project',
+      description: 'Description',
+      product_url: 'https://example.com',
+      repository_label: '',
+      repository_url: ''
+    });
+    expect(parsed.repository_label).toBeNull();
+  });
+
+  it('accepts a screenshot without alt text', () => {
+    const parsed = screenshotMetadataSchema.parse({
+      storage_path: 'creator/project/image.png',
+      alt_text: '',
+      caption: '',
+      sort_order: 0
+    });
+    expect(parsed.alt_text).toBe('');
   });
 });

@@ -10,8 +10,11 @@
 
 <div class="page-shell creator">
   <header>
-    <div>
+    <div class="identity">
       <p class="eyebrow">Creator ledger</p>
+      {#if data.profile.avatar_url}
+        <img class="avatar" src={data.profile.avatar_url} alt="" />
+      {/if}
       <h1>{data.profile.display_name}</h1>
       <p>{data.profile.bio || 'The reasoning behind the projects.'}</p>
     </div>
@@ -23,7 +26,7 @@
       <div class="projects">
         {#each data.projects as project}
           <a href={`/creators/${data.profile.handle}/${project.slug}`}>
-            <div><h2>{project.name}</h2><p>{project.tagline}</p><span>{project.repository_label}</span></div>
+            <div><h2>{project.name}</h2><p>{project.tagline}</p>{#if project.repository_label}<span>{project.repository_label}</span>{/if}</div>
             <span>{project.commits?.[0]?.count ?? 0} entries</span>
             <time>{formatDate(project.published_at)}</time>
           </a>
@@ -55,6 +58,13 @@
     max-width: 600px;
     font-size: 22px;
     color: var(--body);
+  }
+  .avatar {
+    width: clamp(96px, 13vw, 160px);
+    aspect-ratio: 1;
+    object-fit: cover;
+    border-radius: 50%;
+    margin-top: 24px;
   }
   section {
     border-top: 1px solid var(--ink);

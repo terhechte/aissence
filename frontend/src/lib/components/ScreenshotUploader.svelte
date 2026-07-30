@@ -19,8 +19,8 @@
   }
 
   async function upload() {
-    if (!items.length || items.some((item) => !item.alt.trim())) {
-      error = 'Describe every screenshot before uploading.';
+    if (!items.length) {
+      error = 'Choose at least one screenshot.';
       return;
     }
     busy = true;
@@ -78,8 +78,8 @@
         {#each items as item, index}
           <article>
             <img src={URL.createObjectURL(item.file)} alt="" />
-            <div class="field"><label for={`new-alt-${index}`}>Alt text</label><input id={`new-alt-${index}`} bind:value={item.alt} /></div>
-            <div class="field"><label for={`new-caption-${index}`}>Caption</label><input id={`new-caption-${index}`} bind:value={item.caption} /></div>
+            <div class="field"><label for={`new-alt-${index}`}>Alt text <span>(optional)</span></label><input id={`new-alt-${index}`} bind:value={item.alt} /></div>
+            <div class="field"><label for={`new-caption-${index}`}>Caption <span>(optional)</span></label><input id={`new-caption-${index}`} bind:value={item.caption} /></div>
           </article>
         {/each}
       </div>

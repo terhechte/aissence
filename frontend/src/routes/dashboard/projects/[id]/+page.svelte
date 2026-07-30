@@ -37,7 +37,7 @@
       <div class="field wide"><label for="tagline">Tagline</label><input id="tagline" name="tagline" value={data.project.tagline} required /></div>
       <div class="field wide"><label for="description">Description</label><textarea id="description" name="description" required>{data.project.description}</textarea></div>
       <div class="field"><label for="product_url">Product URL</label><input id="product_url" name="product_url" type="url" value={data.project.product_url} required /></div>
-      <div class="field"><label for="repository_label">Repository label</label><input id="repository_label" name="repository_label" value={data.project.repository_label} required /></div>
+      <div class="field"><label for="repository_label">Repository label <span>(optional)</span></label><input id="repository_label" name="repository_label" value={data.project.repository_label ?? ''} /></div>
       <div class="field wide"><label for="repository_url">Repository URL</label><input id="repository_url" name="repository_url" type="url" value={data.project.repository_url ?? ''} /></div>
       <button class="button">Save details</button>
     </form>
@@ -61,8 +61,11 @@
       <div class="shots">
         {#each data.screenshots as shot, index}
           <article>
-            <img src={shot.url} alt={shot.alt_text} />
-            <div><strong>{shot.caption || shot.alt_text}</strong><span>{shot.alt_text}</span></div>
+            <img src={shot.url} alt={shot.alt_text || ''} />
+            <div>
+              <strong>{shot.caption || shot.alt_text || `Screenshot ${index + 1}`}</strong>
+              {#if shot.alt_text}<span>{shot.alt_text}</span>{/if}
+            </div>
             <div class="shot-actions">
               <form method="POST" action="?/moveScreenshot" use:enhance>
                 <input type="hidden" name="screenshot_id" value={shot.id} />

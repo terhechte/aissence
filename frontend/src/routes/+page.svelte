@@ -83,7 +83,7 @@
             <div>
               <h2>{project.name}</h2>
               <p>{project.tagline}</p>
-              <span>{project.repository_label}</span>
+              {#if project.repository_label}<span>{project.repository_label}</span>{/if}
             </div>
             <span>{project.profiles.display_name}</span>
             <span>{project.commits?.[0]?.count ?? 0} entries</span>

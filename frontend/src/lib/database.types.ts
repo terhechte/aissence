@@ -10,6 +10,18 @@ export interface Database {
     }>;
     Views: Record<string, never>;
     Functions: {
+      create_owned_project: {
+        Args: {
+          p_name: string;
+          p_slug: string;
+          p_tagline: string;
+          p_description: string;
+          p_product_url: string;
+          p_repository_label: string;
+          p_repository_url: string;
+        };
+        Returns: string;
+      };
       replace_project_snapshot: {
         Args: {
           p_project_id: string;
