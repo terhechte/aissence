@@ -17,6 +17,11 @@ path = "src/main.rs"
 name = "aissence-gui"
 path = "src/bin/gui.rs"
 
+# Run a complete model benchmark and write side-by-side cache/stat files.
+[[bin]]
+name = "aissence-benchmark"
+path = "src/bin/benchmark.rs"
+
 [dependencies]
 # Unified parsing of Claude Code / Codex / Gemini session logs into one model.
 # OpenCode is normalized into that model by the app's SQLite/JSON loader.

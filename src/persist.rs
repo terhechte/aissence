@@ -60,7 +60,15 @@ impl SummaryStore {
     /// Load the store for `folder`. Returns an empty store when the file is
     /// missing, unreadable, corrupt, or written by a different version.
     pub fn load(folder: &Path) -> Self {
-        let path = folder.join(CACHE_FILE);
+        Self::load_path(folder.join(CACHE_FILE))
+    }
+
+    /// Load a store from an explicitly named cache file.
+    ///
+    /// This is useful for side-by-side model runs that must not replace the
+    /// analyzed project's regular `.aissence` cache.
+    pub fn load_path(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
         let (commits, ignored) = std::fs::read_to_string(&path)
             .ok()
             .and_then(|text| serde_json::from_str::<CacheFile>(&text).ok())
@@ -71,6 +79,15 @@ impl SummaryStore {
             path,
             commits,
             ignored,
+        }
+    }
+
+    /// Create an empty store that will be written to an explicitly named file.
+    pub fn empty_at(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            commits: BTreeMap::new(),
+            ignored: BTreeSet::new(),
         }
     }
 
@@ -173,6 +190,32 @@ impl SummaryStore {
         self.save()
     }
 
+    /// Replace this store with all summarized committed groups and persist it
+    /// in a single atomic write.
+    ///
+    /// The trailing uncommitted group has no stable commit id and therefore
+    /// cannot be represented by the version-1 cache format.
+    pub fn replace_from_groups(&mut self, groups: &[CommitGroup]) -> std::io::Result<()> {
+        self.commits.clear();
+        self.ignored.clear();
+        for group in groups {
+            let (Some(commit), Some(summary)) = (&group.commit, &group.summary) else {
+                continue;
+            };
+            self.commits.insert(
+                commit.id.clone(),
+                CacheEntry {
+                    signature: signature(group),
+                    title: Some(commit.summary.clone()),
+                    date: Some(commit.time),
+                    stats: Some(commit.stats),
+                    summary: summary.clone(),
+                },
+            );
+        }
+        self.save()
+    }
+
     /// Atomically write the store (temp file + rename) so a crash mid-write
     /// can't corrupt the cache.
     fn save(&self) -> std::io::Result<()> {
@@ -182,7 +225,13 @@ impl SummaryStore {
             ignored: self.ignored.clone(),
         };
         let json = serde_json::to_string_pretty(&file).map_err(std::io::Error::other)?;
-        let tmp = self.path.with_file_name(format!("{CACHE_FILE}.tmp"));
+        let file_name = self
+            .path
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new(CACHE_FILE));
+        let mut tmp_name = file_name.to_os_string();
+        tmp_name.push(".tmp");
+        let tmp = self.path.with_file_name(tmp_name);
         std::fs::write(&tmp, json)?;
         std::fs::rename(&tmp, &self.path)
     }
@@ -313,6 +362,30 @@ mod tests {
         assert!(store.get("abc123", 99).is_none());
         assert!(store.get("missing", 42).is_none());
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn writes_a_complete_history_to_an_explicit_cache_path() {
+        let dir = tmp_dir("named-cache");
+        let path = dir.join("vendor-model.aissence");
+        let group = CommitGroup {
+            commit: Some(commit()),
+            messages: vec![],
+            summary: Some(sample()),
+        };
+        let expected_signature = signature(&group);
+
+        let mut store = SummaryStore::empty_at(&path);
+        store.replace_from_groups(&[group]).unwrap();
+
+        assert!(path.exists());
+        assert!(!dir.join(CACHE_FILE).exists());
+        assert!(
+            SummaryStore::load_path(&path)
+                .get("abc123", expected_signature)
+                .is_some()
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

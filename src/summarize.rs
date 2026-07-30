@@ -186,25 +186,44 @@ impl Summarizer {
     /// pressure across user-entry and compact core-summary calls is globally
     /// limited.
     pub async fn summarize_history(&self, history: &mut CoalescedHistory) -> Result<(), Error> {
+        self.summarize_history_with_cost(history).await.0
+    }
+
+    /// Summarize every non-empty group and return the actual OpenRouter cost.
+    ///
+    /// The returned cost includes successful requests made before a later
+    /// request failed. As with [`Self::summarize_history`], summaries are only
+    /// applied to `history` when the complete batch succeeds.
+    pub async fn summarize_history_with_cost(
+        &self,
+        history: &mut CoalescedHistory,
+    ) -> (Result<(), Error>, SummarizationCost) {
+        let costs = CostTracker::default();
+        let costs_ref = &costs;
         let jobs = history
             .groups
             .iter()
             .enumerate()
             .filter(|(_, group)| !group.messages.is_empty())
             .map(|(index, group)| async move {
-                self.summarize_group(group)
+                self.summarize_group_tracked(group, costs_ref)
                     .await
                     .map(|summary| (index, summary))
             });
-        let summaries: Vec<(usize, CommitSummary)> = stream::iter(jobs)
+        let outcome: Result<Vec<(usize, CommitSummary)>, Error> = stream::iter(jobs)
             .buffer_unordered(MAX_CONCURRENT_GROUPS)
             .try_collect()
-            .await?;
+            .await;
+
+        let summaries = match outcome {
+            Ok(summaries) => summaries,
+            Err(error) => return (Err(error), costs.total()),
+        };
 
         for (index, summary) in summaries {
             history.groups[index].summary = Some(summary);
         }
-        Ok(())
+        (Ok(()), costs.total())
     }
 
     /// Summarize a single commit group. Every user entry gets a summary; the
@@ -1372,6 +1391,22 @@ mod tests {
         assert!((total.usd - 0.003).abs() < f64::EPSILON);
         assert_eq!(total.request_count, 3);
         assert_eq!(total.unpriced_request_count, 1);
+    }
+
+    #[tokio::test]
+    async fn empty_history_returns_zero_cost_without_a_request() {
+        let summarizer = Summarizer::new("test-key", "test/model").unwrap();
+        let mut history = CoalescedHistory {
+            folder: std::path::PathBuf::from("/test/project"),
+            groups: vec![],
+            undated: vec![],
+            warnings: vec![],
+        };
+
+        let (outcome, cost) = summarizer.summarize_history_with_cost(&mut history).await;
+
+        assert!(outcome.is_ok());
+        assert_eq!(cost, SummarizationCost::default());
     }
 
     #[test]
