@@ -1,0 +1,4 @@
+interface:
+  display_name: "Run Aissence"
+  short_description: "Start Aissence and its local services"
+  default_prompt: "Use $run-aissence to start the local Aissence development environment."

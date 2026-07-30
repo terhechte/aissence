@@ -50,15 +50,42 @@ calls are represented separately as `Change` objects.
 
 ```jsonc
 {
-  "signature": 17712209936...,   // integer — opaque producer cache key
-  "summary": { ... }              // object — the summary (see "CommitSummary")
+  "signature": 17712209936...,     // integer — opaque producer cache key
+  "title": "Add retry support",    // string — first line of the commit message
+  "date": "2026-06-20T09:18:03Z", // string — commit time in UTC
+  "stats": { ... },                // object — authoritative git diff statistics
+  "summary": { ... }               // object — the summary (see "CommitSummary")
 }
 ```
 
 | Field       | JSON type | Meaning |
 |-------------|-----------|---------|
 | `signature` | integer (unsigned 64-bit) | An opaque producer cache key derived from the message timeline. It is used to decide whether a cached entry can be reused. It is not a content hash or stable external identifier, and a consumer should ignore it. It may exceed JavaScript's safe-integer range (`2^53−1`); use a JSON parser that preserves unsigned 64-bit integers if exact round-tripping is required. |
+| `title`     | string | The first line of the git commit message. May be absent in older version-1 files. |
+| `date`      | string | The commit's committer time in UTC, encoded as RFC 3339 / ISO 8601 (for example, `"2026-06-20T09:18:03Z"`). This is the timestamp used to correlate the conversation with the commit. May be absent in older version-1 files. |
+| `stats`     | object | Authoritative file and text-line counts calculated from the committed git trees. See below. May be absent in older version-1 files. |
 | `summary`   | object    | The commit's summary. See below. |
+
+### Commit stats
+
+```jsonc
+{
+  "files_changed": 3,  // integer
+  "lines_added": 21,   // integer
+  "lines_deleted": 4   // integer
+}
+```
+
+| Field           | JSON type | Meaning |
+|-----------------|-----------|---------|
+| `files_changed` | integer (unsigned) | Number of files changed by the commit, including binary files and submodules. |
+| `lines_added`   | integer (unsigned) | Number of text lines added by the commit. Binary files and submodules contribute no text-line count. |
+| `lines_deleted` | integer (unsigned) | Number of text lines deleted by the commit. Binary files and submodules contribute no text-line count. |
+
+The producer calculates these values from git's committed trees, comparing a
+commit with its first parent (or with the empty tree for a root commit). They
+describe the final commit itself and are authoritative; they are unrelated to
+the best-effort, tool-call-derived `Change.diff` strings.
 
 ## `CommitSummary`
 
@@ -195,12 +222,12 @@ not produce a persisted text/change entry need not satisfy that equality.
 
 A consumer should know the file's boundaries:
 
-- **No git metadata.** The commit message, author, date, and parents are *not*
-  stored — only the commit hash (the map key). Those must be read from the git
-  repository if needed.
+- **Limited git metadata.** The commit title (first message line), committer
+  date, and aggregate diff stats are stored. The full commit message, author,
+  and parents are not; those must be read from the git repository if needed.
 - **No full commit diff.** Only the per-edit synthesized `diff`s inside
-  `changes` are present. The authoritative diff of the whole commit is not
-  stored; it would come from git.
+  `changes` are present. The authoritative aggregate stats of the whole commit
+  are stored, but its patch is not; the patch would come from git.
 - **No complete structured transcript.** Full normalized plain-text content is
   retained for user and assistant-text entries, so the file can contain
   sensitive source prompts and replies. It does not retain structured thinking
@@ -215,6 +242,8 @@ A consumer should know the file's boundaries:
   as an empty string.
 - Treat missing `content` as unavailable source text, not as an empty original
   message. Older files do not contain this field.
+- Treat missing `title`, `date`, or `stats` as unavailable git metadata. Older
+  version-1 files do not contain these fields.
 - Treat missing `tokens` as unknown usage, not as zero usage.
 - Tolerate unknown fields that may be added in future versions — ignore them.
 - Inspect `version`; handle unknown versions gracefully.
@@ -230,6 +259,13 @@ A consumer should know the file's boundaries:
   "commits": {
     "8f2a1c4e9b7d6a5f0c3e2b1a4d8c7e6f9a0b1c2d": {
       "signature": 17712209936023451233,
+      "title": "Add retry support to the network client",
+      "date": "2026-06-20T09:18:03Z",
+      "stats": {
+        "files_changed": 3,
+        "lines_added": 48,
+        "lines_deleted": 7
+      },
       "summary": {
         "user_requested": "The user asked to add a retry wrapper around the network client and make the timeout configurable.",
         "ai_answered": "The assistant proposed an exponential-backoff retry helper and explained that the timeout would be read from an environment variable with a sensible default.",
@@ -278,6 +314,13 @@ A consumer should know the file's boundaries:
     },
     "1b2c3d4e5f60718293a4b5c6d7e8f9a0b1c2d3e4": {
       "signature": 4490112233445566778,
+      "title": "Fix README typo",
+      "date": "2026-06-21T15:03:22Z",
+      "stats": {
+        "files_changed": 1,
+        "lines_added": 1,
+        "lines_deleted": 1
+      },
       "summary": {
         "user_requested": "The user asked to fix a typo in the README.",
         "ai_answered": "",

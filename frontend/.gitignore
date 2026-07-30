@@ -1,1 +1,13 @@
 original
+.DS_Store
+node_modules
+.svelte-kit
+build
+.vercel
+.env
+.env.*
+!.env.example
+playwright-report
+test-results
+coverage
+supabase/.temp

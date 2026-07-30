@@ -1,0 +1,6 @@
+-- Local acceptance-test helper:
+-- select public.grant_manual_subscription(
+--   '<subscriber auth.users id>'::uuid,
+--   '<creator profiles id>'::uuid,
+--   now() + interval '30 days'
+-- );

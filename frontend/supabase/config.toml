@@ -1,0 +1,46 @@
+project_id = "aissence"
+
+[api]
+enabled = true
+port = 55421
+schemas = ["public", "storage", "graphql_public"]
+extra_search_path = ["public", "extensions"]
+
+[db]
+port = 55422
+shadow_port = 55420
+major_version = 17
+
+[studio]
+enabled = true
+port = 55423
+
+[auth]
+enabled = true
+site_url = "http://localhost:5173"
+additional_redirect_urls = [
+  "http://localhost:5173/auth/callback",
+  "http://127.0.0.1:5173/auth/callback",
+]
+
+[storage]
+enabled = true
+file_size_limit = "25MiB"
+
+[inbucket]
+enabled = true
+port = 55424
+smtp_port = 55425
+pop3_port = 55426
+
+[analytics]
+enabled = true
+port = 55427
+backend = "postgres"
+
+[db.pooler]
+enabled = false
+port = 55429
+pool_mode = "transaction"
+default_pool_size = 20
+max_client_conn = 100
