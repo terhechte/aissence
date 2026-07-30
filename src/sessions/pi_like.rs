@@ -166,8 +166,7 @@ fn parse_file(path: &Path, flavor: Flavor) -> Result<Option<ncs::Session>, Strin
             }
             "model_change" => {
                 if session.metadata.provider.is_none() {
-                    session.metadata.provider =
-                        string_at(entry, &["provider"]).map(str::to_string);
+                    session.metadata.provider = string_at(entry, &["provider"]).map(str::to_string);
                 }
                 if session.metadata.model.is_none() {
                     session.metadata.model = string_at(entry, &["modelId"])
@@ -271,10 +270,7 @@ fn normalize_message(entry: &Value, session: &mut ncs::Session, current: &mut nc
             });
         }
         "bashExecution" => {
-            let id = format!(
-                "bash-{}",
-                string_at(entry, &["id"]).unwrap_or("execution")
-            );
+            let id = format!("bash-{}", string_at(entry, &["id"]).unwrap_or("execution"));
             let command = string_at(message, &["command"]).unwrap_or("");
             current.messages.push(ncs::Message {
                 role: ncs::Role::Assistant,

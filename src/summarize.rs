@@ -2,10 +2,13 @@
 //! [OpenRouter](https://openrouter.ai/).
 //!
 //! For each [`CommitGroup`] we summarize every user entry and retain assistant
-//! entries locally. The user-entry summaries are combined locally into *user
-//! requested*. One additional, strictly bounded request derives *ai answered*
-//! and *ai implemented* from terminal assistant text and an authoritative git
-//! fingerprint. A longer cohesive `meta` overview remains optional.
+//! entries locally. Trivially short user entries are kept verbatim; the rest
+//! are summarized in batched requests. The user-entry summaries are combined
+//! locally into *user requested*. One additional, strictly bounded request —
+//! issued concurrently with the user-entry summaries — derives *ai answered*
+//! and *ai implemented* from bounded raw user evidence, terminal assistant
+//! text, and an authoritative git fingerprint. A longer cohesive `meta`
+//! overview remains optional.
 //!
 //! The three categories are derived from the chat itself:
 //! - **user**: [`ncs::Role::User`] message text,
@@ -50,16 +53,28 @@ pub const ENV_PROVIDER: &str = "OPENROUTER_PROVIDER";
 pub const DEFAULT_MODEL: &str = "inclusionai/ling-2.6-flash";
 /// Maximum number of commit groups summarized concurrently.
 ///
-/// Request concurrency across those groups is bounded separately.
-pub const MAX_CONCURRENT_GROUPS: usize = 8;
+/// Groups are cheap to keep in flight; the global request limit
+/// ([`MAX_CONCURRENT_REQUESTS`]) is the real governor of API pressure.
+pub const MAX_CONCURRENT_GROUPS: usize = 32;
 /// Maximum number of OpenRouter requests in flight across all commit groups.
 pub const MAX_CONCURRENT_REQUESTS: usize = 24;
 /// Number of retries after the initial request for transient failures.
-const MAX_REQUEST_RETRIES: usize = 3;
+/// Provider rate limits (429) can persist well beyond a few seconds when a
+/// batch of groups starts at once, so the budget is generous.
+const MAX_REQUEST_RETRIES: usize = 7;
 /// Initial grace period before retrying; subsequent waits double.
 const RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
+/// Longest grace period between retries (before jitter).
+const RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 /// Maximum persisted aggregate of the already-small user prompt summaries.
 const USER_REQUESTED_CHARS: usize = 2_400;
+/// User prompts at or below this length need no model call — the text itself
+/// is already as concise as any summary the model would return.
+const TRIVIAL_USER_CHARS: usize = 200;
+/// Maximum user entries combined into one batched summary request.
+const USER_BATCH_SIZE: usize = 8;
+/// Maximum combined source characters in one batched summary request.
+const USER_BATCH_CHARS: usize = 6_000;
 /// Maximum user-request evidence sent to the compact core-summary call.
 const CORE_USER_CHARS: usize = 1_600;
 /// Maximum assistant evidence sent to the compact core-summary call.
@@ -257,11 +272,14 @@ impl Summarizer {
             .map(|c| c.summary.clone())
             .unwrap_or_else(|| "(uncommitted work in progress)".to_string());
 
-        let entry_summaries = self.summarize_user_entries(&items, costs).await?;
+        // The core-outcome call uses bounded raw user evidence, so it runs
+        // concurrently with the user-entry summaries instead of waiting on
+        // them — one model round trip less on the per-group critical path.
+        let (entry_summaries, (ai_answered, ai_implemented)) = futures::try_join!(
+            self.summarize_user_entries(&items, costs),
+            self.summarize_core_outcome(&items, group.commit.as_ref(), costs),
+        )?;
         let user_requested = aggregate_user_requests(&items, &entry_summaries);
-        let (ai_answered, ai_implemented) = self
-            .summarize_core_outcome(&items, group.commit.as_ref(), &user_requested, costs)
-            .await?;
         let meta = if self.meta_summaries {
             self.meta_summary(
                 &user_requested,
@@ -301,18 +319,18 @@ impl Summarizer {
 
     /// Generate both assistant-facing aggregate fields in one bounded request.
     ///
-    /// The request never receives a full transcript or full diff. Assistant
-    /// evidence favors the terminal response, while implementation evidence is
-    /// an authoritative commit message/stat/path fingerprint. Pending work
-    /// falls back to tool and path names, still without diff bodies.
+    /// The request never receives a full transcript or full diff. User evidence
+    /// is bounded raw prompt text, assistant evidence favors the terminal
+    /// response, and implementation evidence is an authoritative commit
+    /// message/stat/path fingerprint. Pending work falls back to tool and path
+    /// names, still without diff bodies.
     async fn summarize_core_outcome(
         &self,
         items: &[RawItem],
         commit: Option<&crate::model::CommitInfo>,
-        user_requested: &str,
         costs: &CostTracker,
     ) -> Result<(String, String), Error> {
-        let input = core_summary_input(items, commit, user_requested);
+        let input = core_summary_input(items, commit);
         if !input.has_answer && !input.has_implementation {
             return Ok((String::new(), String::new()));
         }
@@ -354,36 +372,109 @@ impl Summarizer {
 
     /// Generate exactly one summary for every coalesced user entry. The full
     /// retained prompt is supplied with no character or entry-count cutoff.
+    ///
+    /// Trivially short entries are kept verbatim without a model call. The
+    /// remaining entries are summarized in batched requests (one JSON array of
+    /// summaries per batch) to cut round trips and request pressure; a batch
+    /// whose response cannot be matched to its entries falls back to
+    /// per-entry requests.
     async fn summarize_user_entries(
         &self,
         items: &[RawItem],
         costs: &CostTracker,
     ) -> Result<Vec<Option<String>>, Error> {
-        let mut jobs = Vec::with_capacity(items.len());
-        for item in items {
-            let kind = item.kind;
-            let text = item.text.clone();
-            jobs.push(async move {
-                if kind != MessageKind::UserWrote {
-                    return Ok(None);
-                }
-                self.complete(
+        let (mut results, batches) = plan_user_entry_jobs(items);
+        let jobs = batches.into_iter().map(|batch| async move {
+            let summaries = self.summarize_user_batch(items, &batch, costs).await?;
+            Ok::<_, Error>((batch, summaries))
+        });
+        let outcomes: Vec<(Vec<usize>, Vec<String>)> = stream::iter(jobs)
+            .buffered(MAX_CONCURRENT_REQUESTS)
+            .try_collect()
+            .await?;
+        for (indices, summaries) in outcomes {
+            for (index, summary) in indices.into_iter().zip(summaries) {
+                results[index] = Some(summary);
+            }
+        }
+        Ok(results)
+    }
+
+    /// Summarize one batch of user entries. Single-entry batches use the plain
+    /// per-entry request; larger batches ask for one JSON array of summaries.
+    async fn summarize_user_batch(
+        &self,
+        items: &[RawItem],
+        batch: &[usize],
+        costs: &CostTracker,
+    ) -> Result<Vec<String>, Error> {
+        if batch.len() == 1 {
+            let summary = self
+                .complete(
                     "You summarize one complete user prompt from a coding session. \
                      Preserve every important request, constraint, question, correction, \
                      and reported problem. Reply with a concise 2-3 sentence summary and \
                      no preamble.",
-                    format!("Complete user prompt:\n\n{text}"),
+                    format!("Complete user prompt:\n\n{}", items[batch[0]].text),
                     300,
                     costs,
                 )
-                .await
-                .map(Some)
-            });
+                .await?;
+            return Ok(vec![summary]);
         }
-        stream::iter(jobs)
-            .buffered(MAX_CONCURRENT_REQUESTS)
-            .try_collect()
-            .await
+
+        let mut prompt = String::from("Summarize each of these user prompts:\n\n");
+        for (position, index) in batch.iter().enumerate() {
+            prompt.push_str(&format!(
+                "### User prompt {}\n{}\n\n",
+                position + 1,
+                items[*index].text
+            ));
+        }
+        let max_tokens = (300 * batch.len() as u32).min(2_400);
+        let text = self
+            .complete(
+                "You summarize several numbered user prompts from a coding session. \
+                 For each, preserve every important request, constraint, question, \
+                 correction, and reported problem. Return one JSON array of strings \
+                 with exactly one concise 2-3 sentence summary per prompt, in the \
+                 same order. Output JSON only.",
+                prompt,
+                max_tokens,
+                costs,
+            )
+            .await?;
+
+        let parsed = parse_string_array(&text).filter(|summaries| {
+            summaries.len() == batch.len()
+                && summaries.iter().all(|summary| !summary.trim().is_empty())
+        });
+        match parsed {
+            Some(summaries) => Ok(summaries
+                .into_iter()
+                .map(|summary| summary.trim().to_string())
+                .collect()),
+            // The model returned something unusable — retry the batch's
+            // entries individually.
+            None => {
+                let mut summaries = Vec::with_capacity(batch.len());
+                for index in batch {
+                    summaries.push(
+                        self.complete(
+                            "You summarize one complete user prompt from a coding session. \
+                             Preserve every important request, constraint, question, correction, \
+                             and reported problem. Reply with a concise 2-3 sentence summary and \
+                             no preamble.",
+                            format!("Complete user prompt:\n\n{}", items[*index].text),
+                            300,
+                            costs,
+                        )
+                        .await?,
+                    );
+                }
+                Ok(summaries)
+            }
+        }
     }
 
     /// Synthesize the three component summaries into one cohesive overview (up
@@ -521,11 +612,72 @@ fn aggregate_user_requests(items: &[RawItem], summaries: &[Option<String>]) -> S
     truncate_middle(&joined, USER_REQUESTED_CHARS)
 }
 
+/// Bounded raw user prompt text used as core-summary evidence. Unlike the
+/// persisted aggregate this needs no model calls, so the core-outcome request
+/// can start immediately, concurrently with the user-entry summaries.
+fn user_evidence(items: &[RawItem]) -> String {
+    items
+        .iter()
+        .filter(|item| item.kind == MessageKind::UserWrote)
+        .map(|item| item.text.trim())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Partition user entries into summary jobs. Returns the prefilled results —
+/// trivially short entries keep their text verbatim — plus the entry-index
+/// batches that each need one model request. Entries at or above
+/// [`USER_BATCH_CHARS`] always get a request of their own.
+fn plan_user_entry_jobs(items: &[RawItem]) -> (Vec<Option<String>>, Vec<Vec<usize>>) {
+    let mut prefilled: Vec<Option<String>> = (0..items.len()).map(|_| None).collect();
+    let mut batches: Vec<Vec<usize>> = Vec::new();
+    let mut current: Vec<usize> = Vec::new();
+    let mut current_chars = 0_usize;
+    for (index, item) in items.iter().enumerate() {
+        if item.kind != MessageKind::UserWrote {
+            continue;
+        }
+        let chars = item.text.chars().count();
+        if chars <= TRIVIAL_USER_CHARS {
+            prefilled[index] = Some(item.text.trim().to_string());
+            continue;
+        }
+        if !current.is_empty()
+            && (current.len() >= USER_BATCH_SIZE || current_chars + chars > USER_BATCH_CHARS)
+        {
+            batches.push(std::mem::take(&mut current));
+            current_chars = 0;
+        }
+        current_chars += chars;
+        current.push(index);
+        if current_chars >= USER_BATCH_CHARS {
+            batches.push(std::mem::take(&mut current));
+            current_chars = 0;
+        }
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    (prefilled, batches)
+}
+
+/// Parse a JSON string array from a model response, tolerating surrounding
+/// prose or code fences.
+fn parse_string_array(text: &str) -> Option<Vec<String>> {
+    let trimmed = text.trim();
+    let start = trimmed.find('[')?;
+    let end = trimmed.rfind(']')?;
+    (start <= end)
+        .then(|| &trimmed[start..=end])
+        .and_then(|json| serde_json::from_str(json).ok())
+}
+
 fn core_summary_input(
     items: &[RawItem],
     commit: Option<&crate::model::CommitInfo>,
-    user_requested: &str,
 ) -> CoreSummaryInput {
+    let user = user_evidence(items);
     let assistant = assistant_evidence(items);
     let implementation = implementation_fingerprint(items, commit);
     let has_answer = items
@@ -536,11 +688,11 @@ fn core_summary_input(
             .iter()
             .any(|item| item.kind == MessageKind::AiChanged && !item.changes.is_empty());
 
-    let request = truncate_middle(user_requested, CORE_USER_CHARS);
+    let request = truncate_middle(&user, CORE_USER_CHARS);
     let assistant = truncate_head(&assistant, CORE_ASSISTANT_CHARS);
     let implementation = truncate_head(&implementation, CORE_IMPLEMENTATION_CHARS);
     let prompt = format!(
-        "Already-summarized user requests:\n{}\n\n\
+        "User requests (bounded raw excerpts):\n{}\n\n\
          Bounded assistant evidence, newest conclusion first:\n{}\n\n\
          Authoritative implementation fingerprint:\n{}\n\n\
          Produce the two-field JSON object.",
@@ -767,8 +919,18 @@ fn is_retryable_status(status: u16) -> bool {
     matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
 }
 
+/// Exponential backoff with a cap and up to +50% jitter, so the many
+/// in-flight requests don't all retry in lockstep after a shared 429.
 fn retry_delay(retry: usize) -> Duration {
-    RETRY_BASE_DELAY.saturating_mul(1_u32 << retry.min(10))
+    let base = RETRY_BASE_DELAY
+        .saturating_mul(1_u32 << retry.min(10))
+        .min(RETRY_MAX_DELAY);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::from(elapsed.subsec_nanos()))
+        .unwrap_or(0);
+    let jitter = Duration::from_millis(nanos % (base.as_millis() as u64 / 2 + 1));
+    base + jitter
 }
 
 /// One source message turned into a locally retained conversation entry and
@@ -852,7 +1014,9 @@ fn coalesce_consecutive(items: Vec<RawItem>) -> Vec<RawItem> {
                 last.text.push_str(&item.text);
                 last.changes.extend(item.changes);
                 if let Some(tokens) = item.tokens {
-                    last.tokens.get_or_insert_with(TokenCount::default).add(&tokens);
+                    last.tokens
+                        .get_or_insert_with(TokenCount::default)
+                        .add(&tokens);
                 }
             }
             _ => merged.push(item),
@@ -1074,8 +1238,14 @@ fn synth_diff(file: &str, input: &serde_json::Value) -> String {
     if let Some(edits) = input.get("edits").and_then(|v| v.as_array()) {
         let mut out = format!("--- a/{file}\n+++ b/{file}\n");
         for edit in edits {
-            let old = edit.get("old_string").and_then(|v| v.as_str()).unwrap_or("");
-            let new = edit.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
+            let old = edit
+                .get("old_string")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let new = edit
+                .get("new_string")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             out.push_str("@@ @@\n");
             push_prefixed(&mut out, '-', old);
             push_prefixed(&mut out, '+', new);
@@ -1415,9 +1585,20 @@ mod tests {
         assert!(is_retryable_status(503));
         assert!(!is_retryable_status(400));
         assert!(!is_retryable_status(401));
-        assert_eq!(retry_delay(0), Duration::from_secs(2));
-        assert_eq!(retry_delay(1), Duration::from_secs(4));
-        assert_eq!(retry_delay(2), Duration::from_secs(8));
+        // Base delays double from 2s, with up to +50% jitter.
+        for (retry, expected_secs) in [(0, 2), (1, 4), (2, 8)] {
+            let base = Duration::from_secs(expected_secs);
+            let delay = retry_delay(retry);
+            assert!(delay >= base, "retry {retry}: {delay:?} below base");
+            assert!(
+                delay <= base + base / 2 + Duration::from_millis(1),
+                "retry {retry}: {delay:?} above jitter bound"
+            );
+        }
+        // High retries are capped at RETRY_MAX_DELAY (plus jitter).
+        let high = retry_delay(10);
+        assert!(high >= RETRY_MAX_DELAY);
+        assert!(high <= RETRY_MAX_DELAY + RETRY_MAX_DELAY / 2 + Duration::from_millis(1));
     }
 
     #[test]
@@ -1538,8 +1719,9 @@ mod tests {
             }],
         };
 
-        let input = core_summary_input(&items, Some(&commit), &"request ".repeat(2_000));
+        let input = core_summary_input(&items, Some(&commit));
         assert!(input.prompt.chars().count() <= CORE_PROMPT_CHARS);
+        assert!(input.prompt.contains("fix it"));
         assert!(input.prompt.contains("Final result: tests pass."));
         assert!(input.prompt.contains("M src/lib.rs"));
         assert!(!input.prompt.contains("DO_NOT_SEND_DIFF_BODY"));
@@ -1556,6 +1738,57 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.ai_answered, "Done.");
         assert_eq!(parsed.ai_implemented, "Changed it.");
+    }
+
+    #[test]
+    fn parses_string_arrays_even_inside_code_fences() {
+        let parsed = parse_string_array("```json\n[\"one\",\"two\"]\n```").unwrap();
+        assert_eq!(parsed, vec!["one".to_string(), "two".to_string()]);
+        assert!(parse_string_array("no json here").is_none());
+    }
+
+    #[test]
+    fn user_entry_jobs_keep_trivial_prompts_verbatim_and_batch_the_rest() {
+        let items = vec![
+            item(MessageKind::UserWrote, "ok"),  // trivial: no model call
+            item(MessageKind::AiWrote, "reply"), // not a user entry
+            item(MessageKind::UserWrote, &"a".repeat(500)),
+            item(MessageKind::UserWrote, &"b".repeat(500)),
+            item(MessageKind::UserWrote, &"c".repeat(7_000)), // own request
+        ];
+
+        let (prefilled, batches) = plan_user_entry_jobs(&items);
+
+        assert_eq!(prefilled[0].as_deref(), Some("ok"));
+        assert_eq!(prefilled[1], None);
+        assert_eq!(batches, vec![vec![2, 3], vec![4]]);
+    }
+
+    #[test]
+    fn user_entry_jobs_cap_batch_size() {
+        let items = (0..10)
+            .map(|_| item(MessageKind::UserWrote, &"a".repeat(500)))
+            .collect::<Vec<_>>();
+
+        let (prefilled, batches) = plan_user_entry_jobs(&items);
+
+        assert!(prefilled.iter().all(|summary| summary.is_none()));
+        assert_eq!(
+            batches,
+            vec![vec![0, 1, 2, 3, 4, 5, 6, 7], vec![8, 9]],
+            "batches stop at USER_BATCH_SIZE entries"
+        );
+    }
+
+    #[test]
+    fn user_evidence_joins_only_user_text() {
+        let items = vec![
+            item(MessageKind::UserWrote, "first"),
+            item(MessageKind::AiWrote, "reply"),
+            item(MessageKind::UserWrote, "last"),
+        ];
+
+        assert_eq!(user_evidence(&items), "first\n\nlast");
     }
 
     #[test]

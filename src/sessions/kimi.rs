@@ -66,7 +66,10 @@ fn sessions_roots() -> Vec<PathBuf> {
     if let Some(profile) = std::env::var_os("USERPROFILE") {
         homes.push(PathBuf::from(profile).join(".kimi-code"));
     }
-    let mut roots: Vec<PathBuf> = homes.into_iter().map(|home| home.join("sessions")).collect();
+    let mut roots: Vec<PathBuf> = homes
+        .into_iter()
+        .map(|home| home.join("sessions"))
+        .collect();
     roots.dedup();
     roots
 }
@@ -138,7 +141,8 @@ fn parse_wire(
     state: &Value,
     session_dir: &Path,
 ) -> Result<Option<ncs::Session>, String> {
-    let text = std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
 
     let mut session = ncs::Session::new(path.to_path_buf(), "kimi");
     session.metadata.session_id = session_dir
@@ -278,7 +282,8 @@ fn parse_wire(
             }
             "llm.request" => {
                 if session.metadata.provider.is_none() {
-                    session.metadata.provider = string_at(&event, &["provider"]).map(str::to_string);
+                    session.metadata.provider =
+                        string_at(&event, &["provider"]).map(str::to_string);
                 }
                 if session.metadata.model.is_none() {
                     session.metadata.model = string_at(&event, &["modelAlias"])
@@ -454,7 +459,12 @@ mod tests {
 
         let mut sessions = Vec::new();
         let mut warnings = Vec::new();
-        load_from_root(&root.join("sessions"), &project, &mut sessions, &mut warnings);
+        load_from_root(
+            &root.join("sessions"),
+            &project,
+            &mut sessions,
+            &mut warnings,
+        );
 
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(sessions.len(), 1);
@@ -492,13 +502,19 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         std::fs::create_dir_all(&other).unwrap();
 
-        let wire =
-            [r#"{"type":"turn.prompt","input":[{"type":"text","text":"hi"}],"time":1784560372445}"#];
+        let wire = [
+            r#"{"type":"turn.prompt","input":[{"type":"text","text":"hi"}],"time":1784560372445}"#,
+        ];
         write_session(&root, "wd_other", "ses_other", &other, &wire);
 
         let mut sessions = Vec::new();
         let mut warnings = Vec::new();
-        load_from_root(&root.join("sessions"), &project, &mut sessions, &mut warnings);
+        load_from_root(
+            &root.join("sessions"),
+            &project,
+            &mut sessions,
+            &mut warnings,
+        );
 
         assert!(sessions.is_empty());
         assert!(warnings.is_empty());

@@ -272,7 +272,8 @@ mod tests {
     use chrono::TimeZone;
 
     fn tmp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("aissence-persist-{}-{tag}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("aissence-persist-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

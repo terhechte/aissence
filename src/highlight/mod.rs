@@ -114,7 +114,10 @@ pub fn highlight_block(code: &str, syntax: &SyntaxReference) -> Vec<StyledLine> 
 
 /// Highlight a single line in isolation (fresh parser state).
 pub fn highlight_line(line: &str, syntax: &SyntaxReference) -> StyledLine {
-    highlight_block(line, syntax).into_iter().next().unwrap_or_default()
+    highlight_block(line, syntax)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

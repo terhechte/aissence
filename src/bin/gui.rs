@@ -583,8 +583,7 @@ impl AissenceApp {
         } else {
             // With changes hidden, let the messages view use all remaining
             // space instead of leaving an empty third pane.
-            egui::CentralPanel::default()
-                .show_inside(ui, |ui| self.messages_pane(ui, &history));
+            egui::CentralPanel::default().show_inside(ui, |ui| self.messages_pane(ui, &history));
         }
 
         // Keep animating / pumping while any commit is queued or summarizing.
@@ -818,7 +817,11 @@ impl AissenceApp {
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new(prefix).color(color).strong());
-            ui.label(egui::RichText::new(message.kind.label()).color(color).strong());
+            ui.label(
+                egui::RichText::new(message.kind.label())
+                    .color(color)
+                    .strong(),
+            );
             // Per-message token counts (turn-level, approximate).
             if let Some(tokens) = message.tokens.filter(|t| !t.is_zero()) {
                 ui.label(
@@ -1023,7 +1026,13 @@ fn raw_messages(ui: &mut egui::Ui, group: &CommitGroup) {
             aissence::ncs::Role::System => (DIM, "system"),
         };
         let text = message.text();
-        let snippet: String = text.lines().next().unwrap_or("").chars().take(140).collect();
+        let snippet: String = text
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(140)
+            .collect();
         if snippet.trim().is_empty() {
             continue;
         }

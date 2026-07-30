@@ -363,8 +363,10 @@ mod tests {
 
     #[test]
     fn history_map_attributes_path_free_conversations() {
-        let directory =
-            std::env::temp_dir().join(format!("aissence-antigravity-history-{}", std::process::id()));
+        let directory = std::env::temp_dir().join(format!(
+            "aissence-antigravity-history-{}",
+            std::process::id()
+        ));
         let project = directory.join("project");
         std::fs::create_dir_all(&project).unwrap();
         let path = directory.join("history.jsonl");

@@ -479,7 +479,12 @@ new file mode 100644\n\
         // display_path skips /dev/null in favor of the real (new) path.
         assert_eq!(file.display_path(), "new.rs");
         assert_eq!(file.hunks[0].lines.len(), 2);
-        assert!(file.hunks[0].lines.iter().all(|l| l.kind == DiffLineKind::Add));
+        assert!(
+            file.hunks[0]
+                .lines
+                .iter()
+                .all(|l| l.kind == DiffLineKind::Add)
+        );
     }
 
     #[test]
