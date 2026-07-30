@@ -79,6 +79,9 @@
   .profile-panel {
     max-width: 900px;
   }
+  .profile-panel .form-grid > .field {
+    align-content: start;
+  }
   .section-head {
     display: grid;
     grid-template-columns: 58px 1fr;

@@ -260,6 +260,10 @@ button[disabled] {
     display: none;
   }
 
+  .site-header nav a:nth-last-of-type(-n + 2) {
+    display: inline;
+  }
+
   .form-grid {
     grid-template-columns: 1fr;
   }

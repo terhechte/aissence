@@ -11,6 +11,7 @@
     <a href="/#recent">Recent</a>
     {#if claims}
       <a href="/dashboard">Dashboard</a>
+      <a href="/dashboard/subscriptions">Subscriptions</a>
     {:else}
       <a href="/auth">Sign in</a>
     {/if}
