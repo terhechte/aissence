@@ -1,6 +1,6 @@
 begin;
 create extension if not exists pgtap with schema extensions;
-select plan(9);
+select plan(12);
 
 insert into auth.users (id, email)
 values
@@ -42,6 +42,20 @@ select lives_ok(
   )$$,
   'creator can create a private draft through the owner-bound function'
 );
+select lives_ok(
+  $$insert into storage.objects (bucket_id, name, owner_id)
+    values (
+      'project-media',
+      '00000000-0000-0000-0000-000000000001/10000000-0000-0000-0000-000000000001/screenshot.png',
+      '00000000-0000-0000-0000-000000000001'
+    )$$,
+  'creator can upload media for their project'
+);
+select is(
+  (select count(*)::integer from storage.objects where bucket_id = 'project-media'),
+  1,
+  'creator can read their project media'
+);
 
 select set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000002', true);
 select is((select count(*)::integer from public.commits), 1, 'unrelated reader can read summaries');
@@ -69,6 +83,16 @@ select throws_ok(
     values ('00000000-0000-0000-0000-000000000001', 'stolen', 'Stolen', 'x', 'x', 'https://x.test', 'x/y')$$,
   'new row violates row-level security policy for table "projects"',
   'reader cannot create projects for creator'
+);
+select throws_ok(
+  $$insert into storage.objects (bucket_id, name, owner_id)
+    values (
+      'project-media',
+      '00000000-0000-0000-0000-000000000002/10000000-0000-0000-0000-000000000001/stolen.png',
+      '00000000-0000-0000-0000-000000000002'
+    )$$,
+  'new row violates row-level security policy for table "objects"',
+  'reader cannot upload media for another creator project'
 );
 select is((select count(*)::integer from public.changes), 0, 'reader cannot see creator changes');
 
