@@ -172,7 +172,12 @@ Entries are in chronological order.
 ```jsonc
 {
   "provider": "Claude Code",      // string
-  "model": "claude-opus-4-8"      // string or null
+  "model": "claude-opus-4-8",     // string or null
+  "tokens": {                     // object (optional)
+    "input": 12345,
+    "output": 4096,
+    "cache_read": 8000
+  }
 }
 ```
 
@@ -180,10 +185,13 @@ Entries are in chronological order.
 |------------|-----------|---------|
 | `provider` | string | Friendly name of the coding agent that produced the session, such as `"Claude Code"`, `"Codex"`, `"OpenCode"`, `"Kimi CLI"`, `"Pi"`, `"Oh My Pi"`, `"Amp"`, `"Crush"`, `"Antigravity"`, `"VS Code Copilot"`, or `"Gemini"` (other values are possible). This is the *agent/tool*, not the underlying LLM vendor. |
 | `model`    | string \| null | The raw model identifier reported by the session (e.g. `"claude-opus-4-8"`, a GPT id, a Gemini id), or `null` if unknown. This is a literal id, not a marketing name. |
+| `tokens`   | object | The exact token usage attributed to this `(provider, model)` pair for the commit. See "TokenCount". Optional for compatibility with older files. |
 
 `agents` lists the **distinct** `(provider, model)` pairs seen across the
 commit's conversation, in first-seen order. A single commit can list more than
-one — for example if a subagent ran on a different model.
+one — for example if a subagent ran on a different model. When every agent has
+`tokens`, those per-agent counts sum to `summary.tokens` and let consumers price
+each model's usage at its own rate.
 
 ## TokenCount (a `tokens` object)
 
@@ -203,10 +211,13 @@ one — for example if a subagent ran on a different model.
 | `cache_read`   | integer (unsigned) | Tokens read from the prompt cache. **Absent** when the agent didn't report it. |
 | `cache_create` | integer (unsigned) | Tokens written to the prompt cache. **Absent** when the agent didn't report it. |
 
-The same shape is used in two places, with different guarantees:
+The same shape is used in three places, with different guarantees:
 
 - **On a `CommitSummary` (`summary.tokens`)** it is the **exact** total for the
   whole conversation that led to the commit — the sum of every turn's usage.
+- **On an `Agent` (`agent.tokens`)** it is the exact subtotal attributed to that
+  `(provider, model)` pair for the commit. Complete per-agent subtotals sum to
+  `summary.tokens`; older files may omit them.
 - **On a `Message` (`message.tokens`)** it is an attribution of turn-level usage,
   not a tokenization of that individual entry. The producer normally places a
   turn's usage on the assistant entry the turn produced, but can fall back to

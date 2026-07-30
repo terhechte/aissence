@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { json } from '@sveltejs/kit';
 import { parseAissence, AissenceValidationError } from '$lib/aissence/schema';
 import { requireProjectOwner } from '$lib/server/auth';
+import { fetchOpenRouterCatalog, priceSnapshot } from '$lib/server/openrouter-pricing';
 
 export const POST = async (event) => {
   const claims = await requireProjectOwner(event, event.params.id);
@@ -19,6 +20,36 @@ export const POST = async (event) => {
     const raw = await blob.text();
     const parsed = parseAissence(raw);
     const checksum = createHash('sha256').update(raw).digest('hex');
+    const pricedSnapshot = priceSnapshot(parsed.snapshot, await fetchOpenRouterCatalog());
+    const unpricedCommits = pricedSnapshot.commits.filter(
+      (commit) =>
+        commit.summary.tokens &&
+        commit.pricing.potential_cost_usd === null
+    ).length;
+    const fallbackPricedCommits = pricedSnapshot.commits.filter(
+      (commit) =>
+        commit.summary.tokens &&
+        ['highest_rate_fallback', 'per_agent_with_fallback'].includes(
+          commit.pricing.pricing_method
+        )
+    ).length;
+    const warnings = [
+      ...parsed.warnings,
+      ...(unpricedCommits
+        ? [
+            `OpenRouter pricing could not be matched for ${unpricedCommits} ${
+              unpricedCommits === 1 ? 'commit' : 'commits'
+            }.`
+          ]
+        : []),
+      ...(fallbackPricedCommits
+        ? [
+            `${fallbackPricedCommits} ${
+              fallbackPricedCommits === 1 ? 'commit includes' : 'commits include'
+            } conservative pricing where complete OpenRouter model rates or per-model token usage were unavailable.`
+          ]
+        : [])
+    ];
 
     const { data: importRow, error: importError } = await event.locals.supabase!
       .from('imports')
@@ -28,7 +59,7 @@ export const POST = async (event) => {
         checksum,
         source_version: parsed.file.version,
         status: 'processing',
-        warnings: parsed.warnings
+        warnings
       })
       .select('id')
       .single();
@@ -41,7 +72,7 @@ export const POST = async (event) => {
         p_import_id: importRow.id,
         p_checksum: checksum,
         p_source_version: parsed.file.version,
-        p_snapshot: parsed.snapshot
+        p_snapshot: pricedSnapshot
       }
     );
     if (rpcError) throw new Error(rpcError.message);
@@ -51,7 +82,7 @@ export const POST = async (event) => {
       ok: true,
       noop: Boolean(result.noop),
       commitCount: parsed.snapshot.commits.length,
-      warnings: parsed.warnings
+      warnings
     });
   } catch (error) {
     if (error instanceof AissenceValidationError) {

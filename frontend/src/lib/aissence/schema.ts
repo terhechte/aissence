@@ -32,7 +32,8 @@ export const changeSchema = z
 export const agentSchema = z
   .object({
     provider: z.string().min(1),
-    model: z.string().nullable()
+    model: z.string().nullable(),
+    tokens: tokenCountSchema.optional()
   })
   .strip();
 

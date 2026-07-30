@@ -26,7 +26,13 @@ function validFile(overrides: Record<string, unknown> = {}) {
               timestamp: '2026-06-20T09:14:02Z'
             }
           ],
-          agents: [{ provider: 'Codex', model: 'gpt-test' }],
+          agents: [
+            {
+              provider: 'Codex',
+              model: 'gpt-test',
+              tokens: { input: 100, output: 20, cache_read: 80 }
+            }
+          ],
           meta: 'Retry support.',
           tokens: { input: 100, output: 20 }
         }
@@ -44,6 +50,11 @@ describe('parseAissence', () => {
     expect(result.snapshot.commits).toHaveLength(1);
     expect(result.snapshot.commits[0].hash).toBe(hash);
     expect(result.snapshot.commits[0].summary.messages[0].content).toBe('Please add retries.');
+    expect(result.snapshot.commits[0].summary.agents[0].tokens).toEqual({
+      input: 100,
+      output: 20,
+      cache_read: 80
+    });
   });
 
   it('accepts legacy v1 entries and emits warnings', () => {
@@ -87,6 +98,14 @@ describe('parseAissence', () => {
         ...validFile(),
         commits: { [hash]: { ...validFile().commits[hash], date: 'last Thursday' } }
       }
+    ],
+    [
+      'negative per-agent tokens',
+      (() => {
+        const input = validFile();
+        (input.commits[hash] as any).summary.agents[0].tokens.input = -1;
+        return input;
+      })()
     ]
   ])('rejects %s', (_name, input) => {
     expect(() => parseAissence(JSON.stringify(input))).toThrow(AissenceValidationError);

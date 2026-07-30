@@ -1,4 +1,6 @@
 <script lang="ts">
+  import PromptMarkdown from '$lib/components/PromptMarkdown.svelte';
+  import { groupTranscript } from '$lib/ledger';
   import { formatCount, formatDate } from '$lib/utils';
 
   let {
@@ -6,14 +8,12 @@
     project,
     commits,
     screenshots,
-    isOwner = false,
     isEntitled = false
   } = $props<{
     profile: any;
     project: any;
     commits: any[];
     screenshots: any[];
-    isOwner?: boolean;
     isEntitled?: boolean;
   }>();
 
@@ -27,6 +27,13 @@
       commits.reduce((total: number, commit: any) => total + Number(commit[key] ?? 0), 0);
     const tokenInput = sum('token_input');
     const tokenOutput = sum('token_output');
+    const inputCost = sum('input_cost_usd');
+    const outputCost = sum('output_cost_usd');
+    const potentialCost = sum('potential_cost_usd');
+    const pricedCommits = commits.filter((commit: any) => commit.potential_cost_usd !== null).length;
+    const unpricedCommits = commits.filter(
+      (commit: any) => commit.token_input !== null && commit.potential_cost_usd === null
+    ).length;
     const agentNames = new Set(
       commits.flatMap((commit: any) => commit.commit_agents.map((agent: any) => agent.provider))
     );
@@ -38,6 +45,11 @@
     return {
       tokenInput,
       tokenOutput,
+      inputCost,
+      outputCost,
+      potentialCost,
+      pricedCommits,
+      unpricedCommits,
       linesAdded: sum('lines_added'),
       linesDeleted: sum('lines_deleted'),
       files: sum('files_changed'),
@@ -81,6 +93,31 @@
 
   function kindLabel(kind: string) {
     return kind === 'UserWrote' ? 'asked' : kind === 'AiWrote' ? 'replied' : 'changed';
+  }
+
+  function promptCount(commit: any) {
+    return commit.messages.filter((message: any) => message.kind === 'UserWrote').length;
+  }
+
+  function activityText(replyCount: number, changedFileCount: number) {
+    return `The agent replied ${replyCount} ${replyCount === 1 ? 'time' : 'times'} and changed ${changedFileCount} ${changedFileCount === 1 ? 'file' : 'files'}.`;
+  }
+
+  function formatUsd(value: number | string | null | undefined) {
+    if (value === null || value === undefined || !Number.isFinite(Number(value))) return 'Unavailable';
+    const amount = Number(value);
+    if (amount > 0 && amount < 0.01) return '<$0.01';
+    return new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency: 'USD',
+      minimumFractionDigits: 2,
+      maximumFractionDigits: amount < 1 ? 4 : 2
+    }).format(amount);
+  }
+
+  function totalCostLabel() {
+    if (!totals.pricedCommits) return 'Unavailable';
+    return `${formatUsd(totals.potentialCost)}${totals.unpricedCommits ? '+' : ''}`;
   }
 
   function toggleCommit(id: string) {
@@ -157,14 +194,18 @@
     <aside>
       <p class="label">The whole account</p>
       <dl>
-        <div><dt>Commits from a conversation</dt><dd>{commits.length}</dd></div>
-        <div><dt>Days represented</dt><dd>{totals.span ?? 'unknown'}</dd></div>
-        <div><dt>Tokens read by models</dt><dd>{formatCount(totals.tokenInput)}</dd></div>
-        <div><dt>Tokens written back</dt><dd>{formatCount(totals.tokenOutput)}</dd></div>
-        <div><dt>Lines added / removed</dt><dd>+{formatCount(totals.linesAdded)} / −{formatCount(totals.linesDeleted)}</dd></div>
-        <div><dt>Agents at the keyboard</dt><dd>{totals.agents.size}</dd></div>
+        <div><dt>Tokens read by model</dt><dd><strong>{formatCount(totals.tokenInput)}</strong><small>{totals.pricedCommits ? formatUsd(totals.inputCost) : 'Cost unavailable'}</small></dd></div>
+        <div><dt>Tokens written back</dt><dd><strong>{formatCount(totals.tokenOutput)}</strong><small>{totals.pricedCommits ? formatUsd(totals.outputCost) : 'Cost unavailable'}</small></dd></div>
+        <div><dt>Potential API costs</dt><dd><strong>{totalCostLabel()}</strong><small>USD estimate</small></dd></div>
+        <div><dt>Commits from a conversation</dt><dd><strong>{commits.length}</strong></dd></div>
+        <div><dt>Days represented</dt><dd><strong>{totals.span ?? 'unknown'}</strong></dd></div>
+        <div><dt>Lines added / removed</dt><dd><strong>+{formatCount(totals.linesAdded)} / −{formatCount(totals.linesDeleted)}</strong></dd></div>
+        <div><dt>Agents at the keyboard</dt><dd><strong>{totals.agents.size}</strong></dd></div>
       </dl>
-      <p class="account-note">{[...totals.agents].join(', ') || 'Agent provenance unavailable'}.</p>
+      <p class="account-note">
+        {[...totals.agents].join(', ') || 'Agent provenance unavailable'}.
+        {#if totals.unpricedCommits} Cost totals exclude {totals.unpricedCommits} unpriced {totals.unpricedCommits === 1 ? 'commit' : 'commits'}.{/if}
+      </p>
     </aside>
   </section>
 
@@ -182,9 +223,13 @@
           <button class="commit-row" onclick={() => toggleCommit(commit.id)} aria-expanded={openCommit === commit.id}>
             <div><time>{formatDate(commit.committed_at, { month: 'short', day: 'numeric', year: undefined })}</time><small>{String(index + 1).padStart(2, '0')}</small></div>
             <div><h3>{commit.title || `Commit ${commit.commit_hash.slice(0, 10)}`}</h3><p>{commit.user_requested}</p><span>{commit.commit_agents.map((agent: any) => `${agent.provider}${agent.model ? ` · ${agent.model}` : ''}`).join(' / ') || 'Agent unknown'}</span></div>
-            <div class="token-cell"><strong>{formatCount(commit.token_input)} in</strong><strong>{formatCount(commit.token_output)} out</strong><small>tokens in / out</small></div>
+            <div class="token-cell">
+              <strong>{formatCount(commit.token_input)} in <em>{formatUsd(commit.input_cost_usd)}</em></strong>
+              <strong>{formatCount(commit.token_output)} out <em>{formatUsd(commit.output_cost_usd)}</em></strong>
+              <small>{formatUsd(commit.potential_cost_usd)} potential</small>
+            </div>
             <div class="line-cell">
-              {#if commit.lines_added !== null}<span>+{commit.lines_added}</span><span>−{commit.lines_deleted}</span><small>{commit.files_changed} files</small>{:else}<small>stats unavailable</small>{/if}
+              {#if commit.lines_added !== null}<span>+{commit.lines_added}</span><span>−{commit.lines_deleted}</span><small>{commit.files_changed} files · {promptCount(commit)} prompts</small>{:else}<small>{promptCount(commit)} prompts · stats unavailable</small>{/if}
             </div>
             <b>{openCommit === commit.id ? '↑' : '↓'}</b>
           </button>
@@ -193,27 +238,28 @@
             <div class="commit-detail">
               <div class="commit-meta"><span>{formatDate(commit.committed_at)}</span><span>{commit.commit_hash.slice(0, 10)}</span></div>
               <div>
-                {#if commit.meta}<p class="meta">{commit.meta}</p>{/if}
                 <div class="summary-grid">
-                  <div><span>Asked</span><p>{commit.user_requested || 'No request summary available.'}</p></div>
                   <div><span>Decided</span><p>{commit.ai_answered || 'No response summary available.'}</p></div>
                   <div><span>Built</span><p>{commit.ai_implemented || 'No implementation summary available.'}</p></div>
                 </div>
 
                 {#if commit.messages.length}
                   <div class="transcript">
-                    <h4>Transcript, abridged</h4>
-                    {#each commit.messages as message}
-                      <div class="message">
-                        <span class:ai={message.kind === 'AiWrote'}>{kindLabel(message.kind)}</span>
-                        <time>{messageTime(message)}</time>
-                        <div>
-                          <p>{message.summary}</p>
-                          {#if message.kind === 'UserWrote'}
+                    <h4>{isEntitled ? 'Transcript' : 'Transcript, abridged'}</h4>
+                    {#each groupTranscript(commit.messages) as turn}
+                      {#if turn.asked}
+                        <div class="message asked-message">
+                          <span>asked</span>
+                          <time>{messageTime(turn.asked)}</time>
+                          <div>
+                            <p>{turn.asked.summary}</p>
                             {#if isEntitled}
-                              {@const content = sourceContent(message)}
+                              {@const content = sourceContent(turn.asked)}
                               {#if content}
-                                <details class="full-prompt"><summary>Read full prompt</summary><pre>{content}</pre></details>
+                                <details class="full-prompt">
+                                  <summary>Read full prompt</summary>
+                                  <PromptMarkdown content={content} />
+                                </details>
                               {:else}
                                 <p class="source-unavailable">Full prompt unavailable in this source file.</p>
                               {/if}
@@ -223,27 +269,44 @@
                                 <a href={`/creators/${profile.handle}/subscribe`}>Unlock prompts →</a>
                               </div>
                             {/if}
-                          {:else if isOwner && message.kind === 'AiWrote' && sourceContent(message)}
-                            <details class="owner-source"><summary>Creator archive: assistant source</summary><pre>{sourceContent(message)}</pre></details>
-                          {/if}
-                          {#if isOwner && message.changes?.length}
-                            <details class="owner-source">
-                              <summary>Creator archive: {message.changes.length} recorded changes</summary>
-                              {#each message.changes as change}
-                                <h5>{change.tool} · {change.file_path}</h5>
-                                <pre>{change.diff}</pre>
-                              {/each}
-                            </details>
-                          {/if}
+                          </div>
                         </div>
-                      </div>
+                      {/if}
+
+                      {#if isEntitled}
+                        {#if turn.activity.length}
+                          <details class="agent-activity">
+                            <summary>
+                              <span>{activityText(turn.replyCount, turn.changedFileCount)}</span>
+                              <b>Show replied / changed</b>
+                            </summary>
+                            <div class="activity-rows">
+                              {#each turn.activity as message}
+                                <div class="message">
+                                  <span class:ai={message.kind === 'AiWrote'}>{kindLabel(message.kind)}</span>
+                                  <time>{messageTime(message)}</time>
+                                  <div><p>{message.summary}</p></div>
+                                </div>
+                              {/each}
+                            </div>
+                          </details>
+                        {/if}
+                      {:else if turn.asked}
+                        <div class="message activity-summary">
+                          <span>agent</span>
+                          <time></time>
+                          <div><p>{activityText(turn.replyCount, turn.changedFileCount)}</p></div>
+                        </div>
+                      {/if}
                     {/each}
                   </div>
                 {/if}
 
                 <div class="facts">
-                  <div><span>tokens in</span><strong>{formatCount(commit.token_input)}</strong></div>
-                  <div><span>tokens out</span><strong>{formatCount(commit.token_output)}</strong></div>
+                  <div><span>tokens in</span><strong>{formatCount(commit.token_input)} · {formatUsd(commit.input_cost_usd)}</strong></div>
+                  <div><span>tokens out</span><strong>{formatCount(commit.token_output)} · {formatUsd(commit.output_cost_usd)}</strong></div>
+                  <div><span>potential API cost</span><strong>{formatUsd(commit.potential_cost_usd)}</strong></div>
+                  <div><span>prompts written</span><strong>{promptCount(commit)}</strong></div>
                   <div><span>lines</span><strong>{commit.lines_added === null ? 'unknown' : `+${commit.lines_added} / −${commit.lines_deleted}`}</strong></div>
                   <div><span>files changed</span><strong>{commit.files_changed ?? 'unknown'}</strong></div>
                 </div>
@@ -474,8 +537,20 @@
     color: var(--soft);
   }
   .account dd {
+    display: grid;
+    justify-items: end;
+    gap: 4px;
     margin: 0;
+    text-align: right;
+  }
+  .account dd strong {
     font: 500 13px/1 'JetBrains Mono', monospace;
+  }
+  .account dd small {
+    color: var(--faint);
+    font: 400 8px/1.2 'JetBrains Mono', monospace;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
   }
   .account .account-note {
     margin-top: 15px;
@@ -530,7 +605,7 @@
   }
   .commit-row {
     display: grid;
-    grid-template-columns: 74px minmax(0, 1fr) 128px 88px 22px;
+    grid-template-columns: 74px minmax(0, 1fr) 158px 108px 22px;
     gap: 22px;
     width: 100%;
     align-items: baseline;
@@ -567,11 +642,23 @@
     font: 400 22px/1.25 'Instrument Serif', Georgia, serif;
   }
   .commit-row > div:nth-child(2) p {
+    display: -webkit-box;
+    overflow: hidden;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
     max-width: 48em;
     margin: 4px 0 8px;
     color: var(--soft);
     font-size: 14px;
     line-height: 1.45;
+  }
+  article.open .commit-row > div:nth-child(2) p {
+    display: block;
+    overflow: visible;
+    max-width: 54em;
+    font-size: 16px;
+    line-height: 1.55;
   }
   .commit-row > div:nth-child(2) span {
     color: var(--accent);
@@ -587,6 +674,17 @@
   .line-cell span {
     font-size: 10px;
     font-weight: 500;
+  }
+  .token-cell strong {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .token-cell em {
+    color: var(--faint);
+    font-size: 8px;
+    font-style: normal;
+    font-weight: 400;
   }
   .token-cell strong:nth-child(2) {
     color: var(--accent);
@@ -612,15 +710,9 @@
     color: var(--muted);
     font: 400 9px/1.4 'JetBrains Mono', monospace;
   }
-  .meta {
-    max-width: 38em;
-    margin: 0 0 30px;
-    color: var(--body3);
-    font: italic 300 20px/1.5 Newsreader, serif;
-  }
   .summary-grid {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: repeat(2, 1fr);
     gap: 28px;
     padding-top: 20px;
     border-top: 1px solid var(--rule2);
@@ -670,31 +762,20 @@
     line-height: 1.5;
   }
   .full-prompt,
-  .owner-source,
   .locked,
   .source-unavailable {
     margin-top: 10px;
   }
-  .full-prompt summary,
-  .owner-source summary {
+  .full-prompt summary {
     color: var(--accent);
     cursor: pointer;
     font: 500 10px/1.4 'JetBrains Mono', monospace;
   }
-  pre {
-    max-width: 100%;
-    overflow: auto;
-    padding: 15px;
-    white-space: pre-wrap;
-    word-break: break-word;
-    background: var(--paper);
+  .full-prompt :global(.prompt-markdown) {
+    margin-top: 12px;
+    padding: 18px 20px;
     border: 1px solid var(--rule2);
-    color: var(--body3);
-    font: 400 11px/1.55 'JetBrains Mono', monospace;
-  }
-  .owner-source h5 {
-    margin-bottom: 8px;
-    font: 500 10px/1.3 'JetBrains Mono', monospace;
+    background: var(--paper);
   }
   .locked {
     display: flex;
@@ -712,6 +793,50 @@
   }
   .source-unavailable {
     color: var(--muted) !important;
+    font-style: italic;
+  }
+  .agent-activity {
+    margin: 3px 0 13px 130px;
+    border: 1px solid var(--rule2);
+    background: var(--paper);
+  }
+  .agent-activity > summary {
+    display: flex;
+    justify-content: space-between;
+    gap: 20px;
+    padding: 11px 13px;
+    color: var(--soft);
+    cursor: pointer;
+    font: 400 10px/1.4 'JetBrains Mono', monospace;
+    list-style: none;
+  }
+  .agent-activity > summary::-webkit-details-marker {
+    display: none;
+  }
+  .agent-activity > summary b {
+    flex: none;
+    color: var(--accent);
+    font-size: 9px;
+    font-weight: 500;
+    text-transform: uppercase;
+  }
+  .agent-activity[open] > summary {
+    border-bottom: 1px solid var(--rule2);
+  }
+  .activity-rows {
+    padding: 4px 12px 8px;
+  }
+  .activity-summary {
+    margin-left: 130px;
+    border-left: 2px solid var(--rule2);
+    padding: 10px 12px;
+    color: var(--muted);
+  }
+  .activity-summary > span {
+    color: var(--faint);
+  }
+  .activity-summary p {
+    color: var(--muted);
     font-style: italic;
   }
   .facts {
@@ -799,6 +924,10 @@
     }
     .message > time {
       display: none;
+    }
+    .agent-activity,
+    .activity-summary {
+      margin-left: 0;
     }
     footer {
       align-items: flex-start;

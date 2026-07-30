@@ -1,4 +1,9 @@
 import { error } from '@sveltejs/kit';
+import { groupTranscript } from '$lib/ledger';
+import {
+  estimatePotentialCost,
+  fetchOpenRouterCatalog
+} from '$lib/server/openrouter-pricing';
 import type { PageServerLoad } from './$types';
 
 export const load: PageServerLoad = async ({ locals, params, setHeaders }) => {
@@ -61,6 +66,66 @@ export const load: PageServerLoad = async ({ locals, params, setHeaders }) => {
         .createSignedUrls(screenshots.map((shot) => shot.storage_path), 60 * 60)
     : { data: [] };
 
+  const normalizedCommits = (commits ?? []).map((commit) => ({
+    ...commit,
+    commit_agents: [...(commit.commit_agents ?? [])].sort((a, b) => a.sort_order - b.sort_order),
+    messages: [...(commit.messages ?? [])]
+      .sort((a, b) => a.sort_order - b.sort_order)
+      .map((message) => ({
+        ...message,
+        changes: [...(message.changes ?? [])].sort((a, b) => a.sort_order - b.sort_order)
+      }))
+  }));
+  const catalog = normalizedCommits.some(
+    (commit) => commit.token_input !== null && commit.potential_cost_usd === null
+  )
+    ? await fetchOpenRouterCatalog()
+    : [];
+  const pricedCommits = normalizedCommits.map((commit) => {
+    if (commit.potential_cost_usd !== null || commit.token_input === null) return commit;
+    const pricing = estimatePotentialCost(
+      {
+        input: Number(commit.token_input ?? 0),
+        output: Number(commit.token_output ?? 0),
+        ...(commit.token_cache_read === null
+          ? {}
+          : { cache_read: Number(commit.token_cache_read) }),
+        ...(commit.token_cache_create === null
+          ? {}
+          : { cache_create: Number(commit.token_cache_create) })
+      },
+      commit.commit_agents.map((agent: any) => ({
+        provider: agent.provider,
+        model: agent.model
+      })),
+      catalog
+    );
+    return {
+      ...commit,
+      input_cost_usd: pricing.input_cost_usd,
+      output_cost_usd: pricing.output_cost_usd,
+      potential_cost_usd: pricing.potential_cost_usd,
+      pricing_model_ids: pricing.model_ids,
+      pricing_calculated_at: pricing.priced_at
+    };
+  });
+  const visibleCommits = isEntitled
+    ? pricedCommits
+    : pricedCommits.map((commit) => ({
+        ...commit,
+        messages: groupTranscript(commit.messages).flatMap((turn) =>
+          turn.asked
+            ? [
+                {
+                  ...turn.asked,
+                  following_reply_count: turn.replyCount,
+                  following_changed_file_count: turn.changedFileCount
+                }
+              ]
+            : []
+        )
+      }));
+
   return {
     profile,
     project,
@@ -70,15 +135,6 @@ export const load: PageServerLoad = async ({ locals, params, setHeaders }) => {
       ...shot,
       url: signed.data?.[index]?.signedUrl ?? ''
     })),
-    commits: (commits ?? []).map((commit) => ({
-      ...commit,
-      commit_agents: [...(commit.commit_agents ?? [])].sort((a, b) => a.sort_order - b.sort_order),
-      messages: [...(commit.messages ?? [])]
-        .sort((a, b) => a.sort_order - b.sort_order)
-        .map((message) => ({
-          ...message,
-          changes: [...(message.changes ?? [])].sort((a, b) => a.sort_order - b.sort_order)
-        }))
-    }))
+    commits: visibleCommits
   };
 };

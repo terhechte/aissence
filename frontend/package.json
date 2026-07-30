@@ -21,6 +21,7 @@
   "dependencies": {
     "@supabase/ssr": "0.12.4",
     "@supabase/supabase-js": "2.111.0",
+    "micromark": "^4.0.2",
     "zod": "4.4.3"
   },
   "devDependencies": {
