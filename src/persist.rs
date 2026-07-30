@@ -274,6 +274,7 @@ mod tests {
                 lines_added: 21,
                 lines_deleted: 4,
             },
+            files: vec![],
         }
     }
 

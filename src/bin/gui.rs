@@ -223,14 +223,14 @@ impl AissenceApp {
                 if !summarize::has_required_user_summaries(group, &summary) {
                     continue;
                 }
-                if self.meta_summaries_enabled
-                    && !summarize::has_required_commit_overview(group, &summary)
-                {
+                let core_backfill = summarize::attach_core_fallbacks(group, &mut summary);
+                if !summarize::has_required_core_summaries(group, &summary) {
                     continue;
                 }
-                let overview_cleared =
-                    !self.meta_summaries_enabled && summarize::clear_commit_overview(&mut summary);
-                if token_backfill || content_backfill || overview_cleared {
+                if self.meta_summaries_enabled && !summarize::has_required_meta_summary(&summary) {
+                    continue;
+                }
+                if token_backfill || content_backfill || core_backfill {
                     backfills.push((commit_id, signature, summary.clone()));
                 }
                 group.summary = Some(summary);

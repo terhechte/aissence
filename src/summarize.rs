@@ -2,9 +2,10 @@
 //! [OpenRouter](https://openrouter.ai/).
 //!
 //! For each [`CommitGroup`] we summarize every user entry and retain assistant
-//! entries locally. An optional commit-level pipeline adds *user requested*,
-//! *ai answered*, *ai implemented*, and one cohesive `meta` overview when
-//! explicitly enabled.
+//! entries locally. The user-entry summaries are combined locally into *user
+//! requested*. One additional, strictly bounded request derives *ai answered*
+//! and *ai implemented* from terminal assistant text and an authoritative git
+//! fingerprint. A longer cohesive `meta` overview remains optional.
 //!
 //! The three categories are derived from the chat itself:
 //! - **user**: [`ncs::Role::User`] message text,
@@ -29,6 +30,7 @@ use openrouter_rs::OpenRouterClient;
 use openrouter_rs::api::chat::{ChatCompletionRequest, Message};
 use openrouter_rs::error::OpenRouterError;
 use openrouter_rs::types::{ProviderPreferences, Role as OrRole};
+use serde::Deserialize;
 use tokio::sync::Semaphore;
 
 use crate::error::Error;
@@ -56,6 +58,18 @@ pub const MAX_CONCURRENT_REQUESTS: usize = 24;
 const MAX_REQUEST_RETRIES: usize = 3;
 /// Initial grace period before retrying; subsequent waits double.
 const RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
+/// Maximum persisted aggregate of the already-small user prompt summaries.
+const USER_REQUESTED_CHARS: usize = 2_400;
+/// Maximum user-request evidence sent to the compact core-summary call.
+const CORE_USER_CHARS: usize = 1_600;
+/// Maximum assistant evidence sent to the compact core-summary call.
+const CORE_ASSISTANT_CHARS: usize = 3_600;
+/// Maximum commit/edit fingerprint sent to the compact core-summary call.
+const CORE_IMPLEMENTATION_CHARS: usize = 1_800;
+/// Hard ceiling for the complete user message of the core-summary call.
+const CORE_PROMPT_CHARS: usize = 8_000;
+/// Maximum changed paths included in a committed implementation fingerprint.
+const CORE_FILE_LIMIT: usize = 20;
 
 /// Actual billing reported by OpenRouter for one summarization operation.
 ///
@@ -155,21 +169,22 @@ impl Summarizer {
         self.provider.as_deref()
     }
 
-    /// Enable or disable the optional commit-level aggregate and `meta`
-    /// summaries. Disabled by default; per-user-entry summaries are unaffected.
+    /// Enable or disable the optional long `meta` overview. The three core
+    /// aggregate fields are generated regardless.
     pub fn with_meta_summaries(mut self, enabled: bool) -> Self {
         self.meta_summaries = enabled;
         self
     }
 
-    /// Whether the optional aggregate and `meta` pipeline is enabled.
+    /// Whether the optional long `meta` overview is enabled.
     pub fn meta_summaries_enabled(&self) -> bool {
         self.meta_summaries
     }
 
     /// Summarize every non-empty group in `history`, filling in
-    /// [`CommitGroup::summary`]. Commit groups use bounded concurrency, and the
-    /// three independent category summaries within each group run concurrently.
+    /// [`CommitGroup::summary`]. Commit groups use bounded concurrency; request
+    /// pressure across user-entry and compact core-summary calls is globally
+    /// limited.
     pub async fn summarize_history(&self, history: &mut CoalescedHistory) -> Result<(), Error> {
         let jobs = history
             .groups
@@ -223,31 +238,23 @@ impl Summarizer {
             .map(|c| c.summary.clone())
             .unwrap_or_else(|| "(uncommitted work in progress)".to_string());
 
-        let (entry_summaries, user_requested, ai_answered, ai_implemented, meta) =
-            if self.meta_summaries {
-                // User-entry summaries and the optional commit-level pipeline
-                // are independent. The shared semaphore bounds request pressure
-                // across every concurrently active group.
-                let (entries, aggregates) = futures::try_join!(
-                    self.summarize_user_entries(&items, costs),
-                    self.summarize_commit_overview(&items, &commit_context, costs),
-                )?;
-                (
-                    entries,
-                    aggregates.0,
-                    aggregates.1,
-                    aggregates.2,
-                    aggregates.3,
-                )
-            } else {
-                (
-                    self.summarize_user_entries(&items, costs).await?,
-                    String::new(),
-                    String::new(),
-                    String::new(),
-                    String::new(),
-                )
-            };
+        let entry_summaries = self.summarize_user_entries(&items, costs).await?;
+        let user_requested = aggregate_user_requests(&items, &entry_summaries);
+        let (ai_answered, ai_implemented) = self
+            .summarize_core_outcome(&items, group.commit.as_ref(), &user_requested, costs)
+            .await?;
+        let meta = if self.meta_summaries {
+            self.meta_summary(
+                &user_requested,
+                &ai_answered,
+                &ai_implemented,
+                &commit_context,
+                costs,
+            )
+            .await?
+        } else {
+            String::new()
+        };
 
         let messages: Vec<MessageSummary> = items
             .iter()
@@ -273,40 +280,57 @@ impl Summarizer {
         })
     }
 
-    /// Generate the optional three aggregate fields and their dependent `meta`
-    /// overview. This entire pipeline is disabled by default.
-    async fn summarize_commit_overview(
+    /// Generate both assistant-facing aggregate fields in one bounded request.
+    ///
+    /// The request never receives a full transcript or full diff. Assistant
+    /// evidence favors the terminal response, while implementation evidence is
+    /// an authoritative commit message/stat/path fingerprint. Pending work
+    /// falls back to tool and path names, still without diff bodies.
+    async fn summarize_core_outcome(
         &self,
         items: &[RawItem],
-        commit_context: &str,
+        commit: Option<&crate::model::CommitInfo>,
+        user_requested: &str,
         costs: &CostTracker,
-    ) -> Result<(String, String, String, String), Error> {
-        let by_kind = |kind: MessageKind| -> Vec<String> {
-            items
-                .iter()
-                .filter(|item| item.kind == kind)
-                .map(|item| item.text.clone())
-                .collect()
-        };
-        let user = by_kind(MessageKind::UserWrote);
-        let answered = by_kind(MessageKind::AiWrote);
-        let changed = by_kind(MessageKind::AiChanged);
+    ) -> Result<(String, String), Error> {
+        let input = core_summary_input(items, commit, user_requested);
+        if !input.has_answer && !input.has_implementation {
+            return Ok((String::new(), String::new()));
+        }
 
-        let (user_requested, ai_answered, ai_implemented) = futures::try_join!(
-            self.reduce_items(&user, Category::User, commit_context, costs),
-            self.reduce_items(&answered, Category::Response, commit_context, costs),
-            self.reduce_items(&changed, Category::Change, commit_context, costs),
-        )?;
-        let meta = self
-            .meta_summary(
-                &user_requested,
-                &ai_answered,
-                &ai_implemented,
-                commit_context,
+        let fallback = fallback_core_outcome(items, commit);
+        let text = self
+            .complete(
+                "You create two concise commit-level summaries from bounded evidence. \
+                 Return one JSON object with exactly the string fields \"ai_answered\" and \
+                 \"ai_implemented\". ai_answered states what the assistant concluded, \
+                 explained, validated, or warned about; ignore intentions and progress \
+                 updates. ai_implemented states only behavior actually supported by the \
+                 committed implementation fingerprint; never treat a plan as completed \
+                 work. Use 1-3 compact sentences per non-empty field. Use an empty string \
+                 only when that category has no evidence. Output JSON only.",
+                input.prompt,
+                350,
                 costs,
             )
             .await?;
-        Ok((user_requested, ai_answered, ai_implemented, meta))
+        let mut outcome = parse_core_outcome(&text).unwrap_or(fallback.clone());
+
+        if !input.has_answer {
+            outcome.ai_answered.clear();
+        } else if outcome.ai_answered.trim().is_empty() {
+            outcome.ai_answered = fallback.ai_answered;
+        }
+        if !input.has_implementation {
+            outcome.ai_implemented.clear();
+        } else if outcome.ai_implemented.trim().is_empty() {
+            outcome.ai_implemented = fallback.ai_implemented;
+        }
+
+        Ok((
+            outcome.ai_answered.trim().to_string(),
+            outcome.ai_implemented.trim().to_string(),
+        ))
     }
 
     /// Generate exactly one summary for every coalesced user entry. The full
@@ -376,36 +400,6 @@ impl Summarizer {
         self.complete(system, user, 1200, costs).await
     }
 
-    /// Condense all source entries of one category into one commit-level
-    /// summary. This is one model request regardless of entry count.
-    async fn reduce_items(
-        &self,
-        source_items: &[String],
-        category: Category,
-        commit_context: &str,
-        costs: &CostTracker,
-    ) -> Result<String, Error> {
-        let joined = source_items
-            .iter()
-            .filter(|s| !s.trim().is_empty())
-            .enumerate()
-            .map(|(i, s)| format!("{}. {}", i + 1, s.trim()))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        if joined.is_empty() {
-            return Ok(String::new());
-        }
-
-        self.complete(
-            category.reduce_system(),
-            category.reduce_user(&joined, commit_context),
-            500,
-            costs,
-        )
-        .await
-    }
-
     /// Issue one chat completion and return the assistant's text.
     async fn complete(
         &self,
@@ -451,9 +445,11 @@ impl Summarizer {
                     }
                     Err(error) => {
                         let attempts = retry + 1;
-                        let suffix = (attempts > 1)
-                            .then(|| format!(" after {attempts} attempts"))
-                            .unwrap_or_default();
+                        let suffix = if attempts > 1 {
+                            format!(" after {attempts} attempts")
+                        } else {
+                            String::new()
+                        };
                         return Err(Error::Llm(format!("{error}{suffix}")));
                     }
                 }
@@ -470,6 +466,274 @@ impl Summarizer {
             .to_string();
         Ok(text)
     }
+}
+
+struct CoreSummaryInput {
+    prompt: String,
+    has_answer: bool,
+    has_implementation: bool,
+}
+
+#[derive(Clone, Default, Deserialize)]
+struct CoreOutcome {
+    #[serde(default)]
+    ai_answered: String,
+    #[serde(default)]
+    ai_implemented: String,
+}
+
+/// Combine the summaries already generated for user entries without another
+/// model request. Keep both the beginning and end when a long multi-turn
+/// session exceeds the display budget, since later messages commonly refine
+/// the original request.
+fn aggregate_user_requests(items: &[RawItem], summaries: &[Option<String>]) -> String {
+    let joined = items
+        .iter()
+        .zip(summaries)
+        .filter_map(|(item, summary)| {
+            (item.kind == MessageKind::UserWrote)
+                .then_some(summary.as_deref())
+                .flatten()
+                .map(str::trim)
+                .filter(|summary| !summary.is_empty())
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    truncate_middle(&joined, USER_REQUESTED_CHARS)
+}
+
+fn core_summary_input(
+    items: &[RawItem],
+    commit: Option<&crate::model::CommitInfo>,
+    user_requested: &str,
+) -> CoreSummaryInput {
+    let assistant = assistant_evidence(items);
+    let implementation = implementation_fingerprint(items, commit);
+    let has_answer = items
+        .iter()
+        .any(|item| item.kind == MessageKind::AiWrote && !item.text.trim().is_empty());
+    let has_implementation = commit.is_some_and(|commit| commit.stats.files_changed > 0)
+        || items
+            .iter()
+            .any(|item| item.kind == MessageKind::AiChanged && !item.changes.is_empty());
+
+    let request = truncate_middle(user_requested, CORE_USER_CHARS);
+    let assistant = truncate_head(&assistant, CORE_ASSISTANT_CHARS);
+    let implementation = truncate_head(&implementation, CORE_IMPLEMENTATION_CHARS);
+    let prompt = format!(
+        "Already-summarized user requests:\n{}\n\n\
+         Bounded assistant evidence, newest conclusion first:\n{}\n\n\
+         Authoritative implementation fingerprint:\n{}\n\n\
+         Produce the two-field JSON object.",
+        nonempty_or_none(&request),
+        nonempty_or_none(&assistant),
+        nonempty_or_none(&implementation),
+    );
+    let prompt = truncate_head(&prompt, CORE_PROMPT_CHARS);
+
+    CoreSummaryInput {
+        prompt,
+        has_answer,
+        has_implementation,
+    }
+}
+
+/// Favor the final assistant block, which coding agents normally use to recap
+/// completed work. Add small tails of earlier blocks newest-first only while
+/// the fixed evidence budget has room.
+fn assistant_evidence(items: &[RawItem]) -> String {
+    let replies = items
+        .iter()
+        .filter(|item| item.kind == MessageKind::AiWrote)
+        .map(|item| item.text.trim())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>();
+    let Some(final_reply) = replies.last() else {
+        return String::new();
+    };
+
+    let mut out = format!(
+        "Most recent assistant text (tail):\n{}",
+        truncate_tail(final_reply, 2_900)
+    );
+    for reply in replies.iter().rev().skip(1) {
+        let remaining = CORE_ASSISTANT_CHARS.saturating_sub(out.chars().count());
+        if remaining <= 80 {
+            break;
+        }
+        let excerpt_chars = remaining.saturating_sub(38).min(420);
+        out.push_str("\n\nEarlier conclusion candidate:\n");
+        out.push_str(&truncate_tail(reply, excerpt_chars));
+    }
+    truncate_head(&out, CORE_ASSISTANT_CHARS)
+}
+
+/// Build compact implementation evidence without including code or diff
+/// bodies. Committed work uses git's tree diff; only uncommitted work falls
+/// back to recognized editing tools.
+fn implementation_fingerprint(
+    items: &[RawItem],
+    commit: Option<&crate::model::CommitInfo>,
+) -> String {
+    if let Some(commit) = commit {
+        if commit.stats.files_changed == 0 {
+            return String::new();
+        }
+
+        let mut out = format!("Commit: {}", commit.summary.trim());
+        if let Some(body) = commit
+            .body
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            out.push_str("\nCommit body: ");
+            out.push_str(&truncate_head(body, 500));
+        }
+        out.push_str(&format!(
+            "\nStats: {} files changed, +{} lines, -{} lines",
+            commit.stats.files_changed, commit.stats.lines_added, commit.stats.lines_deleted
+        ));
+        if !commit.files.is_empty() {
+            out.push_str("\nChanged paths:");
+            for file in commit.files.iter().take(CORE_FILE_LIMIT) {
+                out.push('\n');
+                out.push_str(file.status.label());
+                out.push(' ');
+                if let Some(previous) = &file.previous_path {
+                    out.push_str(previous);
+                    out.push_str(" -> ");
+                }
+                out.push_str(&file.path);
+            }
+            if commit.files.len() > CORE_FILE_LIMIT {
+                out.push_str(&format!(
+                    "\n… and {} more changed paths",
+                    commit.files.len() - CORE_FILE_LIMIT
+                ));
+            }
+        }
+        return truncate_head(&out, CORE_IMPLEMENTATION_CHARS);
+    }
+
+    let changes = items
+        .iter()
+        .filter(|item| item.kind == MessageKind::AiChanged)
+        .flat_map(|item| &item.changes)
+        .collect::<Vec<_>>();
+    if changes.is_empty() {
+        return String::new();
+    }
+
+    let mut out = format!("Uncommitted editing actions: {}", changes.len());
+    let mut seen = std::collections::HashSet::new();
+    for change in changes {
+        if change.file == "(unknown file)" || !seen.insert(change.file.as_str()) {
+            continue;
+        }
+        out.push('\n');
+        out.push_str(&change.tool);
+        out.push(' ');
+        out.push_str(&change.file);
+        if seen.len() == CORE_FILE_LIMIT {
+            break;
+        }
+    }
+    truncate_head(&out, CORE_IMPLEMENTATION_CHARS)
+}
+
+fn fallback_core_outcome(
+    items: &[RawItem],
+    commit: Option<&crate::model::CommitInfo>,
+) -> CoreOutcome {
+    let ai_answered = items
+        .iter()
+        .rev()
+        .find(|item| item.kind == MessageKind::AiWrote && !item.text.trim().is_empty())
+        .map(|item| normalize_whitespace(&truncate_tail(item.text.trim(), 900)))
+        .unwrap_or_default();
+
+    let ai_implemented = commit
+        .filter(|commit| commit.stats.files_changed > 0)
+        .map(|commit| {
+            format!(
+                "{} Changed {} files (+{}/-{} lines).",
+                commit.summary.trim(),
+                commit.stats.files_changed,
+                commit.stats.lines_added,
+                commit.stats.lines_deleted
+            )
+        })
+        .unwrap_or_else(|| {
+            let fingerprint = implementation_fingerprint(items, None);
+            normalize_whitespace(&truncate_head(&fingerprint, 900))
+        });
+
+    CoreOutcome {
+        ai_answered,
+        ai_implemented,
+    }
+}
+
+fn parse_core_outcome(text: &str) -> Option<CoreOutcome> {
+    let trimmed = text.trim();
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    (start <= end)
+        .then(|| &trimmed[start..=end])
+        .and_then(|json| serde_json::from_str(json).ok())
+}
+
+fn nonempty_or_none(text: &str) -> &str {
+    if text.trim().is_empty() {
+        "(none)"
+    } else {
+        text
+    }
+}
+
+fn normalize_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate_head(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    format!("{}…", text.chars().take(keep).collect::<String>())
+}
+
+fn truncate_tail(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let tail = text
+        .chars()
+        .skip(count.saturating_sub(keep))
+        .collect::<String>();
+    format!("…{tail}")
+}
+
+fn truncate_middle(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    if max_chars <= 1 {
+        return "…".chars().take(max_chars).collect();
+    }
+    let available = max_chars - 1;
+    let head_chars = available / 2;
+    let tail_chars = available - head_chars;
+    let head = text.chars().take(head_chars).collect::<String>();
+    let tail = text
+        .chars()
+        .skip(count.saturating_sub(tail_chars))
+        .collect::<String>();
+    format!("{head}…{tail}")
 }
 
 fn is_retryable_request_error(error: &OpenRouterError) -> bool {
@@ -623,6 +887,44 @@ pub fn attach_source_content(group: &CommitGroup, summary: &mut CommitSummary) -
     changed
 }
 
+/// Fill missing core aggregate fields on a cached summary without calling the
+/// model. Existing non-empty values are never replaced.
+///
+/// This gives older caches a useful migration path: user request summaries are
+/// combined locally, the terminal assistant response supplies an extractive
+/// answer fallback, and committed git facts supply the implementation fallback.
+pub fn attach_core_fallbacks(group: &CommitGroup, summary: &mut CommitSummary) -> bool {
+    let items = coalesce_consecutive(raw_items(group));
+    if !items_match_summary(&items, summary) {
+        return false;
+    }
+
+    let mut changed = false;
+    if summary.user_requested.trim().is_empty() {
+        let entry_summaries = summary
+            .messages
+            .iter()
+            .map(|message| message.summary.clone())
+            .collect::<Vec<_>>();
+        let aggregate = aggregate_user_requests(&items, &entry_summaries);
+        if !aggregate.is_empty() {
+            summary.user_requested = aggregate;
+            changed = true;
+        }
+    }
+
+    let fallback = fallback_core_outcome(&items, group.commit.as_ref());
+    if summary.ai_answered.trim().is_empty() && !fallback.ai_answered.is_empty() {
+        summary.ai_answered = fallback.ai_answered;
+        changed = true;
+    }
+    if summary.ai_implemented.trim().is_empty() && !fallback.ai_implemented.is_empty() {
+        summary.ai_implemented = fallback.ai_implemented;
+        changed = true;
+    }
+    changed
+}
+
 /// Whether a cached summary satisfies the current per-entry contract.
 ///
 /// Every coalesced user entry must have a non-empty summary. This deliberately
@@ -644,38 +946,33 @@ pub fn has_required_user_summaries(group: &CommitGroup, summary: &CommitSummary)
             })
 }
 
-/// Whether all source categories and their dependent `meta` overview are
-/// populated for the optional commit-level summary pipeline.
-pub fn has_required_commit_overview(group: &CommitGroup, summary: &CommitSummary) -> bool {
+/// Whether every source category needed by the UI has a core aggregate.
+pub fn has_required_core_summaries(group: &CommitGroup, summary: &CommitSummary) -> bool {
     let items = coalesce_consecutive(raw_items(group));
     let has_user = items.iter().any(|item| item.kind == MessageKind::UserWrote);
     let has_answer = items.iter().any(|item| item.kind == MessageKind::AiWrote);
-    let has_change = items.iter().any(|item| item.kind == MessageKind::AiChanged);
+    let has_implementation = group
+        .commit
+        .as_ref()
+        .is_some_and(|commit| commit.stats.files_changed > 0)
+        || items.iter().any(|item| item.kind == MessageKind::AiChanged);
     let present = |text: &str| !text.trim().is_empty();
 
     (!has_user || present(&summary.user_requested))
         && (!has_answer || present(&summary.ai_answered))
-        && (!has_change || present(&summary.ai_implemented))
-        && (!(has_user || has_answer || has_change) || present(&summary.meta))
+        && (!has_implementation || present(&summary.ai_implemented))
 }
 
-/// Clear the optional commit-level aggregate and `meta` fields.
-///
-/// Returns whether any value changed.
-pub fn clear_commit_overview(summary: &mut CommitSummary) -> bool {
-    let changed = [
+/// Whether an enabled optional `meta` overview is present.
+pub fn has_required_meta_summary(summary: &CommitSummary) -> bool {
+    let has_core = [
         &summary.user_requested,
         &summary.ai_answered,
         &summary.ai_implemented,
-        &summary.meta,
     ]
     .iter()
-    .any(|text| !text.is_empty());
-    summary.user_requested.clear();
-    summary.ai_answered.clear();
-    summary.ai_implemented.clear();
-    summary.meta.clear();
-    changed
+    .any(|text| !text.trim().is_empty());
+    !has_core || !summary.meta.trim().is_empty()
 }
 
 fn items_match_summary(items: &[RawItem], summary: &CommitSummary) -> bool {
@@ -825,54 +1122,6 @@ fn is_edit_tool(name: &str) -> bool {
     ];
     let lower = name.to_ascii_lowercase();
     EDIT_TOOLS.contains(&lower.as_str())
-}
-
-/// Distinguishes the three summary categories and their prompts.
-#[derive(Clone, Copy)]
-enum Category {
-    User,
-    Response,
-    Change,
-}
-
-impl Category {
-    /// System prompt for the commit-level aggregate step.
-    fn reduce_system(self) -> &'static str {
-        match self {
-            Category::User => {
-                "You write a concise 3-5 sentence summary of everything the user \
-                 requested during the work that led to a git commit, given \
-                 the complete ordered user messages. Write in past tense. Output only the \
-                 summary, no preamble."
-            }
-            Category::Response => {
-                "You write a concise 3-5 sentence summary of what the assistant \
-                 answered and explained during the work that led to a git commit, \
-                 given the complete ordered assistant replies. Preserve important \
-                 decisions, conclusions, caveats, and trade-offs. Write in past tense. \
-                 Output only the \
-                 summary, no preamble."
-            }
-            Category::Change => {
-                "You write a concise 3-5 sentence summary of what was implemented \
-                 in the code for a git commit, given the complete ordered editing \
-                 activity. Write in past tense, focusing on behavior and files touched. \
-                 Output only the summary, no preamble."
-            }
-        }
-    }
-
-    /// User prompt for the commit-level aggregate step.
-    fn reduce_user(self, joined: &str, commit_context: &str) -> String {
-        let heading = match self {
-            Category::User => "Complete ordered user messages",
-            Category::Response => "Complete ordered assistant replies",
-            Category::Change => "Complete ordered editing activity",
-        };
-        format!(
-            "Commit: {commit_context}\n\n{heading}:\n{joined}\n\nWrite the 3-5 sentence summary."
-        )
-    }
 }
 
 #[cfg(test)]
@@ -1042,6 +1291,64 @@ mod tests {
     }
 
     #[test]
+    fn cached_core_fallbacks_fill_only_missing_fields() {
+        let group = CommitGroup {
+            commit: Some(crate::model::CommitInfo {
+                id: "abc".into(),
+                short_id: "abc".into(),
+                summary: "Fix cached summaries".into(),
+                body: None,
+                message: "Fix cached summaries".into(),
+                author_name: "tester".into(),
+                author_email: "t@example.com".into(),
+                time: chrono::Utc::now(),
+                stats: crate::model::CommitStats {
+                    files_changed: 1,
+                    lines_added: 5,
+                    lines_deleted: 2,
+                },
+                files: vec![],
+            }),
+            messages: vec![
+                timed(ncs::Role::User, "please fix it", None),
+                timed(ncs::Role::Assistant, "Fixed it and ran tests.", None),
+            ],
+            summary: None,
+        };
+        let mut summary = CommitSummary {
+            messages: vec![
+                MessageSummary {
+                    kind: MessageKind::UserWrote,
+                    summary: Some("The user requested a fix.".into()),
+                    content: Some("please fix it".into()),
+                    changes: vec![],
+                    timestamp: None,
+                    tokens: None,
+                },
+                MessageSummary {
+                    kind: MessageKind::AiWrote,
+                    summary: None,
+                    content: Some("Fixed it and ran tests.".into()),
+                    changes: vec![],
+                    timestamp: None,
+                    tokens: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert!(attach_core_fallbacks(&group, &mut summary));
+        assert_eq!(summary.user_requested, "The user requested a fix.");
+        assert_eq!(summary.ai_answered, "Fixed it and ran tests.");
+        assert!(summary.ai_implemented.contains("Fix cached summaries"));
+        assert!(!attach_core_fallbacks(&group, &mut summary));
+
+        summary.ai_answered = "Keep this richer cached answer.".into();
+        assert!(!attach_core_fallbacks(&group, &mut summary));
+        assert_eq!(summary.ai_answered, "Keep this richer cached answer.");
+    }
+
+    #[test]
     fn understands_opencode_edit_payload_names() {
         let input = serde_json::json!({
             "filePath": "src/lib.rs",
@@ -1107,7 +1414,7 @@ mod tests {
     }
 
     #[test]
-    fn optional_commit_overview_can_be_validated_and_cleared() {
+    fn core_and_optional_meta_requirements_are_independent() {
         let group = CommitGroup {
             commit: None,
             messages: vec![
@@ -1116,7 +1423,7 @@ mod tests {
             ],
             summary: None,
         };
-        let mut summary = CommitSummary {
+        let summary = CommitSummary {
             user_requested: "Asked for a fix.".into(),
             ai_answered: "Confirmed the fix.".into(),
             ai_implemented: String::new(),
@@ -1124,13 +1431,124 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(has_required_commit_overview(&group, &summary));
-        assert!(clear_commit_overview(&mut summary));
-        assert_eq!(summary.user_requested, "");
-        assert_eq!(summary.ai_answered, "");
-        assert_eq!(summary.ai_implemented, "");
-        assert_eq!(summary.meta, "");
-        assert!(!clear_commit_overview(&mut summary));
-        assert!(!has_required_commit_overview(&group, &summary));
+        assert!(has_required_core_summaries(&group, &summary));
+        assert!(has_required_meta_summary(&summary));
+
+        let without_meta = CommitSummary {
+            meta: String::new(),
+            ..summary.clone()
+        };
+        assert!(has_required_core_summaries(&group, &without_meta));
+        assert!(!has_required_meta_summary(&without_meta));
+    }
+
+    #[test]
+    fn user_request_aggregate_is_local_bounded_and_keeps_both_ends() {
+        let items = vec![
+            item(MessageKind::UserWrote, "first"),
+            item(MessageKind::AiWrote, "reply"),
+            item(MessageKind::UserWrote, "last"),
+        ];
+        let summaries = vec![
+            Some(format!("FIRST {}", "a".repeat(2_000))),
+            None,
+            Some(format!("{} LAST", "b".repeat(2_000))),
+        ];
+
+        let aggregate = aggregate_user_requests(&items, &summaries);
+        assert!(aggregate.chars().count() <= USER_REQUESTED_CHARS);
+        assert!(aggregate.starts_with("FIRST"));
+        assert!(aggregate.ends_with("LAST"));
+    }
+
+    #[test]
+    fn compact_core_prompt_has_a_hard_bound_and_excludes_diff_bodies() {
+        let huge_reply = format!(
+            "old progress SECRET_MIDDLE {}\nFinal result: tests pass.",
+            "x".repeat(20_000)
+        );
+        let huge_diff = format!(
+            "--- a/src/lib.rs\n+++ b/src/lib.rs\n{}DO_NOT_SEND_DIFF_BODY",
+            "+code\n".repeat(20_000)
+        );
+        let mut changed = item(MessageKind::AiChanged, &huge_diff);
+        changed.changes.push(CodeChange {
+            tool: "apply_patch".into(),
+            file: "src/lib.rs".into(),
+            diff: huge_diff,
+        });
+        let items = vec![
+            item(MessageKind::UserWrote, "fix it"),
+            item(MessageKind::AiWrote, &huge_reply),
+            changed,
+        ];
+        let commit = crate::model::CommitInfo {
+            id: "abc".into(),
+            short_id: "abc".into(),
+            summary: "Fix compact summaries".into(),
+            body: Some("Use bounded evidence.".into()),
+            message: "Fix compact summaries\n\nUse bounded evidence.".into(),
+            author_name: "tester".into(),
+            author_email: "t@example.com".into(),
+            time: chrono::Utc::now(),
+            stats: crate::model::CommitStats {
+                files_changed: 1,
+                lines_added: 10,
+                lines_deleted: 3,
+            },
+            files: vec![crate::model::CommitFileChange {
+                status: crate::model::CommitFileStatus::Modified,
+                path: "src/lib.rs".into(),
+                previous_path: None,
+            }],
+        };
+
+        let input = core_summary_input(&items, Some(&commit), &"request ".repeat(2_000));
+        assert!(input.prompt.chars().count() <= CORE_PROMPT_CHARS);
+        assert!(input.prompt.contains("Final result: tests pass."));
+        assert!(input.prompt.contains("M src/lib.rs"));
+        assert!(!input.prompt.contains("DO_NOT_SEND_DIFF_BODY"));
+        assert!(!input.prompt.contains("SECRET_MIDDLE"));
+        assert!(input.has_answer);
+        assert!(input.has_implementation);
+    }
+
+    #[test]
+    fn parses_json_even_when_a_model_wraps_it_in_a_code_fence() {
+        let parsed = parse_core_outcome(
+            "```json\n{\"ai_answered\":\"Done.\",\"ai_implemented\":\"Changed it.\"}\n```",
+        )
+        .unwrap();
+        assert_eq!(parsed.ai_answered, "Done.");
+        assert_eq!(parsed.ai_implemented, "Changed it.");
+    }
+
+    #[test]
+    fn fallback_core_outcome_uses_terminal_answer_and_commit_facts() {
+        let items = vec![
+            item(MessageKind::AiWrote, "I will investigate."),
+            item(MessageKind::AiWrote, "Implemented the fix. All tests pass."),
+        ];
+        let commit = crate::model::CommitInfo {
+            id: "abc".into(),
+            short_id: "abc".into(),
+            summary: "Fix the bug".into(),
+            body: None,
+            message: "Fix the bug".into(),
+            author_name: "tester".into(),
+            author_email: "t@example.com".into(),
+            time: chrono::Utc::now(),
+            stats: crate::model::CommitStats {
+                files_changed: 2,
+                lines_added: 12,
+                lines_deleted: 4,
+            },
+            files: vec![],
+        };
+
+        let fallback = fallback_core_outcome(&items, Some(&commit));
+        assert_eq!(fallback.ai_answered, "Implemented the fix. All tests pass.");
+        assert!(fallback.ai_implemented.contains("Fix the bug"));
+        assert!(fallback.ai_implemented.contains("2 files"));
     }
 }

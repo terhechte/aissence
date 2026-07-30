@@ -103,9 +103,9 @@ the best-effort, tool-call-derived `Change.diff` strings.
 
 | Field            | JSON type | Meaning |
 |------------------|-----------|---------|
-| `user_requested` | string | Optional aggregate summary of what the user asked for. Empty by default; generated only with `--meta-summaries`. |
-| `ai_answered`    | string | Optional aggregate summary of what the assistant explained or concluded. Empty by default; generated only with `--meta-summaries`. |
-| `ai_implemented` | string | Optional aggregate summary of recognized file-editing activity. Empty by default; generated only with `--meta-summaries`. |
+| `user_requested` | string | Aggregate of the already-generated user prompt summaries, combined locally without another model request. |
+| `ai_answered`    | string | Compact summary of what the assistant explained or concluded, generated from bounded terminal-response evidence. |
+| `ai_implemented` | string | Compact summary of the committed implementation, generated from the commit message, statistics, and changed paths rather than full diff bodies. |
 | `meta`           | string | Optional cohesive overview synthesized from the three aggregate fields. Empty by default; generated only with `--meta-summaries`. It may be absent in older files. |
 | `messages`       | array  | A chronological breakdown of conversation entries. Every `UserWrote` entry has an LLM summary; assistant entries remain locally derived. Entries can be split or coalesced relative to source messages; see "Message". May be empty. |
 | `agents`         | array  | The coding agent(s) and model(s) that produced this commit's sessions ("provenance"), including exact per-agent/model token totals where reported. See "Agent". May be empty or absent. |
@@ -116,12 +116,20 @@ that kind (e.g. a commit whose conversation contained no code edits has an empty
 `ai_implemented`).
 
 By default, generation uses one model request for every `UserWrote` entry and
-leaves all four commit-level fields above as empty strings. `--meta-summaries`
-additionally enables one request for each non-empty aggregate category and one
-for `meta`. There is no cap on the number of user entries summarized, and each
-call receives the complete retained prompt. Batch generation processes up to
-eight commits concurrently; individual requests are globally limited to 24 in
-flight.
+one additional compact request per commit group to produce both `ai_answered`
+and `ai_implemented`. That compact request is capped at 8,000 characters: it
+uses the tail of the terminal assistant response, small tails of earlier
+assistant replies, and an authoritative git fingerprint containing the commit
+message, line statistics, and at most 20 changed paths. It never receives full
+diff bodies or a full assistant transcript. `--meta-summaries` adds only the
+dependent `meta` request.
+
+There is no cap on the number of user entries summarized, and each per-entry
+call receives the complete retained user prompt. Batch generation processes up
+to eight commits concurrently; individual requests are globally limited to 24
+in flight. Older cached core fields are preserved. Missing fields in an older
+cache can be backfilled locally from its prompt summaries, terminal assistant
+text, and commit facts without another model call.
 
 ## Message (an element of `messages`)
 
@@ -286,9 +294,9 @@ A consumer should know the file's boundaries:
         "lines_deleted": 7
       },
       "summary": {
-        "user_requested": "",
-        "ai_answered": "",
-        "ai_implemented": "",
+        "user_requested": "Requested a retry wrapper for the network client and a configurable timeout.",
+        "ai_answered": "The assistant selected exponential backoff and explained that the timeout would come from REQUEST_TIMEOUT with a default when unset.",
+        "ai_implemented": "Added retry handling to the network request path and replaced the hard-coded timeout with environment-based configuration across three changed files.",
         "messages": [
           {
             "kind": "UserWrote",
@@ -343,9 +351,9 @@ A consumer should know the file's boundaries:
         "lines_deleted": 1
       },
       "summary": {
-        "user_requested": "",
+        "user_requested": "Reported a typo in the README.",
         "ai_answered": "",
-        "ai_implemented": "",
+        "ai_implemented": "Corrected the reported spelling error in README.md.",
         "messages": [
           {
             "kind": "UserWrote",

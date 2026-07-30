@@ -6,7 +6,7 @@ use std::path::Path;
 use chrono::DateTime;
 
 use crate::error::Error;
-use crate::model::{CommitInfo, CommitStats};
+use crate::model::{CommitFileChange, CommitFileStatus, CommitInfo, CommitStats};
 
 /// Return every commit reachable from `HEAD` for the repository containing
 /// `folder`, sorted oldest-first by committer time.
@@ -92,7 +92,7 @@ fn to_commit_info(repo: &gix::Repository, commit: &gix::Commit<'_>) -> Result<Co
     let summary = message.summary().to_string();
     let body = message.body.map(|b| b.to_string());
     let full = commit.message_raw_sloppy().to_string();
-    let stats = commit_stats(repo, commit)?;
+    let (stats, files) = commit_diff_metadata(repo, commit)?;
 
     Ok(CommitInfo {
         id,
@@ -104,13 +104,16 @@ fn to_commit_info(repo: &gix::Repository, commit: &gix::Commit<'_>) -> Result<Co
         author_email,
         time: when,
         stats,
+        files,
     })
 }
 
-/// Calculate the committed tree diff against the first parent. Root commits
-/// are compared with the empty tree. This is the same source of truth as a git
-/// commit diff and deliberately does not use synthesized assistant edit data.
-fn commit_stats(repo: &gix::Repository, commit: &gix::Commit<'_>) -> Result<CommitStats, Error> {
+/// Calculate authoritative statistics and changed paths against the first
+/// parent. Root commits are compared with the empty tree.
+fn commit_diff_metadata(
+    repo: &gix::Repository,
+    commit: &gix::Commit<'_>,
+) -> Result<(CommitStats, Vec<CommitFileChange>), Error> {
     let map_git = |e: &dyn std::fmt::Display| Error::Git(e.to_string());
 
     let current_tree = commit.tree().map_err(|e| map_git(&e))?;
@@ -139,25 +142,68 @@ fn commit_stats(repo: &gix::Repository, commit: &gix::Commit<'_>) -> Result<Comm
     let changes = repo
         .diff_tree_to_tree(Some(&previous_tree), Some(&current_tree), Some(options))
         .map_err(|e| map_git(&e))?;
-    let files_changed = changes
+    let files = changes
         .iter()
-        .filter(|change| {
+        .filter_map(|change| {
             use gix::object::tree::diff::ChangeDetached;
-            let mode = match change {
-                ChangeDetached::Addition { entry_mode, .. }
-                | ChangeDetached::Deletion { entry_mode, .. }
-                | ChangeDetached::Modification { entry_mode, .. }
-                | ChangeDetached::Rewrite { entry_mode, .. } => entry_mode,
-            };
-            !mode.is_tree()
+            match change {
+                ChangeDetached::Addition {
+                    location,
+                    entry_mode,
+                    ..
+                } if !entry_mode.is_tree() => Some(CommitFileChange {
+                    status: CommitFileStatus::Added,
+                    path: String::from_utf8_lossy(location.as_ref()).into_owned(),
+                    previous_path: None,
+                }),
+                ChangeDetached::Deletion {
+                    location,
+                    entry_mode,
+                    ..
+                } if !entry_mode.is_tree() => Some(CommitFileChange {
+                    status: CommitFileStatus::Deleted,
+                    path: String::from_utf8_lossy(location.as_ref()).into_owned(),
+                    previous_path: None,
+                }),
+                ChangeDetached::Modification {
+                    location,
+                    entry_mode,
+                    ..
+                } if !entry_mode.is_tree() => Some(CommitFileChange {
+                    status: CommitFileStatus::Modified,
+                    path: String::from_utf8_lossy(location.as_ref()).into_owned(),
+                    previous_path: None,
+                }),
+                ChangeDetached::Rewrite {
+                    source_location,
+                    location,
+                    entry_mode,
+                    copy,
+                    ..
+                } if !entry_mode.is_tree() => Some(CommitFileChange {
+                    status: if *copy {
+                        CommitFileStatus::Copied
+                    } else {
+                        CommitFileStatus::Renamed
+                    },
+                    path: String::from_utf8_lossy(location.as_ref()).into_owned(),
+                    previous_path: Some(
+                        String::from_utf8_lossy(source_location.as_ref()).into_owned(),
+                    ),
+                }),
+                _ => None,
+            }
         })
-        .count() as u64;
+        .collect::<Vec<_>>();
 
-    Ok(CommitStats {
-        files_changed,
-        lines_added: lines.lines_added,
-        lines_deleted: lines.lines_removed,
-    })
+    Ok((
+        CommitStats {
+            files_changed: files.len() as u64,
+            lines_added: lines.lines_added,
+            lines_deleted: lines.lines_removed,
+        },
+        files,
+    ))
 }
 
 #[cfg(test)]
@@ -220,6 +266,14 @@ mod tests {
                 lines_deleted: 0,
             }
         );
+        assert_eq!(
+            initial.files,
+            vec![CommitFileChange {
+                status: CommitFileStatus::Added,
+                path: "notes.txt".into(),
+                previous_path: None,
+            }]
+        );
         let second = commits
             .iter()
             .find(|commit| commit.summary == "Add a line and binary")
@@ -232,6 +286,16 @@ mod tests {
                 lines_deleted: 0,
             }
         );
+        assert!(second.files.contains(&CommitFileChange {
+            status: CommitFileStatus::Modified,
+            path: "notes.txt".into(),
+            previous_path: None,
+        }));
+        assert!(second.files.contains(&CommitFileChange {
+            status: CommitFileStatus::Added,
+            path: "image.bin".into(),
+            previous_path: None,
+        }));
         let renamed = commits
             .iter()
             .find(|commit| commit.summary == "Rename notes")
@@ -243,6 +307,14 @@ mod tests {
                 lines_added: 0,
                 lines_deleted: 0,
             }
+        );
+        assert_eq!(
+            renamed.files,
+            vec![CommitFileChange {
+                status: CommitFileStatus::Renamed,
+                path: "renamed.txt".into(),
+                previous_path: Some("notes.txt".into()),
+            }]
         );
 
         std::fs::remove_dir_all(&dir).ok();

@@ -165,6 +165,7 @@ mod tests {
             author_email: "t@example.com".into(),
             time: Utc.with_ymd_and_hms(2026, 1, 1, hour, 0, 0).unwrap(),
             stats: Default::default(),
+            files: vec![],
         }
     }
 

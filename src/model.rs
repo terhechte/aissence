@@ -20,6 +20,39 @@ pub struct CommitStats {
     pub lines_deleted: u64,
 }
 
+/// How one file changed in the committed tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitFileStatus {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Copied,
+}
+
+impl CommitFileStatus {
+    /// Compact label used in commit fingerprints supplied to the summarizer.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Added => "A",
+            Self::Modified => "M",
+            Self::Deleted => "D",
+            Self::Renamed => "R",
+            Self::Copied => "C",
+        }
+    }
+}
+
+/// One authoritative file-level change introduced by a git commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitFileChange {
+    pub status: CommitFileStatus,
+    /// Destination/current path. For deletions, this is the deleted path.
+    pub path: String,
+    /// Original path for renames and copies.
+    pub previous_path: Option<String>,
+}
+
 /// A single git commit, normalized for correlation with chat messages.
 #[derive(Debug, Clone)]
 pub struct CommitInfo {
@@ -39,6 +72,8 @@ pub struct CommitInfo {
     pub time: DateTime<Utc>,
     /// Authoritative file/line statistics from the committed tree diff.
     pub stats: CommitStats,
+    /// Authoritative changed paths from the same committed tree diff.
+    pub files: Vec<CommitFileChange>,
 }
 
 /// One chat message lifted out of a parsed session, carrying just enough
@@ -298,19 +333,16 @@ pub struct MessageSummary {
 /// Summary data for what went into a commit.
 ///
 /// Produced by the [`crate::summarize::Summarizer`]. The three aggregate fields
-/// and `meta` are empty unless the optional meta-summary pipeline is enabled.
-/// [`messages`](Self::messages) holds the conversation breakdown; only user
-/// entries receive per-entry LLM summaries.
+/// are always generated when their source category is present. `meta` remains
+/// optional. [`messages`](Self::messages) holds the conversation breakdown;
+/// only user entries receive per-entry LLM summaries.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CommitSummary {
-    /// Optional 3-5 sentence aggregate of what the user asked for.
-    /// Empty unless the meta-summary pipeline is enabled.
+    /// Locally combined summaries of what the user asked for.
     pub user_requested: String,
-    /// Optional 3-5 sentence aggregate of what the assistant explained.
-    /// Empty unless the meta-summary pipeline is enabled.
+    /// Concise summary of what the assistant explained or concluded.
     pub ai_answered: String,
-    /// Optional 3-5 sentence aggregate of code edits.
-    /// Empty unless the meta-summary pipeline is enabled.
+    /// Concise summary of the implementation recorded by the commit.
     pub ai_implemented: String,
     /// Conversation entries in chronological order.
     pub messages: Vec<MessageSummary>,
@@ -319,7 +351,6 @@ pub struct CommitSummary {
     #[serde(default)]
     pub agents: Vec<AgentUsage>,
     /// Optional cohesive overview synthesizing the three aggregate fields.
-    /// Empty unless the meta-summary pipeline is enabled.
     #[serde(default)]
     pub meta: String,
     /// Exact total token usage of the whole conversation that led to this
