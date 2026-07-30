@@ -1,15 +1,10 @@
 //! LLM summarization of a commit's conversation and code changes, via
 //! [OpenRouter](https://openrouter.ai/).
 //!
-//! For each [`CommitGroup`] we produce a [`CommitSummary`] with three parts —
-//! *user requested*, *ai answered*, *ai implemented* — using a two-stage
-//! map-reduce:
-//!
-//! 1. **Map**: every individual item (each user message, each assistant reply,
-//!    each file-editing tool call) is summarized into 2-3 sentences. Short items
-//!    are passed through verbatim to avoid a needless model call.
-//! 2. **Reduce**: the per-item summaries of each category are condensed into one
-//!    slightly longer (3-5 sentence) summary.
+//! For each [`CommitGroup`] we summarize every user entry, retain assistant
+//! entries locally, and ask the model for the three commit-level summaries —
+//! *user requested*, *ai answered*, and *ai implemented* — plus one cohesive
+//! overview.
 //!
 //! The three categories are derived from the chat itself:
 //! - **user**: [`ncs::Role::User`] message text,
@@ -19,17 +14,20 @@
 //! ```no_run
 //! # async fn run() -> Result<(), aissence::Error> {
 //! let mut history = aissence::analyze("/path/to/project")?;
-//! let summarizer = aissence::Summarizer::from_env()?; // OPENROUTER_API_KEY / OPENROUTER_MODEL
+//! let summarizer = aissence::Summarizer::from_env()?;
+//! // OPENROUTER_API_KEY / OPENROUTER_MODEL / OPENROUTER_PROVIDER
 //! summarizer.summarize_history(&mut history).await?;
 //! # Ok(()) }
 //! ```
 
+use std::sync::Arc;
 use std::sync::Mutex;
 
-use futures::stream::{self, StreamExt};
+use futures::stream::{self, StreamExt, TryStreamExt};
 use openrouter_rs::OpenRouterClient;
 use openrouter_rs::api::chat::{ChatCompletionRequest, Message};
-use openrouter_rs::types::Role as OrRole;
+use openrouter_rs::types::{ProviderPreferences, Role as OrRole};
+use tokio::sync::Semaphore;
 
 use crate::error::Error;
 use crate::model::{
@@ -42,14 +40,17 @@ use crate::ncs;
 pub const ENV_API_KEY: &str = "OPENROUTER_API_KEY";
 /// Environment variable selecting the model (e.g. `inclusionai/ling-2.6-flash`).
 pub const ENV_MODEL: &str = "OPENROUTER_MODEL";
+/// Environment variable selecting a preferred provider (e.g. `deepinfra`).
+pub const ENV_PROVIDER: &str = "OPENROUTER_PROVIDER";
 /// Model used when [`ENV_MODEL`] is unset.
 pub const DEFAULT_MODEL: &str = "inclusionai/ling-2.6-flash";
-
-/// Long prose is summarized in bounded chunks so all of it contributes without
-/// requiring one unbounded model context. Code-change renderings use one such
-/// chunk because their complete synthesized diffs are persisted separately.
-const SUMMARY_CHUNK_CHARS: usize = 6_000;
-const CHANGE_SUMMARY_CHARS: usize = 6_000;
+/// Maximum number of commit groups summarized concurrently.
+///
+/// Each group can issue up to three concurrent aggregate requests before its
+/// dependent `meta` request.
+pub const MAX_CONCURRENT_GROUPS: usize = 8;
+/// Maximum number of OpenRouter requests in flight across all commit groups.
+pub const MAX_CONCURRENT_REQUESTS: usize = 24;
 
 /// Actual billing reported by OpenRouter for one summarization operation.
 ///
@@ -92,25 +93,39 @@ impl CostTracker {
 pub struct Summarizer {
     client: OpenRouterClient,
     model: String,
-    /// Maximum concurrent stage-1 (per-item) requests.
-    max_concurrency: usize,
-    /// Items at most this many characters are used verbatim (no model call).
-    passthrough_chars: usize,
+    provider: Option<String>,
+    request_limit: Arc<Semaphore>,
 }
 
 impl Summarizer {
     /// Build a summarizer from the environment.
     ///
-    /// Reads [`ENV_API_KEY`] (required) and [`ENV_MODEL`] (optional, defaulting
-    /// to [`DEFAULT_MODEL`]).
+    /// Reads [`ENV_API_KEY`] (required), [`ENV_MODEL`] (optional, defaulting to
+    /// [`DEFAULT_MODEL`]), and [`ENV_PROVIDER`] (optional).
+    ///
+    /// The provider is sent as the first entry in OpenRouter's provider
+    /// preference order. OpenRouter may still fall back to another provider.
     pub fn from_env() -> Result<Self, Error> {
         let api_key = std::env::var(ENV_API_KEY).map_err(|_| Error::MissingEnv(ENV_API_KEY))?;
         let model = std::env::var(ENV_MODEL).unwrap_or_else(|_| DEFAULT_MODEL.to_string());
-        Self::new(api_key, model)
+        let provider = std::env::var(ENV_PROVIDER)
+            .ok()
+            .map(|provider| provider.trim().to_string())
+            .filter(|provider| !provider.is_empty());
+        Self::new_with_provider(api_key, model, provider)
     }
 
     /// Build a summarizer with an explicit key and model.
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Result<Self, Error> {
+        Self::new_with_provider(api_key, model, None)
+    }
+
+    /// Build a summarizer with an explicit key, model, and preferred provider.
+    pub fn new_with_provider(
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+        provider: Option<String>,
+    ) -> Result<Self, Error> {
         let client = OpenRouterClient::builder()
             .api_key(api_key.into())
             .build()
@@ -118,8 +133,8 @@ impl Summarizer {
         Ok(Self {
             client,
             model: model.into(),
-            max_concurrency: 6,
-            passthrough_chars: 320,
+            provider,
+            request_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
         })
     }
 
@@ -128,22 +143,38 @@ impl Summarizer {
         &self.model
     }
 
+    /// The preferred OpenRouter provider, if configured.
+    pub fn provider(&self) -> Option<&str> {
+        self.provider.as_deref()
+    }
+
     /// Summarize every non-empty group in `history`, filling in
-    /// [`CommitGroup::summary`]. Groups are processed sequentially (each group
-    /// already parallelizes its own per-item requests internally).
+    /// [`CommitGroup::summary`]. Commit groups use bounded concurrency, and the
+    /// three independent category summaries within each group run concurrently.
     pub async fn summarize_history(&self, history: &mut CoalescedHistory) -> Result<(), Error> {
-        for group in &mut history.groups {
-            if group.messages.is_empty() {
-                continue;
-            }
-            let summary = self.summarize_group(group).await?;
-            group.summary = Some(summary);
+        let jobs = history
+            .groups
+            .iter()
+            .enumerate()
+            .filter(|(_, group)| !group.messages.is_empty())
+            .map(|(index, group)| async move {
+                self.summarize_group(group)
+                    .await
+                    .map(|summary| (index, summary))
+            });
+        let summaries: Vec<(usize, CommitSummary)> = stream::iter(jobs)
+            .buffer_unordered(MAX_CONCURRENT_GROUPS)
+            .try_collect()
+            .await?;
+
+        for (index, summary) in summaries {
+            history.groups[index].summary = Some(summary);
         }
         Ok(())
     }
 
-    /// Summarize a single commit group: a per-message breakdown plus the three
-    /// aggregated overviews.
+    /// Summarize a single commit group. Every user entry gets a summary; the
+    /// assistant-text and editing entries are retained without per-entry calls.
     pub async fn summarize_group(&self, group: &CommitGroup) -> Result<CommitSummary, Error> {
         self.summarize_group_with_cost(group).await.0
     }
@@ -165,7 +196,7 @@ impl Summarizer {
         costs: &CostTracker,
     ) -> Result<CommitSummary, Error> {
         // Consecutive messages of the same kind (e.g. several "ai changed" in a
-        // row) are merged so they become a single summary entry.
+        // row) are merged locally into a single retained entry.
         let items = coalesce_consecutive(raw_items(group));
         let commit_context = group
             .commit
@@ -173,44 +204,41 @@ impl Summarizer {
             .map(|c| c.summary.clone())
             .unwrap_or_else(|| "(uncommitted work in progress)".to_string());
 
-        // Stage 1 (map): summarize every message, concurrently.
-        let per_item = self.map_raw_items(&items, costs).await?;
-
-        // Per-message breakdown (drives the app's middle pane).
-        let messages: Vec<MessageSummary> = items
-            .into_iter()
-            .zip(per_item)
-            .map(|(item, summary)| {
-                let content = retained_content(&item);
-                MessageSummary {
-                    kind: item.kind,
-                    summary,
-                    content,
-                    changes: item.changes,
-                    timestamp: item.timestamp,
-                    tokens: item.tokens,
-                }
-            })
-            .collect();
-
-        // Stage 2 (reduce): aggregate each category from its message summaries.
+        // Feed each category's complete retained source directly into its one
+        // commit-level summary call.
         let by_kind = |kind: MessageKind| -> Vec<String> {
-            messages
+            items
                 .iter()
-                .filter(|m| m.kind == kind)
-                .map(|m| m.summary.clone())
+                .filter(|item| item.kind == kind)
+                .map(|item| item.text.clone())
                 .collect()
         };
         let user = by_kind(MessageKind::UserWrote);
         let answered = by_kind(MessageKind::AiWrote);
         let changed = by_kind(MessageKind::AiChanged);
 
-        // The three categories are independent — run them concurrently.
-        let (user_requested, ai_answered, ai_implemented) = futures::try_join!(
+        // User-entry summaries and the three aggregate categories are
+        // independent, so run all of them concurrently. The shared semaphore
+        // bounds total request pressure across every concurrently active group.
+        let (entry_summaries, user_requested, ai_answered, ai_implemented) = futures::try_join!(
+            self.summarize_user_entries(&items, costs),
             self.reduce_items(&user, Category::User, &commit_context, costs),
             self.reduce_items(&answered, Category::Response, &commit_context, costs),
             self.reduce_items(&changed, Category::Change, &commit_context, costs),
         )?;
+
+        let messages: Vec<MessageSummary> = items
+            .iter()
+            .zip(entry_summaries)
+            .map(|(item, summary)| MessageSummary {
+                kind: item.kind,
+                summary,
+                content: retained_content(item),
+                changes: item.changes.clone(),
+                timestamp: item.timestamp,
+                tokens: item.tokens,
+            })
+            .collect();
 
         // Finally, synthesize the three into one longer overview.
         let meta = self
@@ -232,6 +260,40 @@ impl Summarizer {
             meta,
             tokens: group.token_usage(),
         })
+    }
+
+    /// Generate exactly one summary for every coalesced user entry. The full
+    /// retained prompt is supplied with no character or entry-count cutoff.
+    async fn summarize_user_entries(
+        &self,
+        items: &[RawItem],
+        costs: &CostTracker,
+    ) -> Result<Vec<Option<String>>, Error> {
+        let mut jobs = Vec::with_capacity(items.len());
+        for item in items {
+            let kind = item.kind;
+            let text = item.text.clone();
+            jobs.push(async move {
+                if kind != MessageKind::UserWrote {
+                    return Ok(None);
+                }
+                self.complete(
+                    "You summarize one complete user prompt from a coding session. \
+                     Preserve every important request, constraint, question, correction, \
+                     and reported problem. Reply with a concise 2-3 sentence summary and \
+                     no preamble.",
+                    format!("Complete user prompt:\n\n{text}"),
+                    300,
+                    costs,
+                )
+                .await
+                .map(Some)
+            });
+        }
+        stream::iter(jobs)
+            .buffered(MAX_CONCURRENT_REQUESTS)
+            .try_collect()
+            .await
     }
 
     /// Synthesize the three component summaries into one cohesive overview (up
@@ -267,97 +329,16 @@ impl Summarizer {
         self.complete(system, user, 1200, costs).await
     }
 
-    /// Stage 1: summarize each message, concurrently and order-preserving.
-    /// Messages shorter than [`Self::passthrough_chars`] are used verbatim.
-    async fn map_raw_items(
-        &self,
-        items: &[RawItem],
-        costs: &CostTracker,
-    ) -> Result<Vec<String>, Error> {
-        // Build the futures in a plain loop (not `.map`) so each one captures
-        // owned data and a uniform `&self` borrow — avoids the higher-ranked
-        // closure-lifetime bound that breaks `tokio::spawn`'s `Send + 'static`.
-        let mut jobs = Vec::with_capacity(items.len());
-        for item in items {
-            let kind = item.kind;
-            let text = item.text.clone();
-            jobs.push(async move { self.summarize_raw_item(kind, text, costs).await });
-        }
-        let results: Vec<Result<String, Error>> = stream::iter(jobs)
-            .buffered(self.max_concurrency)
-            .collect()
-            .await;
-        results.into_iter().collect()
-    }
-
-    /// Summarize one source entry. Long user/assistant prose is split into
-    /// bounded chunks, each chunk is summarized, and the partials are reduced
-    /// into one entry summary. This lets the full source contribute without
-    /// depending on an arbitrarily large model context window.
-    async fn summarize_raw_item(
-        &self,
-        kind: MessageKind,
-        text: String,
-        costs: &CostTracker,
-    ) -> Result<String, Error> {
-        if text.chars().count() <= self.passthrough_chars {
-            return Ok(text);
-        }
-
-        let category = Category::for_kind(kind);
-        let input = summary_input(kind, &text);
-        let chunks = chunk_chars(&input, SUMMARY_CHUNK_CHARS);
-        let chunk_count = chunks.len();
-        let mut partials = Vec::with_capacity(chunk_count);
-        for (index, chunk) in chunks.into_iter().enumerate() {
-            let labeled = if chunk_count == 1 {
-                chunk
-            } else {
-                format!("Part {} of {chunk_count}:\n\n{chunk}", index + 1)
-            };
-            partials.push(
-                self.complete(
-                    category.item_system(),
-                    category.item_user(&labeled),
-                    300,
-                    costs,
-                )
-                .await?,
-            );
-        }
-
-        if partials.len() == 1 {
-            return Ok(partials.pop().unwrap_or_default());
-        }
-        let joined = partials
-            .iter()
-            .enumerate()
-            .map(|(index, summary)| format!("{}. {summary}", index + 1))
-            .collect::<Vec<_>>()
-            .join("\n");
-        self.complete(
-            "You combine ordered partial summaries of one long message from a coding \
-             session. Preserve all important requests, decisions, caveats, and conclusions \
-             while removing repetition. Reply with one concise summary and no preamble.",
-            format!(
-                "Ordered partial summaries of one message:\n\n{joined}\n\n\
-                 Write the combined summary."
-            ),
-            500,
-            costs,
-        )
-        .await
-    }
-
-    /// Stage 2: condense per-item summaries into one final summary.
+    /// Condense all source entries of one category into one commit-level
+    /// summary. This is one model request regardless of entry count.
     async fn reduce_items(
         &self,
-        per_item: &[String],
+        source_items: &[String],
         category: Category,
         commit_context: &str,
         costs: &CostTracker,
     ) -> Result<String, Error> {
-        let joined = per_item
+        let joined = source_items
             .iter()
             .filter(|s| !s.trim().is_empty())
             .enumerate()
@@ -367,10 +348,6 @@ impl Summarizer {
 
         if joined.is_empty() {
             return Ok(String::new());
-        }
-        // A single item needs no further reduction.
-        if per_item.len() == 1 {
-            return Ok(per_item[0].trim().to_string());
         }
 
         self.complete(
@@ -390,14 +367,26 @@ impl Summarizer {
         max_tokens: u32,
         costs: &CostTracker,
     ) -> Result<String, Error> {
-        let request = ChatCompletionRequest::builder()
+        let _permit = self
+            .request_limit
+            .acquire()
+            .await
+            .map_err(|_| Error::Llm("summarization request limiter closed".to_string()))?;
+        let mut request = ChatCompletionRequest::builder();
+        request
             .model(self.model.as_str())
             .messages(vec![
                 Message::new(OrRole::System, system),
                 Message::new(OrRole::User, user),
             ])
             .temperature(0.2)
-            .max_tokens(max_tokens)
+            .max_tokens(max_tokens);
+        if let Some(provider) = &self.provider {
+            let mut preferences = ProviderPreferences::default();
+            preferences.order = Some(vec![provider.clone()]);
+            request.provider(preferences);
+        }
+        let request = request
             .build()
             .map_err(|e| Error::Llm(format!("request build: {e}")))?;
 
@@ -420,10 +409,11 @@ impl Summarizer {
     }
 }
 
-/// One message turned into a unit of summarization.
+/// One source message turned into a locally retained conversation entry and
+/// aggregate-summary input.
 struct RawItem {
     kind: MessageKind,
-    /// Text fed to the model (message text, or a rendering of the edits).
+    /// Complete text used by the relevant commit-level summary call.
     text: String,
     /// Code changes — only for [`MessageKind::AiChanged`].
     changes: Vec<CodeChange>,
@@ -488,7 +478,7 @@ fn raw_items(group: &CommitGroup) -> Vec<RawItem> {
 
 /// Merge runs of consecutive same-kind items into one. The merged item keeps
 /// the first timestamp, joins the texts, and concatenates the code changes — so
-/// e.g. five "ai changed" messages in a row become a single summarized entry.
+/// e.g. five "ai changed" messages in a row become a single retained entry.
 fn coalesce_consecutive(items: Vec<RawItem>) -> Vec<RawItem> {
     let mut merged: Vec<RawItem> = Vec::with_capacity(items.len());
     for item in items {
@@ -554,6 +544,27 @@ pub fn attach_source_content(group: &CommitGroup, summary: &mut CommitSummary) -
     changed
 }
 
+/// Whether a cached summary satisfies the current per-entry contract.
+///
+/// Every coalesced user entry must have a non-empty summary. This deliberately
+/// rejects files produced during the short-lived no-message-summary format so
+/// "Summarize all" regenerates those commits, while accepting older caches that
+/// already summarized user prompts.
+pub fn has_required_user_summaries(group: &CommitGroup, summary: &CommitSummary) -> bool {
+    let items = coalesce_consecutive(raw_items(group));
+    items_match_summary(&items, summary)
+        && summary
+            .messages
+            .iter()
+            .filter(|message| message.kind == MessageKind::UserWrote)
+            .all(|message| {
+                message
+                    .summary
+                    .as_deref()
+                    .is_some_and(|text| !text.trim().is_empty())
+            })
+}
+
 fn items_match_summary(items: &[RawItem], summary: &CommitSummary) -> bool {
     items.len() == summary.messages.len()
         && items
@@ -562,41 +573,12 @@ fn items_match_summary(items: &[RawItem], summary: &CommitSummary) -> bool {
             .all(|(item, message)| item.kind == message.kind)
 }
 
-/// Source text persisted next to a message summary.
+/// Source text persisted with a conversation entry.
 fn retained_content(item: &RawItem) -> Option<String> {
     match item.kind {
         MessageKind::UserWrote | MessageKind::AiWrote => Some(item.text.clone()),
         MessageKind::AiChanged => None,
     }
-}
-
-/// Text supplied to the stage-1 model. Preserve user and assistant prose in
-/// full, and keep the existing bounded rendering for code changes (whose full
-/// synthesized diffs are persisted separately).
-fn summary_input(kind: MessageKind, text: &str) -> String {
-    match kind {
-        MessageKind::UserWrote | MessageKind::AiWrote => text.to_string(),
-        MessageKind::AiChanged => truncate_chars(text, CHANGE_SUMMARY_CHARS),
-    }
-}
-
-fn chunk_chars(text: &str, max_chars: usize) -> Vec<String> {
-    assert!(max_chars > 0);
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-    let mut count = 0;
-    for character in text.chars() {
-        current.push(character);
-        count += 1;
-        if count == max_chars {
-            chunks.push(std::mem::take(&mut current));
-            count = 0;
-        }
-    }
-    if !current.is_empty() || chunks.is_empty() {
-        chunks.push(current);
-    }
-    chunks
 }
 
 /// Extract the file-editing tool calls of `message` as [`CodeChange`]s.
@@ -732,14 +714,6 @@ fn is_edit_tool(name: &str) -> bool {
     EDIT_TOOLS.contains(&lower.as_str())
 }
 
-fn truncate_chars(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let head: String = text.chars().take(max).collect();
-    format!("{head}\n…[truncated]")
-}
-
 /// Distinguishes the three summary categories and their prompts.
 #[derive(Clone, Copy)]
 enum Category {
@@ -749,79 +723,42 @@ enum Category {
 }
 
 impl Category {
-    /// Map a per-message kind to its prompt category.
-    fn for_kind(kind: MessageKind) -> Self {
-        match kind {
-            MessageKind::UserWrote => Category::User,
-            MessageKind::AiWrote => Category::Response,
-            MessageKind::AiChanged => Category::Change,
-        }
-    }
-
-    /// System prompt for the stage-1 per-item summary.
-    fn item_system(self) -> &'static str {
-        match self {
-            Category::User => {
-                "You summarize a single user message from a coding session. \
-                 Reply with 2-3 sentences describing what the user asked for or \
-                 reported. Output only the summary, no preamble."
-            }
-            Category::Response => {
-                "You summarize a single assistant message from a coding session. \
-                 Reply with 2-3 sentences describing what the assistant explained, \
-                 decided, or concluded. Output only the summary, no preamble."
-            }
-            Category::Change => {
-                "You summarize a single code-change action (a file-editing tool \
-                 call) from a coding session. Reply with 2-3 sentences describing \
-                 what was changed and in which file. Output only the summary, no \
-                 preamble."
-            }
-        }
-    }
-
-    /// User prompt wrapping one item for stage 1.
-    fn item_user(self, item: &str) -> String {
-        let label = match self {
-            Category::User => "User message",
-            Category::Response => "Assistant message",
-            Category::Change => "Code change",
-        };
-        format!("{label}:\n\n{item}")
-    }
-
-    /// System prompt for the stage-2 reduce step.
+    /// System prompt for the commit-level aggregate step.
     fn reduce_system(self) -> &'static str {
         match self {
             Category::User => {
                 "You write a concise 3-5 sentence summary of everything the user \
                  requested during the work that led to a git commit, given \
-                 per-message summaries. Write in past tense. Output only the \
+                 the complete ordered user messages. Write in past tense. Output only the \
                  summary, no preamble."
             }
             Category::Response => {
                 "You write a concise 3-5 sentence summary of what the assistant \
                  answered and explained during the work that led to a git commit, \
-                 given per-message summaries. Write in past tense. Output only the \
+                 given the complete ordered assistant replies. Preserve important \
+                 decisions, conclusions, caveats, and trade-offs. Write in past tense. \
+                 Output only the \
                  summary, no preamble."
             }
             Category::Change => {
                 "You write a concise 3-5 sentence summary of what was implemented \
-                 in the code for a git commit, given per-change summaries. Write \
-                 in past tense, focusing on behavior and files touched. Output \
-                 only the summary, no preamble."
+                 in the code for a git commit, given the complete ordered editing \
+                 activity. Write in past tense, focusing on behavior and files touched. \
+                 Output only the summary, no preamble."
             }
         }
     }
 
-    /// User prompt for the stage-2 reduce step.
+    /// User prompt for the commit-level aggregate step.
     fn reduce_user(self, joined: &str, commit_context: &str) -> String {
         let heading = match self {
-            Category::User => "Per-message summaries of what the user requested",
-            Category::Response => "Per-message summaries of what the assistant answered",
-            Category::Change => "Per-change summaries of what was implemented",
+            Category::User => "Complete ordered user messages",
+            Category::Response => "Complete ordered assistant replies",
+            Category::Change => "Complete ordered editing activity",
         };
-        format!("Commit: {commit_context}\n\n{heading}:\n{joined}\n\nWrite the 3-5 sentence summary.")
+        format!(
+            "Commit: {commit_context}\n\n{heading}:\n{joined}\n\nWrite the 3-5 sentence summary."
+        )
     }
 }
 
@@ -868,7 +805,7 @@ mod tests {
     }
 
     #[test]
-    fn retains_and_summarizes_user_and_assistant_text_without_a_length_cap() {
+    fn retains_user_and_assistant_text_without_a_length_cap() {
         let long_user = "u".repeat(30_000);
         let long_ai = "a".repeat(30_000);
         let user = item(MessageKind::UserWrote, &long_user);
@@ -876,18 +813,6 @@ mod tests {
 
         assert_eq!(retained_content(&user).as_deref(), Some(long_user.as_str()));
         assert_eq!(retained_content(&ai).as_deref(), Some(long_ai.as_str()));
-        assert_eq!(summary_input(user.kind, &user.text), long_user);
-        assert_eq!(summary_input(ai.kind, &ai.text), long_ai);
-    }
-
-    #[test]
-    fn long_summary_input_is_chunked_without_losing_content() {
-        let text = format!("{}🦀{}", "a".repeat(6_003), "b".repeat(6_004));
-        let chunks = chunk_chars(&text, SUMMARY_CHUNK_CHARS);
-
-        assert_eq!(chunks.len(), 3);
-        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 6_000));
-        assert_eq!(chunks.concat(), text);
     }
 
     #[test]
@@ -967,7 +892,7 @@ mod tests {
             messages: vec![
                 MessageSummary {
                     kind: MessageKind::UserWrote,
-                    summary: "hi".into(),
+                    summary: Some("greeting".into()),
                     content: None,
                     changes: vec![],
                     timestamp: None,
@@ -975,7 +900,7 @@ mod tests {
                 },
                 MessageSummary {
                     kind: MessageKind::AiWrote,
-                    summary: "hello".into(),
+                    summary: None,
                     content: None,
                     changes: vec![],
                     timestamp: None,
@@ -997,6 +922,10 @@ mod tests {
         assert_eq!(summary.messages[0].content.as_deref(), Some("hi"));
         assert_eq!(summary.messages[1].content.as_deref(), Some("hello there"));
         assert!(!attach_source_content(&group, &mut summary));
+        assert!(has_required_user_summaries(&group, &summary));
+
+        summary.messages[0].summary = None;
+        assert!(!has_required_user_summaries(&group, &summary));
     }
 
     #[test]
@@ -1023,5 +952,29 @@ mod tests {
         assert!((total.usd - 0.003).abs() < f64::EPSILON);
         assert_eq!(total.request_count, 3);
         assert_eq!(total.unpriced_request_count, 1);
+    }
+
+    #[test]
+    fn preferred_provider_uses_openrouter_order_format() {
+        let mut preferences = ProviderPreferences::default();
+        preferences.order = Some(vec!["deepinfra".to_string()]);
+
+        assert_eq!(
+            serde_json::to_value(preferences).unwrap(),
+            serde_json::json!({ "order": ["deepinfra"] })
+        );
+    }
+
+    #[test]
+    fn constructor_retains_optional_provider() {
+        let summarizer = Summarizer::new_with_provider(
+            "test-key",
+            "example/model",
+            Some("deepinfra".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(summarizer.model(), "example/model");
+        assert_eq!(summarizer.provider(), Some("deepinfra"));
     }
 }

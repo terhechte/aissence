@@ -236,7 +236,7 @@ mod tests {
             ai_implemented: "edited code".into(),
             messages: vec![MessageSummary {
                 kind: MessageKind::UserWrote,
-                summary: "hello".into(),
+                summary: Some("A greeting.".into()),
                 content: Some("hello".into()),
                 changes: vec![],
                 timestamp: None,
@@ -297,6 +297,7 @@ mod tests {
         assert_eq!(entry["summary"]["agents"][0]["model"], "gpt-test");
         assert_eq!(entry["summary"]["agents"][0]["tokens"]["input"], 10);
         assert_eq!(entry["summary"]["agents"][0]["tokens"]["output"], 4);
+        assert_eq!(entry["summary"]["messages"][0]["summary"], "A greeting.");
 
         let store = SummaryStore::load(&dir);
         let got = store.get("abc123", 42).expect("cached entry");
@@ -381,10 +382,27 @@ mod tests {
         let store = SummaryStore::load(&dir);
         let summary = store.get("abc123", 42).unwrap();
         let message = &summary.messages[0];
+        assert_eq!(message.summary.as_deref(), Some("asked"));
         assert_eq!(message.content, None);
         assert_eq!(summary.agents[0].tokens, None);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn assistant_entries_do_not_emit_a_summary() {
+        let message = MessageSummary {
+            kind: MessageKind::AiWrote,
+            summary: None,
+            content: Some("complete assistant reply".into()),
+            changes: vec![],
+            timestamp: None,
+            tokens: None,
+        };
+
+        let json = serde_json::to_value(message).unwrap();
+        assert!(json.get("summary").is_none());
+        assert_eq!(json["content"], "complete assistant reply");
     }
 
     #[test]

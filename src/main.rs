@@ -2,7 +2,8 @@
 //!
 //! Parses a folder's commits and AI session logs, then prints — for each commit
 //! — the chat messages that led up to it. Pass `--summarize` to additionally
-//! generate LLM summaries (reads `OPENROUTER_API_KEY` / `OPENROUTER_MODEL`).
+//! generate LLM summaries (reads `OPENROUTER_API_KEY`, `OPENROUTER_MODEL`, and
+//! optional provider preference `OPENROUTER_PROVIDER`).
 //!
 //! ```text
 //! cargo run -- /path/to/project
@@ -41,7 +42,14 @@ async fn main() {
     if summarize {
         match Summarizer::from_env() {
             Ok(summarizer) => {
-                eprintln!("Summarizing with model `{}` …", summarizer.model());
+                if let Some(provider) = summarizer.provider() {
+                    eprintln!(
+                        "Summarizing with model `{}` (preferring provider `{provider}`) …",
+                        summarizer.model()
+                    );
+                } else {
+                    eprintln!("Summarizing with model `{}` …", summarizer.model());
+                }
                 match summarizer.summarize_history(&mut history).await {
                     Ok(()) => did_summarize = true,
                     Err(err) => eprintln!("summarization error: {err}"),

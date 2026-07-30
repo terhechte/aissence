@@ -103,11 +103,11 @@ the best-effort, tool-call-derived `Change.diff` strings.
 
 | Field            | JSON type | Meaning |
 |------------------|-----------|---------|
-| `user_requested` | string | A concise aggregate summary of what the user asked for across the conversation that led to this commit. Usually 3–5 sentences, but it may be shorter when there is only one short source entry. Plain prose. |
-| `ai_answered`    | string | A concise aggregate summary of what the assistant explained, decided, or concluded in its replies. Usually 3–5 sentences, with the same single-entry exception. |
-| `ai_implemented` | string | A concise aggregate summary of what was implemented through recognized file-editing tool calls. Usually 3–5 sentences, with the same single-entry exception. |
+| `user_requested` | string | A concise aggregate summary of what the user asked for across the conversation that led to this commit. Usually 3–5 sentences. Plain prose. |
+| `ai_answered`    | string | A concise aggregate summary of what the assistant explained, decided, or concluded in its replies. Usually 3–5 sentences. |
+| `ai_implemented` | string | A concise aggregate summary of what was implemented through recognized file-editing tool calls. Usually 3–5 sentences. |
 | `meta`           | string | A single, longer cohesive overview (up to ~20 sentences) synthesizing the three fields above: what the user wanted, what was implemented, and anything important the assistant noted (limitations, caveats, trade-offs, follow-ups). **May be an empty string** (and may be absent in older files). When present it's the most complete single-text description of the commit. |
-| `messages`       | array  | A chronological breakdown of summarized conversation entries. Entries can be split or coalesced relative to source messages; see "Message". May be empty. |
+| `messages`       | array  | A chronological breakdown of conversation entries. Every `UserWrote` entry has an LLM summary; assistant entries remain locally derived. Entries can be split or coalesced relative to source messages; see "Message". May be empty. |
 | `agents`         | array  | The coding agent(s) and model(s) that produced this commit's sessions ("provenance"), including exact per-agent/model token totals where reported. See "Agent". May be empty or absent. |
 | `tokens`         | object | The **exact total** token usage of the whole conversation that led to this commit — the sum of every turn's usage. See "TokenCount". **Absent** when no session reported usage for this commit (treat absent as unknown). |
 
@@ -115,14 +115,20 @@ Any of the three text fields may be empty if the conversation had nothing of
 that kind (e.g. a commit whose conversation contained no code edits has an empty
 `ai_implemented`).
 
+Generation uses one model request for every `UserWrote` entry, one for each
+non-empty aggregate category, and one for `meta`. There is no cap on the number
+of user entries summarized, and each call receives the complete retained prompt.
+Batch generation processes up to eight commits concurrently; individual requests
+are globally limited to 24 in flight.
+
 ## Message (an element of `messages`)
 
 ```jsonc
 {
-  "kind": "AiChanged",        // string enum — see below
-  "summary": "…",             // string — concise summary
-  "content": "…",             // string — complete source text (optional)
-  "changes": [ … ],           // array of change objects
+  "kind": "UserWrote",        // string enum — see below
+  "summary": "…",             // string — present only for UserWrote
+  "content": "…",             // string — complete source text
+  "changes": [],              // array of change objects
   "timestamp": "2026-06-20T11:19:46Z",  // string (RFC 3339) or null
   "tokens": { … }             // object — token usage (optional; see "TokenCount")
 }
@@ -131,7 +137,7 @@ that kind (e.g. a commit whose conversation contained no code edits has an empty
 | Field       | JSON type | Meaning |
 |-------------|-----------|---------|
 | `kind`      | string    | One of `"UserWrote"`, `"AiWrote"`, `"AiChanged"` (see below). |
-| `summary`   | string    | A concise summary of this entry. Source text of at most 320 characters is copied verbatim; longer prose is summarized by the LLM. Long user and assistant text is processed in bounded, ordered chunks and then reduced, so the complete `content` contributes to the summary without requiring one unbounded model request. The 320-character threshold affects only whether an LLM call is needed and never limits `content`. |
+| `summary`   | string    | A concise LLM-generated summary. Present on every newly generated `UserWrote` entry and absent on `AiWrote` and `AiChanged`. The complete `content` is supplied to the model without a character cutoff. |
 | `content`   | string    | The complete plain-text source underlying a `UserWrote` or `AiWrote` entry, regardless of length. If consecutive source entries were coalesced, their texts are joined with a blank line. Absent for `AiChanged` entries and files written before source retention was added. This is plain-text content extracted from the normalized session, not the original structured message JSON. |
 | `changes`   | array     | The concrete code edits this message made. **Non-empty only when `kind` is `"AiChanged"`**; an empty array otherwise. See "Change". |
 | `timestamp` | string \| null | When the entry occurred, as an RFC 3339 / ISO 8601 UTC timestamp (e.g. `"2026-06-20T11:19:46Z"`, sometimes with fractional seconds like `"…46.071Z"`). A coalesced entry keeps the first source timestamp. `null` is permitted for compatibility, although newly generated commit entries come from timestamped messages. |
@@ -149,7 +155,11 @@ One source assistant message can produce both an `AiWrote` entry for its text an
 an `AiChanged` entry for its editing tool calls. After that split, consecutive
 entries of the same `kind` are merged. For example, a run of code-editing steps
 appears as one `AiChanged` entry whose `changes` array contains all edits.
-Entries are in chronological order.
+Entries are in chronological order. Every `UserWrote` entry is summarized from
+its complete `content`. `AiWrote` and `AiChanged` never receive individual
+summarization calls: consumers can derive assistant-text previews from the
+beginning of `content`, and describe editing activity using the number and paths
+of distinct files in `changes`.
 
 ## Change (an element of a message's `changes`)
 
@@ -287,7 +297,6 @@ A consumer should know the file's boundaries:
           },
           {
             "kind": "AiWrote",
-            "summary": "Outlined an exponential-backoff approach and where the timeout would be configured.",
             "content": "I’ll add a small exponential-backoff helper around the request path. The timeout can come from REQUEST_TIMEOUT with a default when it is unset.",
             "changes": [],
             "timestamp": "2026-06-20T09:14:20Z",
@@ -295,7 +304,6 @@ A consumer should know the file's boundaries:
           },
           {
             "kind": "AiChanged",
-            "summary": "Added the retry helper and read the timeout from the environment.",
             "changes": [
               {
                 "tool": "Write",
@@ -346,7 +354,6 @@ A consumer should know the file's boundaries:
           },
           {
             "kind": "AiChanged",
-            "summary": "Fixed the spelling of \"recieve\" to \"receive\".",
             "changes": [
               {
                 "tool": "Edit",

@@ -273,17 +273,17 @@ pub struct CodeChange {
     pub diff: String,
 }
 
-/// LLM summary of one message within a commit group, plus — for `AiChanged`
-/// messages — the concrete code changes it made.
+/// One conversation entry within a commit group.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageSummary {
     pub kind: MessageKind,
-    /// 2-3 sentence summary of this message (or the message verbatim if short).
-    pub summary: String,
+    /// LLM-generated summary for [`MessageKind::UserWrote`]. Newly generated
+    /// assistant-text and editing entries always leave this absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
     /// Complete source text for user and assistant-text entries, regardless of
     /// length. Consecutive source messages represented by one coalesced entry
-    /// are joined with blank lines. Absent for code-change entries and caches
-    /// written before source retention was added.
+    /// are joined with blank lines. Absent for code-change entries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     /// Non-empty only for [`MessageKind::AiChanged`].
@@ -298,9 +298,10 @@ pub struct MessageSummary {
 /// LLM-generated summary of what went into a commit.
 ///
 /// Produced by the [`crate::summarize::Summarizer`]. The three top-level fields
-/// are the *aggregated* overview; [`messages`](Self::messages) holds the
-/// per-message breakdown that drives the middle pane of the app. A field is
-/// empty when the commit group has nothing of that kind.
+/// are the *aggregated* overview; [`messages`](Self::messages) holds a
+/// breakdown that drives the middle pane of the app. Only user entries receive
+/// per-entry LLM summaries. A field is empty when the commit group has nothing
+/// of that kind.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CommitSummary {
     /// 3-5 sentences: what the user asked for across all their messages.
@@ -309,7 +310,7 @@ pub struct CommitSummary {
     pub ai_answered: String,
     /// 3-5 sentences: what the assistant implemented in code (file edits).
     pub ai_implemented: String,
-    /// Per-message summaries, in chronological order.
+    /// Locally-derived conversation entries, in chronological order.
     pub messages: Vec<MessageSummary>,
     /// Coding agent(s) + model(s) that produced this commit's sessions,
     /// including exact per-pair token totals when reported.

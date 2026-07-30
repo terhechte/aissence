@@ -7,8 +7,8 @@
 //! *Summarize* and *Ignore* buttons. Panes:
 //!
 //! - **left**: commits, each with a one-line summary (ignored ones faded),
-//! - **middle**: Summarize/Ignore buttons + the per-message summaries for the
-//!   selected commit (user wrote / ai wrote / ai changed),
+//! - **middle**: Summarize/Ignore buttons + summarized user prompts and local
+//!   previews for assistant text/changes,
 //! - **right** (toggleable, hidden by default): syntax-highlighted code changes
 //!   — the whole commit diff, or the edits of a selected "ai changed" message.
 //!
@@ -21,8 +21,8 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use aissence::{
-    CoalescedHistory, CommitGroup, CommitSummary, DiffView, MessageKind, SummarizationCost,
-    Summarizer, SummaryStore, TokenCount, analyze, git, persist, summarize,
+    CoalescedHistory, CommitGroup, CommitSummary, DiffView, MAX_CONCURRENT_GROUPS, MessageKind,
+    SummarizationCost, Summarizer, SummaryStore, TokenCount, analyze, git, persist, summarize,
 };
 use eframe::egui;
 use elegance::{Accent, Button, Callout, CalloutTone, Card, Spinner, Theme};
@@ -33,10 +33,6 @@ const AI_COLOR: egui::Color32 = egui::Color32::from_rgb(152, 195, 121); // green
 const CHANGE_COLOR: egui::Color32 = egui::Color32::from_rgb(229, 192, 123); // yellow
 const DIM: egui::Color32 = egui::Color32::from_gray(140);
 const DISABLED: egui::Color32 = egui::Color32::from_gray(90); // faded / ignored
-
-/// How many commits "Summarize all" works on at once (each one also fans out
-/// internally), to avoid flooding the API with requests.
-const MAX_CONCURRENT_SUMMARIES: usize = 4;
 
 fn main() -> eframe::Result {
     let folder = match folder_from_args() {
@@ -210,6 +206,9 @@ impl AissenceApp {
                     || summary.agents != current_agents;
                 summarize::attach_token_usage(group, &mut summary);
                 let content_backfill = summarize::attach_source_content(group, &mut summary);
+                if !summarize::has_required_user_summaries(group, &summary) {
+                    continue;
+                }
                 if token_backfill || content_backfill {
                     backfills.push((commit_id, signature, summary.clone()));
                 }
@@ -361,9 +360,9 @@ impl AissenceApp {
             .collect()
     }
 
-    /// Start summarizing queued commits, up to [`MAX_CONCURRENT_SUMMARIES`].
+    /// Start summarizing queued commits, up to [`MAX_CONCURRENT_GROUPS`].
     fn pump_queue(&mut self, history: &CoalescedHistory, ctx: &egui::Context) {
-        while self.in_progress.len() < MAX_CONCURRENT_SUMMARIES {
+        while self.in_progress.len() < MAX_CONCURRENT_GROUPS {
             let Some(queued) = self.queue.pop_front() else {
                 break;
             };
@@ -513,11 +512,14 @@ impl AissenceApp {
                     if self.summarizer.is_none() {
                         button.on_disabled_hover_text("Set OPENROUTER_API_KEY");
                     }
-                    let outstanding = self.queue.len() + self.in_progress.len();
+                    let active = self.in_progress.len();
+                    let queued = self.queue.len();
+                    let outstanding = queued + active;
                     if outstanding > 0 {
                         ui.add(Spinner::new().size(16.0));
                         ui.label(
-                            egui::RichText::new(format!("{outstanding} summarizing")).color(DIM),
+                            egui::RichText::new(format!("{active} active · {queued} queued"))
+                                .color(DIM),
                         );
                     }
                     let changes_label = if self.show_changes {
@@ -812,11 +814,22 @@ impl AissenceApp {
 
         if message.kind == MessageKind::AiChanged {
             // Selectable: clicking shows this message's edits on the right.
-            let files: Vec<&str> = message.changes.iter().map(|c| c.file.as_str()).collect();
+            let mut seen = HashSet::new();
+            let files: Vec<&str> = message
+                .changes
+                .iter()
+                .map(|change| change.file.as_str())
+                .filter(|file| seen.insert(*file))
+                .collect();
+            let activity = match files.len() {
+                0 => "Editing activity".to_string(),
+                1 => "Changed 1 file".to_string(),
+                count => format!("Changed {count} files"),
+            };
             let label = if files.is_empty() {
-                message.summary.clone()
+                activity
             } else {
-                format!("{}\n— {}", message.summary, files.join(", "))
+                format!("{activity}\n— {}", files.join(", "))
             };
             if ui
                 .selectable_label(self.selected_message == Some(index), label)
@@ -824,8 +837,21 @@ impl AissenceApp {
             {
                 self.selected_message = Some(index);
             }
+        } else if message.kind == MessageKind::UserWrote {
+            let text = message
+                .summary
+                .as_deref()
+                .or(message.content.as_deref())
+                .map(message_preview)
+                .unwrap_or_else(|| "Source text unavailable.".to_string());
+            ui.label(text);
         } else {
-            ui.label(&message.summary);
+            let preview = message
+                .content
+                .as_deref()
+                .map(message_preview)
+                .unwrap_or_else(|| "Source text unavailable.".to_string());
+            ui.label(preview);
         }
     }
 
@@ -862,6 +888,18 @@ fn fmt_count(n: u64) -> String {
     } else {
         n.to_string()
     }
+}
+
+/// Short, local preview for retained user and assistant source text.
+fn message_preview(content: &str) -> String {
+    const MAX_CHARS: usize = 320;
+    let normalized = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= MAX_CHARS {
+        return normalized;
+    }
+    let mut preview: String = normalized.chars().take(MAX_CHARS).collect();
+    preview.push('…');
+    preview
 }
 
 fn batch_report(batch: &SummaryBatch) -> (String, CalloutTone) {
@@ -1050,5 +1088,15 @@ mod tests {
         let (report, _) = batch_report(&batch);
         assert!(report.contains("Reported cost is $0.020000"));
         assert!(report.contains("actual total may be higher"));
+    }
+
+    #[test]
+    fn message_preview_is_local_normalized_and_bounded() {
+        assert_eq!(message_preview("first\n\nsecond"), "first second");
+
+        let long = "x".repeat(321);
+        let preview = message_preview(&long);
+        assert_eq!(preview.chars().count(), 321);
+        assert!(preview.ends_with('…'));
     }
 }
