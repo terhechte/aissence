@@ -223,11 +223,18 @@ impl AissenceApp {
                 if !summarize::has_required_user_summaries(group, &summary) {
                     continue;
                 }
-                let core_backfill = summarize::attach_core_fallbacks(group, &mut summary);
                 if !summarize::has_required_core_summaries(group, &summary) {
                     continue;
                 }
-                if self.meta_summaries_enabled && !summarize::has_required_meta_summary(&summary) {
+                let core_backfill = if self.meta_summaries_enabled {
+                    summarize::attach_core_fallbacks(group, &mut summary)
+                } else {
+                    false
+                };
+                if self.meta_summaries_enabled
+                    && (!summarize::has_required_extended_summaries(group, &summary)
+                        || !summarize::has_required_meta_summary(&summary))
+                {
                     continue;
                 }
                 if token_backfill || content_backfill || core_backfill {

@@ -332,10 +332,10 @@ pub struct MessageSummary {
 
 /// Summary data for what went into a commit.
 ///
-/// Produced by the [`crate::summarize::Summarizer`]. The three aggregate fields
-/// are always generated when their source category is present. `meta` remains
-/// optional. [`messages`](Self::messages) holds the conversation breakdown;
-/// only user entries receive per-entry LLM summaries.
+/// Produced by the [`crate::summarize::Summarizer`]. `ai_answered` is generated
+/// when assistant evidence is present. The other aggregate fields are optional
+/// extended summaries. [`messages`](Self::messages) holds the conversation
+/// breakdown; only user entries receive per-entry LLM summaries.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CommitSummary {
     /// Locally combined summaries of what the user asked for.

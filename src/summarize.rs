@@ -3,12 +3,11 @@
 //!
 //! For each [`CommitGroup`] we summarize every user entry and retain assistant
 //! entries locally. Trivially short user entries are kept verbatim; the rest
-//! are summarized in batched requests. The user-entry summaries are combined
-//! locally into *user requested*. One additional, strictly bounded request —
-//! issued concurrently with the user-entry summaries — derives *ai answered*
-//! and *ai implemented* from bounded raw user evidence, terminal assistant
-//! text, and an authoritative git fingerprint. A longer cohesive `meta`
-//! overview remains optional.
+//! are summarized in batched requests. One additional, strictly bounded
+//! request — issued concurrently with the user-entry summaries — derives
+//! *ai answered*. Optional extended summaries also combine the prompt summaries
+//! locally into *user requested*, derive *ai implemented* from an authoritative
+//! git fingerprint, and synthesize a longer cohesive `meta` overview.
 //!
 //! The three categories are derived from the chat itself:
 //! - **user**: [`ncs::Role::User`] message text,
@@ -246,8 +245,9 @@ impl Summarizer {
         self.provider.as_deref()
     }
 
-    /// Enable or disable the optional long `meta` overview. The three core
-    /// aggregate fields are generated regardless.
+    /// Enable or disable extended aggregate summaries. When enabled this adds
+    /// `user_requested`, `ai_implemented`, and the long `meta` overview.
+    /// Per-user-prompt summaries and `ai_answered` are always generated.
     pub fn with_meta_summaries(mut self, enabled: bool) -> Self {
         self.meta_summaries = enabled;
         self
@@ -352,9 +352,18 @@ impl Summarizer {
         // them — one model round trip less on the per-group critical path.
         let (entry_summaries, (ai_answered, ai_implemented)) = futures::try_join!(
             self.summarize_user_entries(&items, costs),
-            self.summarize_core_outcome(&items, group.commit.as_ref(), costs),
+            self.summarize_core_outcome(&items, group.commit.as_ref(), self.meta_summaries, costs),
         )?;
-        let user_requested = aggregate_user_requests(&items, &entry_summaries);
+        let user_requested = if self.meta_summaries {
+            aggregate_user_requests(&items, &entry_summaries)
+        } else {
+            String::new()
+        };
+        let ai_implemented = if self.meta_summaries {
+            ai_implemented
+        } else {
+            String::new()
+        };
         let meta = if self.meta_summaries {
             self.meta_summary(
                 &user_requested,
@@ -403,24 +412,35 @@ impl Summarizer {
         &self,
         items: &[RawItem],
         commit: Option<&crate::model::CommitInfo>,
+        include_implementation: bool,
         costs: &CostTracker,
     ) -> Result<(String, String), Error> {
-        let input = core_summary_input(items, commit);
+        let input = core_summary_input(items, commit, include_implementation);
         if !input.has_answer && !input.has_implementation {
             return Ok((String::new(), String::new()));
         }
 
         let fallback = fallback_core_outcome(items, commit);
+        let system = if include_implementation {
+            "You create two concise commit-level summaries from bounded evidence. \
+             Return one JSON object with exactly the string fields \"ai_answered\" and \
+             \"ai_implemented\". ai_answered states what the assistant concluded, \
+             explained, validated, or warned about; ignore intentions and progress \
+             updates. ai_implemented states only behavior actually supported by the \
+             committed implementation fingerprint; never treat a plan as completed \
+             work. Use 1-3 compact sentences per non-empty field. Use an empty string \
+             only when that category has no evidence. Output JSON only."
+        } else {
+            "Create one concise commit-level summary from bounded conversation evidence. \
+             Return one JSON object with exactly the string fields \"ai_answered\" and \
+             \"ai_implemented\". ai_answered states what the assistant concluded, \
+             explained, validated, or warned about; ignore intentions and progress \
+             updates. Always return an empty string for ai_implemented. Use 1-3 compact \
+             sentences for ai_answered. Output JSON only."
+        };
         let text = self
             .complete(
-                "You create two concise commit-level summaries from bounded evidence. \
-                 Return one JSON object with exactly the string fields \"ai_answered\" and \
-                 \"ai_implemented\". ai_answered states what the assistant concluded, \
-                 explained, validated, or warned about; ignore intentions and progress \
-                 updates. ai_implemented states only behavior actually supported by the \
-                 committed implementation fingerprint; never treat a plan as completed \
-                 work. Use 1-3 compact sentences per non-empty field. Use an empty string \
-                 only when that category has no evidence. Output JSON only.",
+                system,
                 input.prompt,
                 350,
                 SummarizationRequestKind::CoreOutcome,
@@ -859,30 +879,42 @@ fn parse_string_array(text: &str) -> Option<Vec<String>> {
 fn core_summary_input(
     items: &[RawItem],
     commit: Option<&crate::model::CommitInfo>,
+    include_implementation: bool,
 ) -> CoreSummaryInput {
     let user = user_evidence(items);
     let assistant = assistant_evidence(items);
-    let implementation = implementation_fingerprint(items, commit);
     let has_answer = items
         .iter()
         .any(|item| item.kind == MessageKind::AiWrote && !item.text.trim().is_empty());
-    let has_implementation = commit.is_some_and(|commit| commit.stats.files_changed > 0)
-        || items
-            .iter()
-            .any(|item| item.kind == MessageKind::AiChanged && !item.changes.is_empty());
+    let has_implementation = include_implementation
+        && (commit.is_some_and(|commit| commit.stats.files_changed > 0)
+            || items
+                .iter()
+                .any(|item| item.kind == MessageKind::AiChanged && !item.changes.is_empty()));
 
     let request = truncate_middle(&user, CORE_USER_CHARS);
     let assistant = truncate_head(&assistant, CORE_ASSISTANT_CHARS);
-    let implementation = truncate_head(&implementation, CORE_IMPLEMENTATION_CHARS);
-    let prompt = format!(
-        "User requests (bounded raw excerpts):\n{}\n\n\
-         Bounded assistant evidence, newest conclusion first:\n{}\n\n\
-         Authoritative implementation fingerprint:\n{}\n\n\
-         Produce the two-field JSON object.",
-        nonempty_or_none(&request),
-        nonempty_or_none(&assistant),
-        nonempty_or_none(&implementation),
-    );
+    let prompt = if include_implementation {
+        let implementation = implementation_fingerprint(items, commit);
+        let implementation = truncate_head(&implementation, CORE_IMPLEMENTATION_CHARS);
+        format!(
+            "User requests (bounded raw excerpts):\n{}\n\n\
+             Bounded assistant evidence, newest conclusion first:\n{}\n\n\
+             Authoritative implementation fingerprint:\n{}\n\n\
+             Produce the two-field JSON object.",
+            nonempty_or_none(&request),
+            nonempty_or_none(&assistant),
+            nonempty_or_none(&implementation),
+        )
+    } else {
+        format!(
+            "User requests (bounded raw excerpts):\n{}\n\n\
+             Bounded assistant evidence, newest conclusion first:\n{}\n\n\
+             Produce the two-field JSON object.",
+            nonempty_or_none(&request),
+            nonempty_or_none(&assistant),
+        )
+    };
     let prompt = truncate_head(&prompt, CORE_PROMPT_CHARS);
 
     CoreSummaryInput {
@@ -1312,11 +1344,17 @@ pub fn has_required_user_summaries(group: &CommitGroup, summary: &CommitSummary)
             })
 }
 
-/// Whether every source category needed by the UI has a core aggregate.
+/// Whether assistant text has its default aggregate summary.
 pub fn has_required_core_summaries(group: &CommitGroup, summary: &CommitSummary) -> bool {
     let items = coalesce_consecutive(raw_items(group));
-    let has_user = items.iter().any(|item| item.kind == MessageKind::UserWrote);
     let has_answer = items.iter().any(|item| item.kind == MessageKind::AiWrote);
+    !has_answer || !summary.ai_answered.trim().is_empty()
+}
+
+/// Whether every optional extended aggregate is present.
+pub fn has_required_extended_summaries(group: &CommitGroup, summary: &CommitSummary) -> bool {
+    let items = coalesce_consecutive(raw_items(group));
+    let has_user = items.iter().any(|item| item.kind == MessageKind::UserWrote);
     let has_implementation = group
         .commit
         .as_ref()
@@ -1325,7 +1363,6 @@ pub fn has_required_core_summaries(group: &CommitGroup, summary: &CommitSummary)
     let present = |text: &str| !text.trim().is_empty();
 
     (!has_user || present(&summary.user_requested))
-        && (!has_answer || present(&summary.ai_answered))
         && (!has_implementation || present(&summary.ai_implemented))
 }
 
@@ -1902,7 +1939,7 @@ mod tests {
             }],
         };
 
-        let input = core_summary_input(&items, Some(&commit));
+        let input = core_summary_input(&items, Some(&commit), true);
         assert!(input.prompt.chars().count() <= CORE_PROMPT_CHARS);
         assert!(input.prompt.contains("fix it"));
         assert!(input.prompt.contains("Final result: tests pass."));
@@ -1911,6 +1948,10 @@ mod tests {
         assert!(!input.prompt.contains("SECRET_MIDDLE"));
         assert!(input.has_answer);
         assert!(input.has_implementation);
+
+        let default_input = core_summary_input(&items, Some(&commit), false);
+        assert!(!default_input.prompt.contains("M src/lib.rs"));
+        assert!(!default_input.has_implementation);
     }
 
     #[test]

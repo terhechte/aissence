@@ -20,8 +20,10 @@ state, and recent errors. Estimates are replaced with exact provider counts
 when a request completes. Set `NO_COLOR=1` to disable the animation and ANSI
 color sequences.
 
-The command always performs a fresh run with meta summaries enabled. It writes
-both files to the current directory rather than choosing the source folder:
+The command performs a fresh run and, by default, skips the redundant
+`User requested`, `AI implemented`, and `Overview` summaries. Pass
+`--meta-summaries` to include those extended summaries. It writes both files to
+the current directory rather than choosing the source folder:
 
 - `inclusionai-ling-2.6-flash.aissence` — the model-specific summary cache
 - `inclusionai-ling-2.6-flash-stats.md` — elapsed time, reported OpenRouter

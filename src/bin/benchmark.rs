@@ -18,7 +18,10 @@ use tokio::sync::mpsc;
 
 const USAGE: &str = "\
 Usage:
-  aissence-benchmark --model <MODEL> --source-folder <FOLDER>
+  aissence-benchmark --model <MODEL> --source-folder <FOLDER> [--meta-summaries]
+
+Options:
+  --meta-summaries     Also generate User requested, AI implemented, and Overview
 
 Environment:
   OPENROUTER_API_KEY    Required OpenRouter API key
@@ -29,6 +32,7 @@ Environment:
 struct Args {
     model: String,
     source_folder: PathBuf,
+    meta_summaries: bool,
 }
 
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -349,7 +353,7 @@ async fn run() -> Result<(), String> {
         .filter(|provider| !provider.is_empty());
     let summarizer = Summarizer::new_with_provider(api_key, &args.model, provider)
         .map_err(|error| error.to_string())?
-        .with_meta_summaries(true);
+        .with_meta_summaries(args.meta_summaries);
 
     eprintln!(
         "Summarizing {} group(s) and {} prompt(s) with `{}` …",
@@ -421,11 +425,13 @@ async fn run() -> Result<(), String> {
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Args>, String> {
     let mut model = None;
     let mut source_folder = None;
+    let mut meta_summaries = false;
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => return Ok(None),
+            "--meta-summaries" => meta_summaries = true,
             "--model" | "-m" => {
                 model = Some(
                     args.next()
@@ -456,6 +462,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Args>, St
     Ok(Some(Args {
         model,
         source_folder,
+        meta_summaries,
     }))
 }
 
@@ -576,11 +583,17 @@ fn append_sample(markdown: &mut String, position: &str, sample: Option<PromptSam
     .unwrap();
     append_quote(markdown, sample.prompt);
 
-    writeln!(markdown, "\n### {position} meta summaries (all)").unwrap();
-    append_named_summary(markdown, "User requested", &sample.group.user_requested);
+    writeln!(markdown, "\n### {position} aggregate summaries").unwrap();
+    if !sample.group.user_requested.trim().is_empty() {
+        append_named_summary(markdown, "User requested", &sample.group.user_requested);
+    }
     append_named_summary(markdown, "AI answered", &sample.group.ai_answered);
-    append_named_summary(markdown, "AI implemented", &sample.group.ai_implemented);
-    append_named_summary(markdown, "Overview", &sample.group.meta);
+    if !sample.group.ai_implemented.trim().is_empty() {
+        append_named_summary(markdown, "AI implemented", &sample.group.ai_implemented);
+    }
+    if !sample.group.meta.trim().is_empty() {
+        append_named_summary(markdown, "Overview", &sample.group.meta);
+    }
 }
 
 fn append_named_summary(markdown: &mut String, heading: &str, text: &str) {
@@ -668,8 +681,27 @@ mod tests {
             Args {
                 model: "vendor/model".to_string(),
                 source_folder: PathBuf::from("../project"),
+                meta_summaries: false,
             }
         );
+    }
+
+    #[test]
+    fn meta_summaries_are_opt_in() {
+        let args = parse_args(
+            [
+                "--model",
+                "vendor/model",
+                "--source-folder",
+                "../project",
+                "--meta-summaries",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(args.meta_summaries);
     }
 
     #[test]
@@ -781,5 +813,44 @@ mod tests {
         assert!(stats.contains("> Aggregate answer"));
         assert!(stats.contains("> Aggregate implementation"));
         assert!(stats.contains("> Complete overview"));
+    }
+
+    #[test]
+    fn stats_omit_disabled_extended_summary_sections() {
+        let summary = CommitSummary {
+            ai_answered: "Aggregate answer".into(),
+            messages: vec![aissence::MessageSummary {
+                kind: MessageKind::UserWrote,
+                summary: Some("Prompt summary".into()),
+                content: None,
+                changes: vec![],
+                timestamp: None,
+                tokens: None,
+            }],
+            ..Default::default()
+        };
+        let history = CoalescedHistory {
+            folder: PathBuf::from("/source"),
+            groups: vec![aissence::CommitGroup {
+                commit: None,
+                messages: vec![],
+                summary: Some(summary),
+            }],
+            undated: vec![],
+            warnings: vec![],
+        };
+
+        let stats = stats_markdown(
+            "vendor/model",
+            Path::new("/source"),
+            Duration::ZERO,
+            SummarizationCost::default(),
+            &history,
+        );
+
+        assert!(stats.contains("#### AI answered"));
+        assert!(!stats.contains("#### User requested"));
+        assert!(!stats.contains("#### AI implemented"));
+        assert!(!stats.contains("#### Overview"));
     }
 }
