@@ -280,7 +280,7 @@
                 <small>{String(index + 1).padStart(2, '0')}</small>
               </span>
             </div>
-            <div><h3>{commit.title || `Commit ${commit.commit_hash.slice(0, 10)}`}</h3><p>{promptBlurb(commit)}</p><span>{commit.commit_agents.map((agent: any) => `${agent.provider}${agent.model ? ` · ${agent.model}` : ''}`).join(' / ') || 'Agent unknown'}</span></div>
+            <div><h3>{commit.title || `Commit ${commit.commit_hash.slice(0, 10)}`}</h3><PromptMarkdown content={promptBlurb(commit)} /><span>{commit.commit_agents.map((agent: any) => `${agent.provider}${agent.model ? ` · ${agent.model}` : ''}`).join(' / ') || 'Agent unknown'}</span></div>
             <div class="token-cell">
               <strong>{formatCount(commit.token_input)} in <em>{formatUsd(commit.input_cost_usd)}</em></strong>
               <strong>{formatCount(commit.token_output)} out <em>{formatUsd(commit.output_cost_usd)}</em></strong>
@@ -297,7 +297,7 @@
               <div class="commit-meta"><span>{formatDate(commit.committed_at)}</span><span>{commit.commit_hash.slice(0, 10)}</span></div>
               <div>
                 <div class="summary-grid">
-                  <div><span>Assistant summary</span><p>{commit.ai_answered}</p></div>
+                  <div><span>Assistant summary</span><PromptMarkdown content={commit.ai_answered} /></div>
                   <div><span>Changed</span><p>{changedSummary(commit)}</p></div>
                 </div>
 
@@ -318,7 +318,7 @@
                           <span>asked</span>
                           <time>{messageTime(turn.asked)}</time>
                           <div>
-                            <p>{turn.asked.summary}</p>
+                            <PromptMarkdown content={turn.asked.summary} />
                             {#if isEntitled}
                               {@const content = sourceContent(turn.asked)}
                               {#if content}
@@ -730,7 +730,7 @@
     margin: 0;
     font: 400 22px/1.25 'Instrument Serif', Georgia, serif;
   }
-  .commit-row > div:nth-child(2) p {
+  .commit-row > div:nth-child(2) :global(.prompt-markdown) {
     display: -webkit-box;
     overflow: hidden;
     -webkit-box-orient: vertical;
@@ -739,10 +739,9 @@
     max-width: 48em;
     margin: 4px 0 8px;
     color: var(--soft);
-    font-size: 14px;
-    line-height: 1.45;
+    font: 400 14px/1.45 Newsreader, Georgia, serif;
   }
-  article.open .commit-row > div:nth-child(2) p {
+  article.open .commit-row > div:nth-child(2) :global(.prompt-markdown) {
     display: block;
     overflow: visible;
     max-width: 54em;
