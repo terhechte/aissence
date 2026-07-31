@@ -1,5 +1,6 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
+  import { repositoryFields } from '$lib/aissence/project';
   import { parseAissence, AissenceValidationError } from '$lib/aissence/schema';
   import { getBrowserSupabase } from '$lib/supabase/client';
   import { slugify } from '$lib/utils';
@@ -10,6 +11,11 @@
   let name = $state('');
   let slug = $state('');
   let slugTouched = $state(false);
+  let tagline = $state('');
+  let description = $state('');
+  let productUrl = $state('');
+  let repositoryLabel = $state('');
+  let repositoryUrl = $state('');
   let busy = $state(false);
   let status = $state('');
   let error = $state('');
@@ -18,6 +24,16 @@
   function setName(value: string) {
     name = value;
     if (!slugTouched) slug = slugify(value);
+  }
+
+  function prefillProjectFields(project: { name?: string; repository?: string } | undefined) {
+    if (!project) return;
+    if (project.name) setName(project.name);
+    if (project.repository) {
+      const repository = repositoryFields(project.repository);
+      repositoryLabel = repository.label;
+      repositoryUrl = repository.url;
+    }
   }
 
   async function inspectFile(file: File | undefined) {
@@ -35,6 +51,7 @@
     try {
       const parsed = parseAissence(await file.text());
       projectFile = file;
+      prefillProjectFields(parsed.file.project);
       fileSummary = {
         commits: parsed.snapshot.commits.length,
         warnings: parsed.warnings.length
@@ -208,23 +225,23 @@
         </div>
         <div class="field wide">
           <label for="tagline">Tagline</label>
-          <input id="tagline" name="tagline" required maxlength="240" />
+          <input id="tagline" name="tagline" required maxlength="240" bind:value={tagline} />
         </div>
         <div class="field wide">
           <label for="description">Description</label>
-          <textarea id="description" name="description" required maxlength="3000"></textarea>
+          <textarea id="description" name="description" required maxlength="3000" bind:value={description}></textarea>
         </div>
         <div class="field">
           <label for="product_url">Product URL <span>(optional)</span></label>
-          <input id="product_url" name="product_url" type="url" pattern="https://.*" placeholder="https://" />
+          <input id="product_url" name="product_url" type="url" pattern="https://.*" placeholder="https://" bind:value={productUrl} />
         </div>
         <div class="field">
           <label for="repository_label">Repository label <span>(optional)</span></label>
-          <input id="repository_label" name="repository_label" placeholder="owner/repository" />
+          <input id="repository_label" name="repository_label" placeholder="owner/repository" bind:value={repositoryLabel} />
         </div>
         <div class="field wide">
           <label for="repository_url">Repository URL <span>(optional)</span></label>
-          <input id="repository_url" name="repository_url" type="url" pattern="https://.*" placeholder="https://" />
+          <input id="repository_url" name="repository_url" type="url" pattern="https://.*" placeholder="https://" bind:value={repositoryUrl} />
         </div>
       </div>
     </section>

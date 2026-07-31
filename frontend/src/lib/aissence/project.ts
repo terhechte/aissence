@@ -25,6 +25,30 @@ export const projectMetadataSchema = z.object({
     .transform((value) => value || null)
 });
 
+export interface RepositoryFields {
+  label: string;
+  url: string;
+}
+
+/** Convert the repository reference stored in an .aissence file to form fields. */
+export function repositoryFields(repository: string): RepositoryFields {
+  const trimmed = repository.trim().replace(/\/+$/, '');
+  const normalized = trimmed.replace(/^git@github\.com:/i, 'https://github.com/');
+  const match = normalized.match(
+    /^(?:https?:\/\/)?(?:www\.)?github\.com\/([^/\s]+)\/([^/?#\s]+?)(?:\.git)?\/?(?:[?#].*)?$/i
+  );
+
+  if (match) {
+    const label = `${match[1]}/${match[2]}`;
+    return { label, url: `https://github.com/${label}` };
+  }
+
+  return {
+    label: trimmed,
+    url: /^https:\/\//i.test(trimmed) ? trimmed : ''
+  };
+}
+
 export const profileSchema = z.object({
   handle: z
     .string()

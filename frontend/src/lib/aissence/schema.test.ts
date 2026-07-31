@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { projectMetadataSchema, screenshotMetadataSchema } from './project';
+import { projectMetadataSchema, repositoryFields, screenshotMetadataSchema } from './project';
 import { AissenceValidationError, parseAissence } from './schema';
 
 const hash = '8f2a1c4e9b7d6a5f0c3e2b1a4d8c7e6f9a0b1c2d';
@@ -45,8 +45,15 @@ function validFile(overrides: Record<string, unknown> = {}) {
 
 describe('parseAissence', () => {
   it('normalizes a valid v1 file', () => {
-    const result = parseAissence(JSON.stringify(validFile()));
+    const result = parseAissence(
+      JSON.stringify(
+        validFile({
+          project: { name: 'Emyn', repository: 'github.com/terhechte/Emyn' }
+        })
+      )
+    );
     expect(result.file.version).toBe(1);
+    expect(result.file.project).toEqual({ name: 'Emyn', repository: 'github.com/terhechte/Emyn' });
     expect(result.snapshot.commits).toHaveLength(1);
     expect(result.snapshot.commits[0].hash).toBe(hash);
     expect(result.snapshot.commits[0].summary.messages[0].content).toBe('Please add retries.');
@@ -151,6 +158,13 @@ describe('parseAissence', () => {
 });
 
 describe('optional project metadata', () => {
+  it('derives repository fields from a GitHub reference', () => {
+    expect(repositoryFields('github.com/terhechte/Emyn')).toEqual({
+      label: 'terhechte/Emyn',
+      url: 'https://github.com/terhechte/Emyn'
+    });
+  });
+
   it('accepts a project without a repository label', () => {
     const parsed = projectMetadataSchema.parse({
       name: 'Project',

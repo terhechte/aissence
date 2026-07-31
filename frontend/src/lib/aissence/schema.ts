@@ -115,9 +115,17 @@ export const commitEntrySchema = z
   })
   .strip();
 
+export const aissenceProjectSchema = z
+  .object({
+    name: z.string().trim().min(1).max(120).optional(),
+    repository: z.string().trim().min(1).max(240).optional()
+  })
+  .strip();
+
 export const aissenceFileV1Schema = z
   .object({
     version: z.literal(1),
+    project: aissenceProjectSchema.optional(),
     commits: z.record(z.string(), commitEntrySchema),
     ignored: z.array(z.string()).optional().default([])
   })
@@ -161,6 +169,7 @@ export type AissenceMessage = z.infer<typeof messageSchema>;
 export type CommitStats = z.infer<typeof commitStatsSchema>;
 export type CommitSummary = z.infer<typeof commitSummarySchema>;
 export type CommitEntry = z.infer<typeof commitEntrySchema>;
+export type AissenceProject = z.infer<typeof aissenceProjectSchema>;
 export type AissenceFileV1 = z.infer<typeof aissenceFileV1Schema>;
 
 export interface NormalizedCommit extends CommitEntry {
