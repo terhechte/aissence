@@ -14,6 +14,12 @@ cargo run --bin aissence-benchmark -- \
 
 Set `OPENROUTER_API_KEY` first. `OPENROUTER_PROVIDER` remains optional.
 
+In an interactive terminal, the benchmark shows a live request dashboard with
+in-flight request types, elapsed time, streaming output-token estimates, retry
+state, and recent errors. Estimates are replaced with exact provider counts
+when a request completes. Set `NO_COLOR=1` to disable the animation and ANSI
+color sequences.
+
 The command always performs a fresh run with meta summaries enabled. It writes
 both files to the current directory rather than choosing the source folder:
 

@@ -26,12 +26,14 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures::stream::{self, StreamExt, TryStreamExt};
 use openrouter_rs::OpenRouterClient;
-use openrouter_rs::api::chat::{ChatCompletionRequest, Message};
+use openrouter_rs::api::chat::{ChatCompletionRequest, Message, StreamOptions};
 use openrouter_rs::error::OpenRouterError;
+use openrouter_rs::types::completion::ResponseUsage;
 use openrouter_rs::types::{ProviderPreferences, Role as OrRole};
 use serde::Deserialize;
 use tokio::sync::Semaphore;
@@ -97,6 +99,62 @@ pub struct SummarizationCost {
     pub unpriced_request_count: usize,
 }
 
+/// The kind of model request currently being executed.
+///
+/// This is intentionally small and stable so front-ends can present request
+/// progress without needing to know how prompts are assembled internally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummarizationRequestKind {
+    /// A request summarizing one or more user entries.
+    UserBatch { entries: usize },
+    /// The compact request that derives the answer and implementation fields.
+    CoreOutcome,
+    /// The optional long-form overview request.
+    MetaSummary,
+}
+
+/// Token and billing usage reported when one request completes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SummarizationRequestUsage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub total_tokens: u32,
+    pub cost: Option<f64>,
+}
+
+/// Live progress emitted by [`Summarizer::with_progress`].
+///
+/// While a request is streaming, [`Self::TokensReceived`] is an estimate based
+/// on received text. The completed event contains the provider's exact usage
+/// when OpenRouter returned it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SummarizationProgress {
+    Started {
+        id: usize,
+        kind: SummarizationRequestKind,
+    },
+    TokensReceived {
+        id: usize,
+        tokens: usize,
+    },
+    Retrying {
+        id: usize,
+        kind: SummarizationRequestKind,
+        attempt: usize,
+        error: String,
+    },
+    Completed {
+        id: usize,
+        kind: SummarizationRequestKind,
+        usage: Option<SummarizationRequestUsage>,
+    },
+    Failed {
+        id: usize,
+        kind: SummarizationRequestKind,
+        error: String,
+    },
+}
+
 impl SummarizationCost {
     pub fn add(&mut self, other: Self) {
         self.usd += other.usd;
@@ -130,6 +188,8 @@ pub struct Summarizer {
     provider: Option<String>,
     meta_summaries: bool,
     request_limit: Arc<Semaphore>,
+    progress: Option<Arc<dyn Fn(SummarizationProgress) + Send + Sync>>,
+    next_request_id: AtomicUsize,
 }
 
 impl Summarizer {
@@ -171,6 +231,8 @@ impl Summarizer {
             provider,
             meta_summaries: false,
             request_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
+            progress: None,
+            next_request_id: AtomicUsize::new(0),
         })
     }
 
@@ -188,6 +250,19 @@ impl Summarizer {
     /// aggregate fields are generated regardless.
     pub fn with_meta_summaries(mut self, enabled: bool) -> Self {
         self.meta_summaries = enabled;
+        self
+    }
+
+    /// Attach a callback that receives live request progress.
+    ///
+    /// Enabling progress also switches requests to OpenRouter's streaming
+    /// endpoint so token estimates can be updated while a response is in
+    /// flight. Callbacks should be quick; they run on the request task.
+    pub fn with_progress<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(SummarizationProgress) + Send + Sync + 'static,
+    {
+        self.progress = Some(Arc::new(callback));
         self
     }
 
@@ -348,6 +423,7 @@ impl Summarizer {
                  only when that category has no evidence. Output JSON only.",
                 input.prompt,
                 350,
+                SummarizationRequestKind::CoreOutcome,
                 costs,
             )
             .await?;
@@ -417,6 +493,7 @@ impl Summarizer {
                      no preamble.",
                     format!("Complete user prompt:\n\n{}", items[batch[0]].text),
                     300,
+                    SummarizationRequestKind::UserBatch { entries: 1 },
                     costs,
                 )
                 .await?;
@@ -441,6 +518,9 @@ impl Summarizer {
                  same order. Output JSON only.",
                 prompt,
                 max_tokens,
+                SummarizationRequestKind::UserBatch {
+                    entries: batch.len(),
+                },
                 costs,
             )
             .await?;
@@ -467,6 +547,7 @@ impl Summarizer {
                              no preamble.",
                             format!("Complete user prompt:\n\n{}", items[*index].text),
                             300,
+                            SummarizationRequestKind::UserBatch { entries: 1 },
                             costs,
                         )
                         .await?,
@@ -507,7 +588,14 @@ impl Summarizer {
              What the assistant implemented:\n{ai_implemented}\n\n\
              Write the overview (up to 20 sentences)."
         );
-        self.complete(system, user, 1200, costs).await
+        self.complete(
+            system,
+            user,
+            1200,
+            SummarizationRequestKind::MetaSummary,
+            costs,
+        )
+        .await
     }
 
     /// Issue one chat completion and return the assistant's text.
@@ -516,6 +604,7 @@ impl Summarizer {
         system: &'static str,
         user: String,
         max_tokens: u32,
+        kind: SummarizationRequestKind,
         costs: &CostTracker,
     ) -> Result<String, Error> {
         let mut request = ChatCompletionRequest::builder();
@@ -532,10 +621,16 @@ impl Summarizer {
             preferences.order = Some(vec![provider.clone()]);
             request.provider(preferences);
         }
+        if self.progress.is_some() {
+            let mut stream_options = StreamOptions::default();
+            stream_options.include_usage = Some(true);
+            request.stream_options(stream_options);
+        }
         let request = request
             .build()
             .map_err(|e| Error::Llm(format!("request build: {e}")))?;
 
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
         let response = {
             let mut retry = 0;
             loop {
@@ -543,13 +638,37 @@ impl Summarizer {
                     let _permit = self.request_limit.acquire().await.map_err(|_| {
                         Error::Llm("summarization request limiter closed".to_string())
                     })?;
-                    self.client.chat().create(&request).await
+                    if self.progress.is_some() {
+                        self.emit_progress(SummarizationProgress::Started {
+                            id: request_id,
+                            kind,
+                        });
+                        self.stream_completion(&request, request_id).await
+                    } else {
+                        self.client.chat().create(&request).await.map(|response| {
+                            CompletionResponse {
+                                text: response
+                                    .choices
+                                    .first()
+                                    .and_then(|choice| choice.content())
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                usage: response.usage,
+                            }
+                        })
+                    }
                 };
                 match result {
                     Ok(response) => break response,
                     Err(error)
                         if is_retryable_request_error(&error) && retry < MAX_REQUEST_RETRIES =>
                     {
+                        self.emit_progress(SummarizationProgress::Retrying {
+                            id: request_id,
+                            kind,
+                            attempt: retry + 2,
+                            error: error.to_string(),
+                        });
                         tokio::time::sleep(retry_delay(retry)).await;
                         retry += 1;
                     }
@@ -560,22 +679,86 @@ impl Summarizer {
                         } else {
                             String::new()
                         };
+                        self.emit_progress(SummarizationProgress::Failed {
+                            id: request_id,
+                            kind,
+                            error: format!("{error}{suffix}"),
+                        });
                         return Err(Error::Llm(format!("{error}{suffix}")));
                     }
                 }
             }
         };
         costs.record(response.usage.as_ref().and_then(|usage| usage.cost));
+        self.emit_progress(SummarizationProgress::Completed {
+            id: request_id,
+            kind,
+            usage: response.usage.as_ref().map(request_usage),
+        });
 
-        let text = response
-            .choices
-            .first()
-            .and_then(|choice| choice.content())
-            .unwrap_or_default()
-            .trim()
-            .to_string();
+        let text = response.text.trim().to_string();
         Ok(text)
     }
+
+    async fn stream_completion(
+        &self,
+        request: &ChatCompletionRequest,
+        request_id: usize,
+    ) -> Result<CompletionResponse, OpenRouterError> {
+        let mut stream = self.client.chat().stream(request).await?;
+        let mut text = String::new();
+        let mut received_chars = 0;
+        let mut usage = None;
+
+        while let Some(event) = stream.next().await {
+            let response = event?;
+            if let Some(response_usage) = response.usage {
+                usage = Some(response_usage);
+            }
+            for choice in response.choices {
+                if let Some(content) = choice.content() {
+                    text.push_str(content);
+                    received_chars += content.chars().count();
+                }
+                if let Some(reasoning) = choice.reasoning() {
+                    received_chars += reasoning.chars().count();
+                }
+            }
+
+            if received_chars > 0 {
+                self.emit_progress(SummarizationProgress::TokensReceived {
+                    id: request_id,
+                    tokens: estimated_tokens(received_chars),
+                });
+            }
+        }
+
+        Ok(CompletionResponse { text, usage })
+    }
+
+    fn emit_progress(&self, progress: SummarizationProgress) {
+        if let Some(callback) = &self.progress {
+            callback(progress);
+        }
+    }
+}
+
+struct CompletionResponse {
+    text: String,
+    usage: Option<ResponseUsage>,
+}
+
+fn request_usage(usage: &ResponseUsage) -> SummarizationRequestUsage {
+    SummarizationRequestUsage {
+        prompt_tokens: usage.prompt_tokens,
+        completion_tokens: usage.completion_tokens,
+        total_tokens: usage.total_tokens,
+        cost: usage.cost,
+    }
+}
+
+fn estimated_tokens(received_chars: usize) -> usize {
+    received_chars.div_ceil(4)
 }
 
 struct CoreSummaryInput {

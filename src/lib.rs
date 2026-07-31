@@ -49,7 +49,8 @@ pub use model::{
 };
 pub use persist::SummaryStore;
 pub use summarize::{
-    MAX_CONCURRENT_GROUPS, MAX_CONCURRENT_REQUESTS, SummarizationCost, Summarizer,
+    MAX_CONCURRENT_GROUPS, MAX_CONCURRENT_REQUESTS, SummarizationCost, SummarizationProgress,
+    SummarizationRequestKind, SummarizationRequestUsage, Summarizer,
 };
 pub use ui::{CodeView, DiffView};
 
