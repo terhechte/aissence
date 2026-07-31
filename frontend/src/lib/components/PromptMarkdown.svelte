@@ -1,8 +1,9 @@
 <script lang="ts">
   import { micromark } from 'micromark';
+  import { filterPromptNoise } from '$lib/prompt';
 
   let { content }: { content: string } = $props();
-  const rendered = $derived(micromark(content));
+  const rendered = $derived(micromark(filterPromptNoise(content)));
 </script>
 
 <div class="prompt-markdown">{@html rendered}</div>
