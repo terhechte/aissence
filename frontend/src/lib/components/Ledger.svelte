@@ -376,14 +376,6 @@
                   </div>
                 {/if}
 
-                <div class="facts">
-                  <div><span>tokens in</span><strong>{formatCount(commit.token_input)} · {formatUsd(commit.input_cost_usd)}</strong></div>
-                  <div><span>tokens out</span><strong>{formatCount(commit.token_output)} · {formatUsd(commit.output_cost_usd)}</strong></div>
-                  <div><span>estimated API cost</span><strong>{formatUsd(commit.potential_cost_usd)}</strong></div>
-                  <div><span>prompts written</span><strong>{promptCount(commit)}</strong></div>
-                  <div><span>lines</span><strong>{commit.lines_added === null ? 'unknown' : `+${commit.lines_added} / −${commit.lines_deleted}`}</strong></div>
-                  <div><span>files changed</span><strong>{commit.files_changed ?? 'unknown'}</strong></div>
-                </div>
               </div>
             </div>
           {/if}
@@ -807,8 +799,7 @@
     border-top: 1px solid var(--rule2);
   }
   .summary-grid span,
-  .transcript h4,
-  .facts span {
+  .transcript h4 {
     color: var(--accent);
     font: 400 9px/1 'JetBrains Mono', monospace;
     text-transform: uppercase;
@@ -927,24 +918,6 @@
   .activity-summary p {
     color: var(--muted);
     font-style: italic;
-  }
-  .facts {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 32px;
-    margin-top: 27px;
-    border-top: 1px solid var(--rule2);
-    padding-top: 17px;
-  }
-  .facts div {
-    display: grid;
-    gap: 6px;
-  }
-  .facts span {
-    color: var(--faint);
-  }
-  .facts strong {
-    font: 500 12px/1 'JetBrains Mono', monospace;
   }
   footer {
     display: flex;
