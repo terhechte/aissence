@@ -68,6 +68,7 @@ export const load: PageServerLoad = async ({ locals, params, setHeaders }) => {
 
   const normalizedCommits = (commits ?? []).map((commit) => ({
     ...commit,
+    total_prompt_count: (commit.messages ?? []).filter((message: any) => message.kind === 'UserWrote').length,
     commit_agents: [...(commit.commit_agents ?? [])].sort((a, b) => a.sort_order - b.sort_order),
     messages: [...(commit.messages ?? [])]
       .sort((a, b) => a.sort_order - b.sort_order)

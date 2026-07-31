@@ -39,7 +39,7 @@
     );
     const prompts = commits.reduce(
       (total: number, commit: any) =>
-        total + commit.messages.filter((message: any) => message.kind === 'UserWrote').length,
+        total + Number(commit.total_prompt_count ?? commit.messages.filter((message: any) => message.kind === 'UserWrote').length),
       0
     );
     const dated = commits.filter((commit: any) => commit.committed_at);
@@ -119,7 +119,25 @@
   }
 
   function promptCount(commit: any) {
-    return commit.messages.filter((message: any) => message.kind === 'UserWrote').length;
+    return Number(commit.total_prompt_count ?? commit.messages.filter((message: any) => message.kind === 'UserWrote').length);
+  }
+
+  function promptBlurb(commit: any) {
+    const count = promptCount(commit);
+    const firstPrompt = commit.messages.find((message: any) => message.kind === 'UserWrote');
+    const summary = String(firstPrompt?.summary ?? '').trim();
+    if (!summary) return count ? `${count} ${count === 1 ? 'prompt' : 'prompts'}` : 'No prompt summary available.';
+    return count > 1 ? `${count} prompts · ${summary}` : summary;
+  }
+
+  function changedSummary(commit: any) {
+    const files = commit.files_changed;
+    const lines =
+      commit.lines_added == null || commit.lines_deleted == null
+        ? ''
+        : ` · +${commit.lines_added} / −${commit.lines_deleted} lines`;
+    if (files == null) return `Change statistics unavailable${lines}`;
+    return `${files} ${Number(files) === 1 ? 'file' : 'files'} changed${lines}`;
   }
 
   function activityText(replyCount: number, changedFileCount: number) {
@@ -262,7 +280,7 @@
                 <small>{String(index + 1).padStart(2, '0')}</small>
               </span>
             </div>
-            <div><h3>{commit.title || `Commit ${commit.commit_hash.slice(0, 10)}`}</h3><p>{commit.user_requested}</p><span>{commit.commit_agents.map((agent: any) => `${agent.provider}${agent.model ? ` · ${agent.model}` : ''}`).join(' / ') || 'Agent unknown'}</span></div>
+            <div><h3>{commit.title || `Commit ${commit.commit_hash.slice(0, 10)}`}</h3><p>{promptBlurb(commit)}</p><span>{commit.commit_agents.map((agent: any) => `${agent.provider}${agent.model ? ` · ${agent.model}` : ''}`).join(' / ') || 'Agent unknown'}</span></div>
             <div class="token-cell">
               <strong>{formatCount(commit.token_input)} in <em>{formatUsd(commit.input_cost_usd)}</em></strong>
               <strong>{formatCount(commit.token_output)} out <em>{formatUsd(commit.output_cost_usd)}</em></strong>
@@ -279,8 +297,8 @@
               <div class="commit-meta"><span>{formatDate(commit.committed_at)}</span><span>{commit.commit_hash.slice(0, 10)}</span></div>
               <div>
                 <div class="summary-grid">
-                  <div><span>Decided</span><p>{commit.ai_answered || 'No response summary available.'}</p></div>
-                  <div><span>Built</span><p>{commit.ai_implemented || 'No implementation summary available.'}</p></div>
+                  <div><span>Assistant summary</span><p>{commit.ai_answered}</p></div>
+                  <div><span>Changed</span><p>{changedSummary(commit)}</p></div>
                 </div>
 
                 {#if commit.messages.length}
