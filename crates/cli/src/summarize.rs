@@ -60,9 +60,10 @@ use crate::ncs;
 pub const MAX_CONCURRENT_GROUPS: usize = 32;
 /// Maximum number of LLM requests in flight across all commit groups.
 pub const MAX_CONCURRENT_REQUESTS: usize = 24;
-/// Number of retries after the initial request for transient failures.
+/// Number of retries after the initial request for retryable failures.
 /// Provider rate limits (429) can persist well beyond a few seconds when a
-/// batch of groups starts at once, so the budget is generous.
+/// batch of groups starts at once, so the budget is generous. Malformed model
+/// output that fails response validation uses the same bounded budget.
 const DEFAULT_MAX_REQUEST_RETRIES: usize = 7;
 /// Initial grace period before retrying; subsequent waits double.
 const RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
@@ -298,7 +299,7 @@ impl Summarizer {
         self
     }
 
-    /// Set the number of transient retries after the initial upstream call.
+    /// Set the number of retryable failures after the initial upstream call.
     /// The hosted service uses one; local mode retains the more forgiving
     /// default.
     pub fn with_max_request_retries(mut self, retries: usize) -> Self {
@@ -632,37 +633,34 @@ impl Summarizer {
             ));
         }
         let max_tokens = (300 * batch.len() as u32).min(2_400);
-        let text = self
-            .complete(
-                "You summarize several numbered user prompts from a coding session. \
+        self.complete_with_parser(
+            "You summarize several numbered user prompts from a coding session. \
                  For each, preserve every important request, constraint, question, \
                  correction, and reported problem. Return one JSON array of strings \
                  with exactly one concise 2-3 sentence summary per prompt, in the \
                  same order. Output JSON only.",
-                prompt,
-                max_tokens,
-                SummarizationRequestKind::UserBatch {
-                    entries: batch.len(),
-                },
-                costs,
-            )
-            .await?;
-
-        let parsed = parse_string_array(&text).filter(|summaries| {
-            summaries.len() == batch.len()
-                && summaries.iter().all(|summary| !summary.trim().is_empty())
-        });
-        match parsed {
-            Some(summaries) => Ok(summaries
-                .into_iter()
-                .map(|summary| summary.trim().to_string())
-                .collect()),
-            // Do not fan one malformed batch out into N paid calls. The caller
-            // may retry the bounded batch within its normal attempt budget.
-            None => Err(Error::Llm(
-                "model returned an invalid user-summary batch".to_string(),
-            )),
-        }
+            prompt,
+            max_tokens,
+            SummarizationRequestKind::UserBatch {
+                entries: batch.len(),
+            },
+            costs,
+            |text| {
+                parse_string_array(text)
+                    .filter(|summaries| {
+                        summaries.len() == batch.len()
+                            && summaries.iter().all(|summary| !summary.trim().is_empty())
+                    })
+                    .map(|summaries| {
+                        summaries
+                            .into_iter()
+                            .map(|summary| summary.trim().to_string())
+                            .collect()
+                    })
+                    .ok_or_else(|| "model returned an invalid user-summary batch".to_string())
+            },
+        )
+        .await
     }
 
     /// Synthesize the three component summaries into one cohesive overview (up
@@ -714,6 +712,27 @@ impl Summarizer {
         kind: SummarizationRequestKind,
         costs: &CostTracker,
     ) -> Result<String, Error> {
+        self.complete_with_parser(system, user, max_tokens, kind, costs, |text| {
+            Ok(text.trim().to_string())
+        })
+        .await
+    }
+
+    /// Issue chat completions until the response passes `parser` or the shared
+    /// retry budget is exhausted. Successful-but-invalid model responses are
+    /// billed and surfaced as retries just like retryable transport failures.
+    async fn complete_with_parser<T, F>(
+        &self,
+        system: &'static str,
+        user: String,
+        max_tokens: u32,
+        kind: SummarizationRequestKind,
+        costs: &CostTracker,
+        parser: F,
+    ) -> Result<T, Error>
+    where
+        F: Fn(&str) -> Result<T, String>,
+    {
         if self.hosted_policy && self.api != LlmApi::OpenRouter {
             return Err(Error::Llm(
                 "the hosted privacy policy requires the OpenRouter API".to_string(),
@@ -741,57 +760,66 @@ impl Summarizer {
             .map_err(|e| Error::Llm(format!("request build: {e}")))?;
 
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
-        let response = {
-            let mut retry = 0;
-            loop {
-                let result = {
-                    let _permit = self.request_limit.acquire().await.map_err(|_| {
+        let mut retry = 0;
+        loop {
+            let result = {
+                let _permit =
+                    self.request_limit.acquire().await.map_err(|_| {
                         Error::Llm("summarization request limiter closed".to_string())
                     })?;
-                    self.emit_progress(SummarizationProgress::Started {
+                self.emit_progress(SummarizationProgress::Started {
+                    id: request_id,
+                    kind,
+                });
+                match self.send_completion(&request, request_id).await {
+                    Ok(response) => {
+                        let CompletionResponse { text, usage } = response;
+                        costs.record(usage.as_ref().and_then(|usage| usage.cost));
+                        parser(&text)
+                            .map(|parsed| (parsed, usage))
+                            .map_err(|message| CompletionError {
+                                message,
+                                retryable: true,
+                            })
+                    }
+                    Err(error) => Err(error),
+                }
+            };
+            match result {
+                Ok((parsed, usage)) => {
+                    self.emit_progress(SummarizationProgress::Completed {
                         id: request_id,
                         kind,
+                        usage: usage.as_ref().map(request_usage),
                     });
-                    self.send_completion(&request, request_id).await
-                };
-                match result {
-                    Ok(response) => break response,
-                    Err(error) if error.retryable && retry < self.max_request_retries => {
-                        self.emit_progress(SummarizationProgress::Retrying {
-                            id: request_id,
-                            kind,
-                            attempt: retry + 2,
-                            error: error.to_string(),
-                        });
-                        tokio::time::sleep(retry_delay(retry)).await;
-                        retry += 1;
-                    }
-                    Err(error) => {
-                        let attempts = retry + 1;
-                        let suffix = if attempts > 1 {
-                            format!(" after {attempts} attempts")
-                        } else {
-                            String::new()
-                        };
-                        self.emit_progress(SummarizationProgress::Failed {
-                            id: request_id,
-                            kind,
-                            error: format!("{error}{suffix}"),
-                        });
-                        return Err(Error::Llm(format!("{error}{suffix}")));
-                    }
+                    return Ok(parsed);
+                }
+                Err(error) if error.retryable && retry < self.max_request_retries => {
+                    self.emit_progress(SummarizationProgress::Retrying {
+                        id: request_id,
+                        kind,
+                        attempt: retry + 2,
+                        error: error.to_string(),
+                    });
+                    tokio::time::sleep(retry_delay(retry)).await;
+                    retry += 1;
+                }
+                Err(error) => {
+                    let attempts = retry + 1;
+                    let suffix = if attempts > 1 {
+                        format!(" after {attempts} attempts")
+                    } else {
+                        String::new()
+                    };
+                    self.emit_progress(SummarizationProgress::Failed {
+                        id: request_id,
+                        kind,
+                        error: format!("{error}{suffix}"),
+                    });
+                    return Err(Error::Llm(format!("{error}{suffix}")));
                 }
             }
-        };
-        costs.record(response.usage.as_ref().and_then(|usage| usage.cost));
-        self.emit_progress(SummarizationProgress::Completed {
-            id: request_id,
-            kind,
-            usage: response.usage.as_ref().map(request_usage),
-        });
-
-        let text = response.text.trim().to_string();
-        Ok(text)
+        }
     }
 
     fn provider_preferences(&self) -> Option<ProviderPreferences> {
@@ -2124,6 +2152,100 @@ mod tests {
         assert!(!request.contains("\"provider\""));
         assert!(!request.contains("\"stream_options\""));
         assert_eq!(costs.total().unpriced_request_count, 1);
+    }
+
+    #[tokio::test]
+    async fn invalid_user_summary_batch_is_retried() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for content in [
+                "not a JSON array",
+                r#"["First summary.","Second summary."]"#,
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let _request = read_http_request(&mut socket).await;
+                let body = serde_json::json!({
+                    "id": "test-completion",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "local-model",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": content},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {
+                        "prompt_tokens": 4,
+                        "completion_tokens": 2,
+                        "total_tokens": 6
+                    }
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let progress = Arc::new(Mutex::new(Vec::new()));
+        let captured_progress = Arc::clone(&progress);
+        let summarizer = Summarizer::from_config(LlmConfig {
+            api: LlmApi::OpenaiCompatible,
+            base_url: format!("http://{address}/v1"),
+            api_key: None,
+            model: "local-model".to_string(),
+            provider: None,
+        })
+        .unwrap()
+        .with_max_request_retries(1)
+        .with_progress(move |event| captured_progress.lock().unwrap().push(event));
+        let costs = CostTracker::default();
+        let items = vec![
+            item(MessageKind::UserWrote, &"a".repeat(300)),
+            item(MessageKind::UserWrote, &"b".repeat(300)),
+        ];
+
+        let summaries = summarizer
+            .summarize_user_batch(&items, &[0, 1], &costs)
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(summaries, ["First summary.", "Second summary."]);
+        let cost = costs.total();
+        assert_eq!(cost.request_count, 2);
+        assert_eq!(cost.unpriced_request_count, 2);
+        let progress = progress.lock().unwrap();
+        assert_eq!(
+            progress
+                .iter()
+                .filter(|event| matches!(event, SummarizationProgress::Started { .. }))
+                .count(),
+            2
+        );
+        assert!(progress.iter().any(|event| matches!(
+            event,
+            SummarizationProgress::Retrying {
+                attempt: 2,
+                error,
+                ..
+            } if error == "model returned an invalid user-summary batch"
+        )));
+        assert_eq!(
+            progress
+                .iter()
+                .filter(|event| matches!(event, SummarizationProgress::Completed { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !progress
+                .iter()
+                .any(|event| matches!(event, SummarizationProgress::Failed { .. }))
+        );
     }
 
     async fn read_http_request(socket: &mut tokio::net::TcpStream) -> String {
