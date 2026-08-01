@@ -75,3 +75,5 @@ redact-core = "0.8.3"
 redact-ner = { version = "0.8.3", optional = true }
 regex = "1"
 dotenvy = "0.15"
+terminal_size = "0.4"
+unicode-width = "0.2"

@@ -14,7 +14,9 @@ use aissence::{
     CoalescedHistory, CommitSummary, MessageKind, SummarizationCost, SummarizationProgress,
     SummarizationRequestKind, Summarizer, SummaryStore, analyze,
 };
+use terminal_size::{Width, terminal_size};
 use tokio::sync::mpsc;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const USAGE: &str = "\
 Usage:
@@ -41,7 +43,12 @@ const CYAN: &str = "\x1b[38;5;81m";
 const GREEN: &str = "\x1b[38;5;114m";
 const YELLOW: &str = "\x1b[38;5;221m";
 const RED: &str = "\x1b[38;5;203m";
-const DIM: &str = "\x1b[2m";
+const BLUE: &str = "\x1b[38;5;75m";
+const MUTED: &str = "\x1b[38;5;244m";
+const MAX_VISIBLE_REQUESTS: usize = aissence::summarize::MAX_CONCURRENT_REQUESTS;
+const MIN_CELL_WIDTH: usize = 38;
+const MAX_GRID_COLUMNS: usize = 4;
+const CELL_GAP: &str = "  ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestStatus {
@@ -66,19 +73,27 @@ struct RequestState {
 /// cursor-control sequences.
 struct LiveProgress {
     interactive: bool,
+    color: bool,
     frame: usize,
     rendered_lines: usize,
+    cursor_hidden: bool,
+    model: String,
     requests: BTreeMap<usize, RequestState>,
+    slots: Vec<Option<usize>>,
     recent_failures: VecDeque<(usize, String)>,
 }
 
 impl LiveProgress {
-    fn new() -> Self {
+    fn new(model: &str) -> Self {
         Self {
-            interactive: io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
+            interactive: io::stderr().is_terminal(),
+            color: std::env::var_os("NO_COLOR").is_none(),
             frame: 0,
             rendered_lines: 0,
+            cursor_hidden: false,
+            model: model.to_string(),
             requests: BTreeMap::new(),
+            slots: vec![None; MAX_VISIBLE_REQUESTS],
             recent_failures: VecDeque::new(),
         }
     }
@@ -86,6 +101,7 @@ impl LiveProgress {
     fn handle(&mut self, event: SummarizationProgress) {
         match event {
             SummarizationProgress::Started { id, kind } => {
+                self.assign_slot(id);
                 self.requests
                     .entry(id)
                     .and_modify(|state| {
@@ -110,6 +126,7 @@ impl LiveProgress {
                 attempt,
                 error: _,
             } => {
+                self.assign_slot(id);
                 self.requests
                     .entry(id)
                     .and_modify(|state| {
@@ -124,15 +141,21 @@ impl LiveProgress {
                     });
             }
             SummarizationProgress::Completed { id, kind, usage } => {
-                if let Some(state) = self.requests.get_mut(&id) {
-                    state.kind = kind;
-                    state.status = RequestStatus::Completed;
-                    if let Some(usage) = usage {
-                        state.tokens = usage.completion_tokens as usize;
-                    }
+                self.assign_slot(id);
+                let state = self.requests.entry(id).or_insert(RequestState {
+                    kind,
+                    status: RequestStatus::Completed,
+                    tokens: 0,
+                    started: Instant::now(),
+                });
+                state.kind = kind;
+                state.status = RequestStatus::Completed;
+                if let Some(usage) = usage {
+                    state.tokens = usage.completion_tokens as usize;
                 }
             }
             SummarizationProgress::Failed { id, kind, error } => {
+                self.assign_slot(id);
                 let state = self.requests.entry(id).or_insert(RequestState {
                     kind,
                     status: RequestStatus::Failed,
@@ -147,12 +170,43 @@ impl LiveProgress {
         }
     }
 
+    /// Keep requests attached to stable screen positions. A completed slot is
+    /// recycled in place when the next request starts, so neighboring cards do
+    /// not slide around as concurrent work finishes in a different order.
+    fn assign_slot(&mut self, id: usize) {
+        if self.slots.contains(&Some(id)) {
+            return;
+        }
+        if let Some(empty) = self.slots.iter_mut().find(|slot| slot.is_none()) {
+            *empty = Some(id);
+            return;
+        }
+        let reusable = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| {
+                let visible_id = (*slot)?;
+                let state = self.requests.get(&visible_id)?;
+                (!matches!(
+                    state.status,
+                    RequestStatus::InFlight | RequestStatus::Retrying(_)
+                ))
+                .then_some((index, visible_id))
+            })
+            .min_by_key(|(_, visible_id)| *visible_id)
+            .map(|(index, _)| index);
+        if let Some(index) = reusable {
+            self.slots[index] = Some(id);
+        }
+    }
+
     fn render(&mut self) {
         if !self.interactive {
             return;
         }
 
-        let lines = self.dashboard_lines();
+        let lines = self.dashboard_lines(terminal_width());
         self.write_dashboard(&lines);
         self.frame = self.frame.wrapping_add(1);
     }
@@ -162,84 +216,153 @@ impl LiveProgress {
             return;
         }
 
-        let completed = self.completed_count();
-        let failed = self.failed_count();
-        let total_tokens = self.total_tokens();
-        let (icon, label, color) = if success {
-            ('✓', "benchmark complete", GREEN)
-        } else {
-            ('■', "benchmark stopped", RED)
-        };
-        let line = format!(
-            "{color}{icon}{RESET} {label} · {completed} requests · {} output tokens · {failed} errors",
-            format_count(total_tokens)
-        );
-        self.write_dashboard(&[line]);
+        let lines = self.dashboard_lines_for(terminal_width(), Some(success));
+        self.write_dashboard(&lines);
+        self.show_cursor();
         self.rendered_lines = 0;
     }
 
-    fn dashboard_lines(&self) -> Vec<String> {
-        let active: Vec<_> = self
-            .requests
-            .iter()
-            .filter(|(_, state)| {
+    fn dashboard_lines(&self, width: usize) -> Vec<String> {
+        self.dashboard_lines_for(width, None)
+    }
+
+    fn dashboard_lines_for(&self, width: usize, finished: Option<bool>) -> Vec<String> {
+        let width = width.max(20);
+        let active = self.active_count();
+        let completed = self.completed_count();
+        let failed = self.failed_count();
+        let total_tokens = self.total_tokens();
+        let spinner = SPINNER[self.frame % SPINNER.len()];
+        let title = " Aissence benchmark ";
+        let model = format!(" {} ", self.model);
+        let rule_width = width.saturating_sub(
+            UnicodeWidthStr::width(title) + UnicodeWidthStr::width(model.as_str()) + 2,
+        );
+        let mut lines = vec![render_segments(
+            &[
+                (BLUE, "─".to_string()),
+                (CYAN, title.to_string()),
+                (BLUE, "─".to_string()),
+                (MUTED, model),
+                (BLUE, "─".repeat(rule_width)),
+            ],
+            width,
+            self.color,
+        )];
+
+        let columns = (width + CELL_GAP.len())
+            .checked_div(MIN_CELL_WIDTH + CELL_GAP.len())
+            .unwrap_or(1)
+            .clamp(1, MAX_GRID_COLUMNS);
+        let cell_width = (width.saturating_sub(CELL_GAP.len() * (columns - 1))) / columns;
+        let last_visible = self.slots.iter().rposition(Option::is_some);
+        if let Some(last_visible) = last_visible {
+            for row in self.slots[..=last_visible].chunks(columns) {
+                let cells = row
+                    .iter()
+                    .map(|slot| {
+                        slot.and_then(|id| {
+                            self.requests
+                                .get(&id)
+                                .map(|state| self.request_cell(id, state, cell_width))
+                        })
+                        .unwrap_or_else(|| " ".repeat(cell_width))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(CELL_GAP);
+                lines.push(cells);
+            }
+        } else {
+            lines.push(render_segments(
+                &[(MUTED, "  waiting for the first request…".to_string())],
+                width,
+                self.color,
+            ));
+        }
+
+        if !self.recent_failures.is_empty() {
+            let details = self
+                .recent_failures
+                .iter()
+                .map(|(id, error)| format!("#{id:03} {}", compact_error(error, 48)))
+                .collect::<Vec<_>>()
+                .join("  ·  ");
+            lines.push(render_segments(
+                &[(RED, format!("  ✕ {details}"))],
+                width,
+                self.color,
+            ));
+        }
+
+        let (status_icon, status_label, status_color) = match finished {
+            Some(true) => ('✓', "Complete", GREEN),
+            Some(false) => ('■', "Stopped", RED),
+            None => (spinner, "Working…", GREEN),
+        };
+        let metrics = format!(
+            "{active} active · {completed} done · {failed} errors · {} tok",
+            format_count(total_tokens)
+        );
+        let left = format!(" {status_icon} {status_label} ");
+        let divider_width = width.saturating_sub(
+            UnicodeWidthStr::width(left.as_str()) + UnicodeWidthStr::width(metrics.as_str()) + 2,
+        );
+        lines.push(render_segments(
+            &[
+                (status_color, left),
+                (BLUE, "─".repeat(divider_width)),
+                (MUTED, format!("  {metrics}")),
+            ],
+            width,
+            self.color,
+        ));
+        lines
+    }
+
+    fn request_cell(&self, id: usize, state: &RequestState, width: usize) -> String {
+        let elapsed = state.started.elapsed().as_secs_f64();
+        let bar_width = match width {
+            0..=31 => 4,
+            32..=43 => 6,
+            44..=55 => 8,
+            _ => 10,
+        };
+        let (icon, color, detail) = match state.status {
+            RequestStatus::InFlight => (
+                SPINNER[self.frame % SPINNER.len()],
+                GREEN,
+                if state.tokens == 0 {
+                    "streaming".to_string()
+                } else {
+                    format!("~{} tok", format_count(state.tokens))
+                },
+            ),
+            RequestStatus::Retrying(attempt) => ('↻', YELLOW, format!("retry {attempt}")),
+            RequestStatus::Completed => ('✓', GREEN, format!("{} tok", format_count(state.tokens))),
+            RequestStatus::Failed => ('✕', RED, "failed".to_string()),
+        };
+        let segments = vec![
+            (BLUE, format!("{id:03}")),
+            (MUTED, " [".to_string()),
+            (color, progress_bar(state.status, self.frame, bar_width)),
+            (MUTED, "] ".to_string()),
+            (color, icon.to_string()),
+            ("", format!(" {}", request_kind_label(state.kind))),
+            (MUTED, format!(" · {detail} · {elapsed:.1}s")),
+        ];
+        render_segments(&segments, width, self.color)
+    }
+
+    fn active_count(&self) -> usize {
+        self.requests
+            .values()
+            .filter(|state| {
                 matches!(
                     state.status,
                     RequestStatus::InFlight | RequestStatus::Retrying(_)
                 )
             })
-            .collect();
-        let completed = self.completed_count();
-        let failed = self.failed_count();
-        let total_tokens = self.total_tokens();
-        let spinner = SPINNER[self.frame % SPINNER.len()];
-
-        let mut lines = vec![format!(
-            "{CYAN}{spinner}{RESET} summarizing · {} active · {completed} done · {failed} errors · {} tokens received",
-            active.len(),
-            format_count(total_tokens)
-        )];
-
-        if active.is_empty() {
-            lines.push(format!("  {DIM}waiting for the next request…{RESET}"));
-        } else {
-            for row in active.chunks(4) {
-                let cells = row
-                    .iter()
-                    .map(|(id, state)| self.request_cell(**id, state))
-                    .collect::<Vec<_>>()
-                    .join("   ");
-                lines.push(format!("  {cells}"));
-            }
-        }
-
-        let failures = if self.recent_failures.is_empty() {
-            format!("  {DIM}recent errors: none{RESET}")
-        } else {
-            let details = self
-                .recent_failures
-                .iter()
-                .map(|(id, error)| format!("{RED}✖{RESET} #{id:03} {}", compact_error(error, 48)))
-                .collect::<Vec<_>>()
-                .join("   ");
-            format!("  recent errors: {details}")
-        };
-        lines.push(failures);
-        lines
-    }
-
-    fn request_cell(&self, id: usize, state: &RequestState) -> String {
-        let elapsed = state.started.elapsed().as_secs_f64();
-        let token_label = format!("~{}tok", format_count(state.tokens));
-        let (icon, status) = match state.status {
-            RequestStatus::InFlight => ('▸', "live".to_string()),
-            RequestStatus::Retrying(attempt) => ('↻', format!("retry {attempt}")),
-            RequestStatus::Completed | RequestStatus::Failed => unreachable!(),
-        };
-        format!(
-            "{YELLOW}{icon}{RESET} #{id:03} {} {token_label} {DIM}{elapsed:.1}s {status}{RESET}",
-            request_kind_label(state.kind)
-        )
+            .count()
     }
 
     fn completed_count(&self) -> usize {
@@ -264,6 +387,10 @@ impl LiveProgress {
         let previous_lines = self.rendered_lines;
         let slots = previous_lines.max(lines.len());
         let mut stderr = io::stderr().lock();
+        if !self.cursor_hidden {
+            let _ = write!(stderr, "\x1b[?25l");
+            self.cursor_hidden = true;
+        }
         if previous_lines > 0 {
             let _ = write!(stderr, "\x1b[{previous_lines}A");
         }
@@ -277,6 +404,99 @@ impl LiveProgress {
         let _ = stderr.flush();
         self.rendered_lines = slots;
     }
+
+    fn show_cursor(&mut self) {
+        if self.cursor_hidden {
+            let _ = write!(io::stderr().lock(), "\x1b[?25h");
+            self.cursor_hidden = false;
+        }
+    }
+}
+
+impl Drop for LiveProgress {
+    fn drop(&mut self) {
+        if self.interactive {
+            self.show_cursor();
+        }
+    }
+}
+
+fn terminal_width() -> usize {
+    terminal_size()
+        .map(|(Width(width), _)| usize::from(width))
+        .or_else(|| {
+            std::env::var("COLUMNS")
+                .ok()
+                .and_then(|columns| columns.parse().ok())
+        })
+        .unwrap_or(120)
+}
+
+fn progress_bar(status: RequestStatus, frame: usize, width: usize) -> String {
+    match status {
+        RequestStatus::Completed => "⣿".repeat(width),
+        RequestStatus::Failed => "×".repeat(width),
+        RequestStatus::Retrying(_) => (0..width)
+            .map(|index| {
+                if (index + frame / 2).is_multiple_of(2) {
+                    '⣶'
+                } else {
+                    '·'
+                }
+            })
+            .collect(),
+        RequestStatus::InFlight => {
+            let head = frame % (width + 3);
+            (0..width)
+                .map(|index| match head.checked_sub(index) {
+                    Some(0) => '⣿',
+                    Some(1) => '⣷',
+                    Some(2) => '⣤',
+                    _ => '·',
+                })
+                .collect()
+        }
+    }
+}
+
+/// Render independently styled pieces into an exact terminal-cell width.
+/// ANSI sequences never participate in truncation or padding calculations.
+fn render_segments(segments: &[(&str, String)], width: usize, color: bool) -> String {
+    let mut rendered = String::new();
+    let mut used = 0;
+    for (style, text) in segments {
+        if used >= width {
+            break;
+        }
+        let (text, text_width) = truncate_to_width(text, width - used);
+        if text.is_empty() {
+            continue;
+        }
+        if color && !style.is_empty() {
+            rendered.push_str(style);
+        }
+        rendered.push_str(&text);
+        if color && !style.is_empty() {
+            rendered.push_str(RESET);
+        }
+        used += text_width;
+    }
+    rendered.push_str(&" ".repeat(width.saturating_sub(used)));
+    rendered
+}
+
+fn truncate_to_width(text: &str, max_width: usize) -> (String, usize) {
+    let mut result = String::new();
+    let mut width = 0;
+    for character in text.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if width + character_width > max_width {
+            break;
+        }
+        result.push(character);
+        width += character_width;
+    }
+    (result, width)
 }
 
 fn request_kind_label(kind: SummarizationRequestKind) -> String {
@@ -370,7 +590,7 @@ async fn run() -> Result<(), String> {
     let summarizer = summarizer.with_progress(move |event| {
         let _ = progress_sender.send(event);
     });
-    let mut live_progress = LiveProgress::new();
+    let mut live_progress = LiveProgress::new(&args.model);
     let mut tick = tokio::time::interval(Duration::from_millis(80));
     let (outcome, cost) = {
         let summarize = summarizer.summarize_history_with_cost(&mut history);
@@ -660,9 +880,13 @@ mod tests {
     fn test_live_progress() -> LiveProgress {
         LiveProgress {
             interactive: false,
+            color: false,
             frame: 0,
             rendered_lines: 0,
+            cursor_hidden: false,
+            model: "vendor/model".to_string(),
             requests: BTreeMap::new(),
+            slots: vec![None; MAX_VISIBLE_REQUESTS],
             recent_failures: VecDeque::new(),
         }
     }
@@ -735,8 +959,9 @@ mod tests {
             id: 1,
             tokens: 1234,
         });
-        assert!(live.dashboard_lines()[0].contains("1 active"));
-        assert!(live.dashboard_lines()[1].contains("~1.2ktok"));
+        let lines = live.dashboard_lines(120);
+        assert!(lines.last().unwrap().contains("1 active"));
+        assert!(lines[1].contains("~1.2k tok"));
 
         live.handle(SummarizationProgress::Completed {
             id: 1,
@@ -753,12 +978,56 @@ mod tests {
             kind: SummarizationRequestKind::CoreOutcome,
             error: "429: provider rate limit".into(),
         });
-        let lines = live.dashboard_lines();
-        assert!(lines[0].contains("0 active"));
-        assert!(lines[0].contains("1 done"));
-        assert!(lines[0].contains("1 errors"));
-        assert!(lines[2].contains("#002 429: provider rate limit"));
+        let lines = live.dashboard_lines(120);
+        let footer = lines.last().unwrap();
+        assert!(footer.contains("0 active"));
+        assert!(footer.contains("1 done"));
+        assert!(footer.contains("1 errors"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("#002 429: provider rate limit"))
+        );
         assert_eq!(live.total_tokens(), 42);
+    }
+
+    #[test]
+    fn live_progress_recycles_one_finished_slot_without_shifting_its_neighbors() {
+        let mut live = test_live_progress();
+        live.slots = vec![None; 2];
+        for id in [1, 2] {
+            live.handle(SummarizationProgress::Started {
+                id,
+                kind: SummarizationRequestKind::CoreOutcome,
+            });
+        }
+        live.handle(SummarizationProgress::Completed {
+            id: 1,
+            kind: SummarizationRequestKind::CoreOutcome,
+            usage: None,
+        });
+        live.handle(SummarizationProgress::Started {
+            id: 3,
+            kind: SummarizationRequestKind::MetaSummary,
+        });
+
+        assert_eq!(live.slots, vec![Some(3), Some(2)]);
+        let grid = &live.dashboard_lines(100)[1];
+        assert!(grid.find("003").unwrap() < grid.find("002").unwrap());
+    }
+
+    #[test]
+    fn dashboard_rows_fit_the_terminal_width_with_unicode_model_names() {
+        let mut live = test_live_progress();
+        live.model = "模型/model".to_string();
+        live.handle(SummarizationProgress::Started {
+            id: 1,
+            kind: SummarizationRequestKind::UserBatch { entries: 12 },
+        });
+
+        for line in live.dashboard_lines(73) {
+            assert_eq!(UnicodeWidthStr::width(line.as_str()), 73);
+        }
     }
 
     #[test]
