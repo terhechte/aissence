@@ -21,6 +21,7 @@
   let activeShot = $state(0);
   let modal = $state(false);
   let chartMode = $state<'tokens' | 'lines'>('tokens');
+  let chartScale = $state<'linear' | 'log'>('log');
 
   const totals = $derived.by(() => {
     const sum = (key: string) =>
@@ -73,6 +74,20 @@
       ...commits.flatMap((commit: any) => keys.map((key) => Number(commit[key] ?? 0)))
     );
   });
+
+  function chartRatio(value: number, maximum: number) {
+    const safeValue = Math.max(0, value);
+    const safeMaximum = Math.max(1, maximum);
+    if (chartScale === 'log') {
+      return Math.log1p(safeValue) / Math.log1p(safeMaximum);
+    }
+    return safeValue / safeMaximum;
+  }
+
+  function chartHeight(value: number, maximum: number) {
+    const ratio = chartRatio(value, maximum);
+    return `${ratio > 0 ? Math.max(1, ratio * 100) : 0}%`;
+  }
 
   function monthKey(commit: any) {
     if (!commit.committed_at) return 'Undated';
@@ -223,23 +238,28 @@
     <div class="chart">
       <div class="chart-head">
         <p>{chartMode === 'tokens' ? 'Tokens read above the line, written below' : 'Lines added above the line, removed below'}</p>
-        <div><button class:active={chartMode === 'tokens'} onclick={() => (chartMode = 'tokens')}>tokens</button><button class:active={chartMode === 'lines'} onclick={() => (chartMode = 'lines')}>lines</button></div>
+        <div class="chart-controls">
+          <span><button class:active={chartMode === 'tokens'} onclick={() => (chartMode = 'tokens')}>tokens</button><button class:active={chartMode === 'lines'} onclick={() => (chartMode = 'lines')}>lines</button></span>
+          <span><button class:active={chartScale === 'linear'} onclick={() => (chartScale = 'linear')}>linear</button><button class:active={chartScale === 'log'} onclick={() => (chartScale = 'log')}>log</button></span>
+        </div>
       </div>
-      <div class="bars">
-        {#each commits as commit, index}
-          {@const up = Number(commit[chartMode === 'tokens' ? 'token_input' : 'lines_added'] ?? 0)}
-          {@const down = Number(commit[chartMode === 'tokens' ? 'token_output' : 'lines_deleted'] ?? 0)}
-          <button
-            class:dimmed={openCommit && openCommit !== commit.id}
-            onclick={() => toggleCommit(commit.id)}
-            aria-label={`Open ${commit.title || commit.commit_hash.slice(0, 10)}`}
-          >
-            <span class="up" style={`height:${Math.max(2, Math.round((up / maxChartValue) * 100))}px`}></span>
-            <i></i>
-            <span class="down" style={`height:${Math.max(2, Math.round((down / maxChartValue) * 34))}px`}></span>
-            <small>{index % 4 === 2 ? formatDate(commit.committed_at, { month: 'short', day: 'numeric', year: undefined }) : ''}</small>
-          </button>
-        {/each}
+      <div class="bars-scroll" aria-label="Scrollable commit chart">
+        <div class="bars" style={`--bar-count:${commits.length}`}>
+          {#each commits as commit, index}
+            {@const up = Number(commit[chartMode === 'tokens' ? 'token_input' : 'lines_added'] ?? 0)}
+            {@const down = Number(commit[chartMode === 'tokens' ? 'token_output' : 'lines_deleted'] ?? 0)}
+            <button
+              class:dimmed={openCommit && openCommit !== commit.id}
+              onclick={() => toggleCommit(commit.id)}
+              aria-label={`Open ${commit.title || commit.commit_hash.slice(0, 10)}`}
+            >
+              <span class="up" style={`height:${chartHeight(up, maxChartValue)}`}></span>
+              <i></i>
+              <span class="down" style={`height:${chartHeight(down, maxChartValue)}`}></span>
+              <small>{index % 4 === 2 ? formatDate(commit.committed_at, { month: 'short', day: 'numeric', year: undefined }) : ''}</small>
+            </button>
+          {/each}
+        </div>
       </div>
     </div>
     <aside>
@@ -489,9 +509,15 @@
   .thumbnails {
     display: flex;
     gap: 8px;
+    max-width: 100%;
+    overflow-x: auto;
+    padding-bottom: 4px;
+    scrollbar-color: var(--muted) transparent;
+    scrollbar-width: thin;
   }
   .thumbnails button {
-    flex: 1;
+    flex: 0 0 132px;
+    width: 132px;
     border: 1px solid var(--rule2);
     padding: 2px;
     background: transparent;
@@ -516,6 +542,10 @@
     border-top: 1px solid var(--ink);
     padding-top: 14px;
   }
+  .chart {
+    display: flex;
+    flex-direction: column;
+  }
   .chart-head {
     display: flex;
     justify-content: space-between;
@@ -528,6 +558,18 @@
     text-transform: uppercase;
     letter-spacing: 0.1em;
   }
+  .chart-controls {
+    display: flex;
+    gap: 12px;
+  }
+  .chart-controls span {
+    display: flex;
+    gap: 8px;
+  }
+  .chart-controls span + span {
+    border-left: 1px solid var(--rule2);
+    padding-left: 12px;
+  }
   .chart-head button {
     border: 0;
     background: transparent;
@@ -539,8 +581,32 @@
     color: var(--accent);
     text-decoration: underline;
   }
+  .bars-scroll {
+    display: flex;
+    flex: 1;
+    position: relative;
+    min-width: 0;
+    min-height: 178px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-color: var(--muted) transparent;
+    scrollbar-width: thin;
+  }
+  .bars-scroll::after {
+    position: absolute;
+    z-index: 1;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: 42px;
+    pointer-events: none;
+    background: linear-gradient(to right, transparent, var(--paper));
+    content: '';
+  }
   .bars {
-    height: 178px;
+    height: 100%;
+    min-height: 178px;
+    width: max(100%, calc(var(--bar-count) * 36px));
     margin-top: 25px;
     display: flex;
     align-items: center;
@@ -550,7 +616,7 @@
     align-self: stretch;
     flex: 1;
     display: grid;
-    grid-template-rows: 104px 1px 36px 22px;
+    grid-template-rows: minmax(0, 1fr) 1px minmax(0, 0.34fr) 22px;
     align-items: end;
     border: 0;
     padding: 0 1px;

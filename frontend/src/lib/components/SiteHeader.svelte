@@ -5,7 +5,11 @@
 </script>
 
 <header class="site-header page-shell">
-  <a class="wordmark" href="/" aria-label="Aissence home">aissence</a>
+  <a class="wordmark" href="/" aria-label="Aissence home">
+    <img class="wordmark-icon wordmark-icon-light" src="/icon-black.png" alt="" aria-hidden="true" />
+    <img class="wordmark-icon wordmark-icon-dark" src="/icon-white.png" alt="" aria-hidden="true" />
+    <span>aissence</span>
+  </a>
   <nav aria-label="Primary navigation">
     <a href="/#how">How it works</a>
     <a href="/#recent">Recent</a>

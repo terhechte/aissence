@@ -102,9 +102,31 @@ textarea:focus-visible {
 }
 
 .wordmark {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
   font: 400 28px/1 'Instrument Serif', Georgia, serif;
   letter-spacing: -0.02em;
   text-decoration: none;
+}
+
+.wordmark-icon {
+  width: 34px;
+  height: 30px;
+  flex: 0 0 auto;
+  object-fit: contain;
+}
+
+.wordmark-icon-dark {
+  display: none;
+}
+
+:root[data-theme='dark'] .wordmark-icon-light {
+  display: none;
+}
+
+:root[data-theme='dark'] .wordmark-icon-dark {
+  display: block;
 }
 
 .site-header nav {
