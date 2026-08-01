@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-aissence = { path = "../aissence" }
+aissence = { path = "../cli" }
 axum = { version = "0.8", features = ["macros"] }
 base64 = "0.22"
 chrono.workspace = true

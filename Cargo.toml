@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/aissence", "crates/aissence-server"]
+members = ["crates/cli", "crates/api-server"]
 resolver = "3"
 
 [workspace.package]

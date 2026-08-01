@@ -7,8 +7,8 @@ or by the authenticated Aissence server.
 
 ## Workspace
 
-- `crates/aissence`: shared library, CLI, GUI, and benchmark executable.
-- `crates/aissence-server`: authenticated HTTP API, Postgres import queue, and
+- `crates/cli`: shared library, CLI, GUI, and benchmark executable.
+- `crates/api-server`: authenticated HTTP API, Postgres import queue, and
   summarization worker.
 
 ## CLI
