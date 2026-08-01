@@ -1,0 +1,32 @@
+[package]
+name = "aissence-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aissence = { path = "../aissence" }
+axum = { version = "0.8", features = ["macros"] }
+base64 = "0.22"
+chrono.workspace = true
+hex = "0.4"
+jsonwebtoken = "9"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde.workspace = true
+serde_json.workspace = true
+serde_urlencoded = "0.7"
+serde_path_to_error = "0.1"
+sha2 = "0.10"
+deadpool-postgres = "0.14"
+dotenvy = "0.15"
+tokio-postgres = { version = "0.7", features = ["with-uuid-1", "with-chrono-0_4", "with-serde_json-1"] }
+thiserror.workspace = true
+tokio.workspace = true
+tower-http = { version = "0.6", features = ["catch-panic", "cors", "limit", "request-id", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
