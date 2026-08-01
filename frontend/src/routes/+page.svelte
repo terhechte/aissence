@@ -74,7 +74,10 @@
   <section id="recent" class="recent">
     <div class="section-heading">
       <p class="label">Recent projects</p>
-      <p>Public ledgers, newest first</p>
+      <div class="section-heading-actions">
+        <p>Public ledgers, newest first</p>
+        <a href="/projects">Browse all →</a>
+      </div>
     </div>
     {#if data.projects.length}
       <div class="project-table">
@@ -188,6 +191,16 @@
   .section-heading .label {
     font-style: normal;
   }
+  .section-heading-actions {
+    display: flex;
+    align-items: baseline;
+    gap: 20px;
+  }
+  .section-heading-actions a {
+    color: var(--accent);
+    font-style: normal;
+    text-decoration: none;
+  }
   .steps {
     display: grid;
     grid-template-columns: repeat(3, 1fr);
@@ -270,6 +283,11 @@
     .project-table > a > span:first-of-type,
     .project-table > a > span:last-of-type {
       display: none;
+    }
+    .section-heading {
+      align-items: flex-start;
+      flex-direction: column;
+      gap: 8px;
     }
   }
 </style>

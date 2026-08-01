@@ -11,8 +11,8 @@
     <span>aissence</span>
   </a>
   <nav aria-label="Primary navigation">
+    <a class="projects-link" href="/projects">Projects</a>
     <a href="/#how">How it works</a>
-    <a href="/#recent">Recent</a>
     {#if claims}
       <a href="/dashboard">Dashboard</a>
       <a href="/dashboard/subscriptions">Subscriptions</a>

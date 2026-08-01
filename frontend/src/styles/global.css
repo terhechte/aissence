@@ -278,11 +278,12 @@ button[disabled] {
     gap: 12px;
   }
 
-  .site-header nav a:not(:last-of-type) {
+  .site-header nav a {
     display: none;
   }
 
-  .site-header nav a:nth-last-of-type(-n + 2) {
+  .site-header nav a.projects-link,
+  .site-header nav a:last-of-type {
     display: inline;
   }
 
