@@ -1,6 +1,6 @@
 begin;
 create extension if not exists pgtap with schema extensions;
-select plan(15);
+select plan(20);
 
 insert into auth.users (id, email)
 values
@@ -10,6 +10,13 @@ values
 
 insert into public.profiles (id, handle, display_name) values
   ('00000000-0000-0000-0000-000000000001', 'creator', 'Creator');
+insert into public.creator_plans (
+  id, creator_id, name, description, interval, price_cents, currency, active
+) values (
+  '50000000-0000-0000-0000-000000000001',
+  '00000000-0000-0000-0000-000000000001',
+  'Monthly', 'Full prompts', 'monthly', 1000, 'USD', true
+);
 insert into public.projects (
   id, owner_id, slug, name, tagline, description, product_url, repository_label, visibility
 ) values (
@@ -128,6 +135,9 @@ select is(
 select set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000002', true);
 select is((select count(*)::integer from public.commits), 1, 'unrelated reader can read summaries');
 select is((select count(*)::integer from public.message_sources), 0, 'unrelated reader cannot read source');
+select is((select count(*)::integer from public.creator_plans), 1, 'public readers can see active plan pricing');
+select is((select count(*)::integer from public.creator_accounts), 0, 'creator compliance state is private');
+select is(public.creator_payments_ready('00000000-0000-0000-0000-000000000001'), false, 'unverified creators cannot accept payments');
 
 reset role;
 insert into public.creator_subscriptions (subscriber_id, creator_id, status, source)
@@ -144,6 +154,23 @@ select is(
   'private prompt',
   'subscriber receives prompt rather than reply'
 );
+
+reset role;
+update public.creator_subscriptions
+set status = 'canceled', cancel_at_period_end = true, current_period_end = now() + interval '1 day'
+where subscriber_id = '00000000-0000-0000-0000-000000000003'
+  and creator_id = '00000000-0000-0000-0000-000000000001';
+set local role authenticated;
+select set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000003', true);
+select is((select count(*)::integer from public.message_sources), 1, 'canceling subscriber keeps access through period end');
+
+reset role;
+update public.creator_subscriptions
+set current_period_end = now() - interval '1 second'
+where subscriber_id = '00000000-0000-0000-0000-000000000003'
+  and creator_id = '00000000-0000-0000-0000-000000000001';
+set local role authenticated;
+select is((select count(*)::integer from public.message_sources), 0, 'canceled subscriber loses access after period end');
 
 select set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000002', true);
 select throws_ok(

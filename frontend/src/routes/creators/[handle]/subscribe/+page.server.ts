@@ -1,4 +1,5 @@
 import { error, redirect } from '@sveltejs/kit';
+import { subscriptionGrantsAccess } from '$lib/server/subscriptions';
 import type { PageServerLoad } from './$types';
 
 export const load: PageServerLoad = async ({ locals, params, url }) => {
@@ -10,11 +11,26 @@ export const load: PageServerLoad = async ({ locals, params, url }) => {
     .eq('handle', params.handle)
     .maybeSingle();
   if (!profile) error(404, 'Creator not found');
-  const { data: subscription } = await locals.supabase!
-    .from('creator_subscriptions')
-    .select('status,current_period_end,source')
-    .eq('subscriber_id', claims.sub)
-    .eq('creator_id', profile.id)
-    .maybeSingle();
-  return { profile, subscription };
+  const [{ data: subscription }, { data: plans }, { data: paymentsReady }] = await Promise.all([
+    locals.supabase!
+      .from('creator_subscriptions')
+      .select('status,current_period_end,source,cancel_at_period_end,plan_id')
+      .eq('subscriber_id', claims.sub)
+      .eq('creator_id', profile.id)
+      .maybeSingle(),
+    locals.supabase!
+      .from('creator_plans')
+      .select('id,name,description,interval,price_cents,currency,active')
+      .eq('creator_id', profile.id)
+      .eq('active', true)
+      .order('interval'),
+    locals.supabase!.rpc('creator_payments_ready', { p_creator_id: profile.id })
+  ]);
+  return {
+    profile,
+    subscription,
+    plans: plans ?? [],
+    paymentsReady: paymentsReady === true,
+    isEntitled: subscriptionGrantsAccess(subscription)
+  };
 };

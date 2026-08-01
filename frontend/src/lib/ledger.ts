@@ -5,6 +5,12 @@ export interface TranscriptTurn {
   changedFileCount: number;
 }
 
+/** Remove retained prompt previews and source relations before serializing a free view. */
+export function redactPublicMessage(message: any) {
+  const { preview: _preview, message_sources: _sources, content: _content, changes: _changes, ...safe } = message;
+  return safe;
+}
+
 export type PublicTranscriptItem =
   | { kind: 'turn'; turn: TranscriptTurn }
   | {

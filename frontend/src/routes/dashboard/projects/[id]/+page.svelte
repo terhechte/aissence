@@ -39,12 +39,20 @@
       <div class="field"><label for="product_url">Product URL <span>(optional)</span></label><input id="product_url" name="product_url" type="url" value={data.project.product_url ?? ''} pattern="https://.*" /></div>
       <div class="field"><label for="repository_label">Repository label <span>(optional)</span></label><input id="repository_label" name="repository_label" value={data.project.repository_label ?? ''} /></div>
       <div class="field wide"><label for="repository_url">Repository URL</label><input id="repository_url" name="repository_url" type="url" value={data.project.repository_url ?? ''} /></div>
+      <div class="field wide">
+        <label for="comment_visibility">Comments</label>
+        <select id="comment_visibility" name="comment_visibility" value={data.project.comment_visibility ?? 'subscribers'}>
+          <option value="subscribers">Subscribers only</option>
+          <option value="public">Everyone</option>
+        </select>
+        <small>When comments are enabled, choose who can read and post on this ledger.</small>
+      </div>
       <button class="button">Save details</button>
     </form>
   </section>
 
   <section>
-    <div class="section-head"><span>02</span><div><h2>Project history</h2><p>A new upload replaces the current snapshot atomically.</p></div></div>
+    <div class="section-head"><span>02</span><div><h2>Project history</h2><p>This is a continuously updated ledger. A new upload replaces the current snapshot atomically.</p></div></div>
     <ImportUploader projectId={data.project.id} />
     {#if data.imports.length}
       <div class="import-log">

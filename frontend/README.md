@@ -63,7 +63,7 @@ screenshot URLs after their project visibility has been checked.
 
 ## Manual subscription grants
 
-Stripe is intentionally not connected in v1. Grant test access from a trusted
+The payment/KYC provider is intentionally not connected in v1. Grant test access from a trusted
 SQL/service-role session:
 
 ```sql
@@ -74,8 +74,9 @@ select public.grant_manual_subscription(
 );
 ```
 
-Subscriptions apply to every published project owned by that creator. The same
-table has nullable external billing identifiers for the future Stripe webhook.
+Subscriptions apply to every current and future published project owned by that
+creator. The same table has nullable external billing identifiers for the future
+provider webhook.
 
 ## Validation
 

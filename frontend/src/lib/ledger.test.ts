@@ -1,5 +1,20 @@
 import { describe, expect, it } from 'vitest';
-import { abridgeTranscript, groupTranscript } from './ledger';
+import { abridgeTranscript, groupTranscript, redactPublicMessage } from './ledger';
+
+describe('redactPublicMessage', () => {
+  it('does not serialize retained prompt previews or private source relations', () => {
+    expect(
+      redactPublicMessage({
+        id: 'message',
+        kind: 'UserWrote',
+        summary: 'Public summary',
+        preview: 'Private prompt preview',
+        message_sources: [{ content: 'Private prompt' }],
+        changes: [{ diff: 'Private diff' }]
+      })
+    ).toEqual({ id: 'message', kind: 'UserWrote', summary: 'Public summary' });
+  });
+});
 
 describe('groupTranscript', () => {
   it('groups agent activity under the preceding prompt', () => {

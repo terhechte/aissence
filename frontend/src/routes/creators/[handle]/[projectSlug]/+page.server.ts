@@ -1,9 +1,10 @@
 import { error } from '@sveltejs/kit';
-import { groupTranscript } from '$lib/ledger';
+import { groupTranscript, redactPublicMessage } from '$lib/ledger';
 import {
   estimatePotentialCost,
   fetchOpenRouterCatalog
 } from '$lib/server/openrouter-pricing';
+import { hasCreatorAccess } from '$lib/server/subscriptions';
 import type { PageServerLoad } from './$types';
 
 export const load: PageServerLoad = async ({ locals, params, setHeaders }) => {
@@ -32,17 +33,7 @@ export const load: PageServerLoad = async ({ locals, params, setHeaders }) => {
   const isOwner = claims?.sub === profile.id;
   let isEntitled = isOwner;
   if (claims && !isOwner) {
-    const { data: subscription } = await locals.supabase
-      .from('creator_subscriptions')
-      .select('status,current_period_end')
-      .eq('subscriber_id', claims.sub)
-      .eq('creator_id', profile.id)
-      .maybeSingle();
-    isEntitled = Boolean(
-      subscription &&
-        ['active', 'trialing'].includes(subscription.status) &&
-        (!subscription.current_period_end || Date.parse(subscription.current_period_end) > Date.now())
-    );
+    isEntitled = await hasCreatorAccess(locals.supabase, claims.sub, profile.id);
   }
 
   const [{ data: screenshots }, { data: commits }] = await Promise.all([
@@ -118,7 +109,7 @@ export const load: PageServerLoad = async ({ locals, params, setHeaders }) => {
           turn.asked
             ? [
                 {
-                  ...turn.asked,
+                  ...redactPublicMessage(turn.asked),
                   following_reply_count: turn.replyCount,
                   following_changed_file_count: turn.changedFileCount
                 }

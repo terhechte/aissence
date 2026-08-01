@@ -1,6 +1,16 @@
 <script lang="ts">
   import { formatDate } from '$lib/utils';
   let { data } = $props();
+
+  function formatPrice(cents: number, currency: string, interval: string) {
+    const amount = new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency,
+      minimumFractionDigits: 0,
+      maximumFractionDigits: 2
+    }).format(Number(cents) / 100);
+    return `${amount}/${interval === 'annual' ? 'year' : 'month'}`;
+  }
 </script>
 
 <svelte:head>
@@ -18,7 +28,14 @@
       <h1>{data.profile.display_name}</h1>
       <p>{data.profile.bio || 'The reasoning behind the projects.'}</p>
     </div>
-    <a class="button secondary" href={`/creators/${data.profile.handle}/subscribe`}>Subscribe to prompts</a>
+    <div class="subscription-cta">
+      <a class="button secondary" href={`/creators/${data.profile.handle}/subscribe`}>Subscribe to prompts</a>
+      {#if data.plans.length}
+        <small>{data.plans.map((plan: any) => formatPrice(plan.price_cents, plan.currency, plan.interval)).join(' · ')}</small>
+      {:else}
+        <small>Monthly and annual plans coming soon</small>
+      {/if}
+    </div>
   </header>
   <section>
     <div class="section-head"><span>Published projects</span><span>{data.projects.length} total</span></div>
@@ -58,6 +75,15 @@
     max-width: 600px;
     font-size: 22px;
     color: var(--body);
+  }
+  .subscription-cta {
+    display: grid;
+    justify-items: end;
+    gap: 9px;
+  }
+  .subscription-cta small {
+    color: var(--muted);
+    font: 400 10px/1.3 'JetBrains Mono', monospace;
   }
   .avatar {
     width: clamp(96px, 13vw, 160px);
@@ -111,6 +137,9 @@
     header {
       align-items: flex-start;
       flex-direction: column;
+    }
+    .subscription-cta {
+      justify-items: start;
     }
     .projects > a {
       grid-template-columns: 1fr auto;

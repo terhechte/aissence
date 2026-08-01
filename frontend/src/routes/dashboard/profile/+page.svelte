@@ -3,6 +3,14 @@
 
   let { data, form } = $props();
   const profileValues = $derived((form as any)?.profileValues ?? {});
+  const planValues = $derived((form as any)?.planValues ?? {});
+
+  function planPrice(interval: string) {
+    const plan = data.plans.find((item: any) => item.interval === interval);
+    return plan ? (Number(plan.price_cents) / 100).toFixed(2) : '';
+  }
+
+  const kycStatus = $derived(data.account?.kyc_status ?? 'not_started');
 </script>
 
 <svelte:head><title>Edit creator profile — aissence</title></svelte:head>
@@ -56,6 +64,41 @@
       <button class="button">Save creator profile</button>
     </form>
   </section>
+
+  <section class="panel plans-panel">
+    <div class="section-head">
+      <span>02</span>
+      <div>
+        <h2>Subscription plans</h2>
+        <p>One creator subscription unlocks every current and future published ledger.</p>
+      </div>
+    </div>
+
+    <div class="provider-status">
+      <strong>Payment provider status</strong>
+      <span>{kycStatus === 'verified' ? 'KYC verified' : 'KYC not yet verified'}</span>
+      <small>Plans can be prepared now. A payment provider must verify you before checkout can accept money.</small>
+    </div>
+
+    {#if form?.planError}<p class="error">{form.planError}</p>{/if}
+    {#if form?.plansSaved}<p class="notice">Subscription plans saved.</p>{/if}
+
+    <form class="plans-form" method="POST" action="?/savePlans" use:enhance>
+      <div class="plan-fields">
+        <div class="field">
+          <label for="monthly_price">Monthly price (USD)</label>
+          <input id="monthly_price" name="monthly_price" type="number" min="0.01" step="0.01" placeholder="10.00" value={planValues.monthly_price ?? planPrice('monthly')} />
+          <small>Leave blank to hide the monthly option.</small>
+        </div>
+        <div class="field">
+          <label for="annual_price">Annual price (USD)</label>
+          <input id="annual_price" name="annual_price" type="number" min="0.01" step="0.01" placeholder="100.00" value={planValues.annual_price ?? planPrice('annual')} />
+          <small>Leave blank to hide the annual option.</small>
+        </div>
+      </div>
+      <button class="button">Save plans</button>
+    </form>
+  </section>
 </div>
 
 <style>
@@ -77,6 +120,9 @@
     color: var(--muted);
   }
   .profile-panel {
+    max-width: 900px;
+  }
+  .plans-panel {
     max-width: 900px;
   }
   .profile-panel .form-grid > .field {
@@ -115,6 +161,29 @@
   .avatar-field {
     gap: 9px;
   }
+  .provider-status {
+    display: grid;
+    gap: 5px;
+    margin-bottom: 24px;
+    padding: 16px 18px;
+    background: var(--panel2);
+  }
+  .provider-status strong {
+    font-weight: 400;
+  }
+  .provider-status span,
+  .provider-status small {
+    color: var(--muted);
+  }
+  .plans-form {
+    display: grid;
+    gap: 24px;
+  }
+  .plan-fields {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 20px;
+  }
   .current-avatar {
     display: flex;
     align-items: center;
@@ -133,6 +202,9 @@
     header {
       align-items: flex-start;
       flex-direction: column;
+    }
+    .plan-fields {
+      grid-template-columns: 1fr;
     }
   }
 </style>

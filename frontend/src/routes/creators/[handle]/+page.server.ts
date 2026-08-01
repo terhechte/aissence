@@ -9,12 +9,20 @@ export const load: PageServerLoad = async ({ locals, params }) => {
     .eq('handle', params.handle)
     .maybeSingle();
   if (!profile) error(404, 'Creator not found');
-  const { data: projects } = await locals.supabase
-    .from('projects')
-    .select('id,slug,name,tagline,description,repository_label,published_at,commits(count)')
-    .eq('owner_id', profile.id)
-    .eq('visibility', 'published')
-    .order('published_at', { ascending: false });
+  const [{ data: projects }, { data: plans }] = await Promise.all([
+    locals.supabase
+      .from('projects')
+      .select('id,slug,name,tagline,description,repository_label,published_at,commits(count)')
+      .eq('owner_id', profile.id)
+      .eq('visibility', 'published')
+      .order('published_at', { ascending: false }),
+    locals.supabase
+      .from('creator_plans')
+      .select('id,name,interval,price_cents,currency')
+      .eq('creator_id', profile.id)
+      .eq('active', true)
+      .order('interval')
+  ]);
   return {
     profile: {
       ...profile,
@@ -22,6 +30,7 @@ export const load: PageServerLoad = async ({ locals, params }) => {
         ? locals.supabase.storage.from('profile-images').getPublicUrl(profile.avatar_path).data.publicUrl
         : null
     },
-    projects: projects ?? []
+    projects: projects ?? [],
+    plans: plans ?? []
   };
 };

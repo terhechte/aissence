@@ -22,7 +22,8 @@ export const projectMetadataSchema = z.object({
     .transform((value) => value || null),
   repository_url: z
     .union([z.literal(''), z.string().url().startsWith('https://', 'Use an HTTPS URL')])
-    .transform((value) => value || null)
+    .transform((value) => value || null),
+  comment_visibility: z.enum(['public', 'subscribers']).default('subscribers')
 });
 
 export interface RepositoryFields {
