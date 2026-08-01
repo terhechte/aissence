@@ -8,8 +8,8 @@ use aissence::remote::{
     ResolveProjectRequest, ServiceConfiguration, SyncPlanRequest, SyncPlanResponse, WhoAmI,
 };
 use aissence::{
-    AissenceDocument, Summarizer, SummaryStore, analyze, persist::read_document,
-    persist::write_document,
+    AissenceDocument, LlmApi, LlmConfig, LlmConfigOverrides, Summarizer, SummaryStore, analyze,
+    persist::read_document, persist::write_document,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -51,7 +51,7 @@ enum Command {
         #[arg(default_value = ".")]
         folder: PathBuf,
     },
-    /// Summarize locally through the user's OpenRouter key or through the server.
+    /// Summarize locally through an OpenAI-compatible API or through the server.
     Summarize {
         #[arg(default_value = ".")]
         folder: PathBuf,
@@ -61,6 +61,8 @@ enum Command {
         meta_summaries: bool,
         #[arg(long, default_value = DEFAULT_SERVER)]
         server: String,
+        #[command(flatten)]
+        llm: LlmOptions,
     },
     /// Analyze and incrementally upload only missing or changed commits.
     Sync {
@@ -81,6 +83,69 @@ enum Command {
 enum Mode {
     Local,
     Server,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum LlmApiArgument {
+    Openrouter,
+    OpenaiCompatible,
+}
+
+impl From<LlmApiArgument> for LlmApi {
+    fn from(value: LlmApiArgument) -> Self {
+        match value {
+            LlmApiArgument::Openrouter => Self::OpenRouter,
+            LlmApiArgument::OpenaiCompatible => Self::OpenaiCompatible,
+        }
+    }
+}
+
+#[derive(Default, clap::Args)]
+struct LlmOptions {
+    /// TOML config file; defaults to <folder>/.aissence.toml when present.
+    #[arg(long)]
+    llm_config: Option<PathBuf>,
+    /// Request dialect used by the endpoint.
+    #[arg(long, value_enum)]
+    api: Option<LlmApiArgument>,
+    /// API base URL including /v1 (the client appends /chat/completions).
+    #[arg(long)]
+    base_url: Option<String>,
+    /// Bearer token. Prefer --api-key-env to avoid shell history exposure.
+    #[arg(long)]
+    api_key: Option<String>,
+    /// Name of an environment variable containing the bearer token.
+    #[arg(long)]
+    api_key_env: Option<String>,
+    /// Model identifier understood by the endpoint.
+    #[arg(long)]
+    model: Option<String>,
+    /// Preferred OpenRouter provider (invalid for generic endpoints).
+    #[arg(long)]
+    provider: Option<String>,
+}
+
+impl LlmOptions {
+    fn overrides(self) -> LlmConfigOverrides {
+        LlmConfigOverrides {
+            api: self.api.map(Into::into),
+            base_url: self.base_url,
+            api_key: self.api_key,
+            api_key_env: self.api_key_env,
+            model: self.model,
+            provider: self.provider,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.llm_config.is_none()
+            && self.api.is_none()
+            && self.base_url.is_none()
+            && self.api_key.is_none()
+            && self.api_key_env.is_none()
+            && self.model.is_none()
+            && self.provider.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,15 +174,22 @@ async fn run() -> Result<(), String> {
             folder,
             mode: Mode::Local,
             meta_summaries,
+            llm,
             ..
-        } => summarize_local(&folder, meta_summaries).await,
+        } => summarize_local(&folder, meta_summaries, llm).await,
         Command::Summarize {
             folder,
             mode: Mode::Server,
             server,
+            llm,
             ..
+        } => {
+            if !llm.is_empty() {
+                return Err("local LLM options cannot be used with --mode server".to_string());
+            }
+            sync_folder(&folder, &server).await
         }
-        | Command::Sync { folder, server } => sync_folder(&folder, &server).await,
+        Command::Sync { folder, server } => sync_folder(&folder, &server).await,
         Command::Upload { file, server } => upload_file(&file, &server).await,
     }
 }
@@ -136,9 +208,16 @@ fn analyze_to_file(folder: &Path) -> Result<(), String> {
     Ok(())
 }
 
-async fn summarize_local(folder: &Path, meta_summaries: bool) -> Result<(), String> {
+async fn summarize_local(
+    folder: &Path,
+    meta_summaries: bool,
+    llm: LlmOptions,
+) -> Result<(), String> {
     let mut history = analyze(folder).map_err(|error| error.to_string())?;
-    let summarizer = Summarizer::from_env()
+    let config_path = llm.llm_config.clone();
+    let config = LlmConfig::load(folder, config_path.as_deref(), llm.overrides())
+        .map_err(|error| error.to_string())?;
+    let summarizer = Summarizer::from_config(config)
         .map_err(|error| error.to_string())?
         .with_meta_summaries(meta_summaries);
     let (outcome, cost) = summarizer.summarize_history_with_cost(&mut history).await;
@@ -147,11 +226,17 @@ async fn summarize_local(folder: &Path, meta_summaries: bool) -> Result<(), Stri
     store
         .replace_from_groups(&history.groups)
         .map_err(|error| error.to_string())?;
+    let unpriced = if cost.unpriced_request_count == 0 {
+        String::new()
+    } else {
+        format!(", {} unpriced", cost.unpriced_request_count)
+    };
     println!(
-        "Wrote {} with local summaries ({} request(s), ${:.6}).",
+        "Wrote {} with local summaries ({} request(s), ${:.6}{}).",
         store.path().display(),
         cost.request_count,
-        cost.usd
+        cost.usd,
+        unpriced
     );
     Ok(())
 }

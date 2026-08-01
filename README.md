@@ -2,7 +2,8 @@
 
 Aissence correlates AI coding-agent conversations with Git commits and writes a
 shareable, sanitized `.aissence` JSON document. Summaries can be generated
-locally with the user's OpenRouter key or by the authenticated Aissence server.
+locally with OpenRouter or any standard OpenAI-compatible chat-completions API,
+or by the authenticated Aissence server.
 
 ## Workspace
 
@@ -16,8 +17,15 @@ locally with the user's OpenRouter key or by the authenticated Aissence server.
 # Create/update an unsummarized .aissence file.
 cargo run -p aissence -- analyze /path/to/project
 
-# Summarize directly with the user's OPENROUTER_API_KEY.
+# Summarize directly with the user's OPENROUTER_API_KEY (the default).
 cargo run -p aissence -- summarize --mode local /path/to/project
+
+# Or use a local/third-party OpenAI-compatible endpoint. The base URL includes
+# /v1; Aissence appends /chat/completions. --api-key-env is optional.
+cargo run -p aissence -- summarize --mode local /path/to/project \
+  --api openai-compatible \
+  --base-url http://127.0.0.1:11434/v1 \
+  --model qwen2.5-coder:7b
 
 # Browser login, then incremental server summarization.
 cargo run -p aissence -- login
@@ -37,6 +45,42 @@ access token nor password is sent to the CLI.
 Set `AISSENCE_NER_MODEL` to a compatible ONNX NER model. Without it, local and
 server redaction still use `redact-core` pattern detection plus Aissence's
 dedicated API-key, credential-assignment, and private-key detectors.
+
+### Local LLM configuration
+
+Local `summarize` accepts `--api`, `--base-url`, `--model`, `--api-key`,
+`--api-key-env`, and the OpenRouter-only `--provider`. Passing a literal key on
+the command line can expose it in shell history and process listings, so
+`--api-key-env NAME` is preferred. Authentication is optional for compatible
+local endpoints.
+
+The same values can live under `[llm]` in `<project>/.aissence.toml`, or in a
+file selected with `--llm-config PATH`:
+
+```toml
+[llm]
+api = "openai-compatible"
+base_url = "http://127.0.0.1:11434/v1"
+model = "qwen2.5-coder:7b"
+# api_key_env = "MY_LLM_API_KEY"
+```
+
+Use `api_key_env` rather than `api_key` in a file that might be committed.
+Configuration precedence is CLI arguments, then environment variables, then
+the TOML file, then built-in defaults. The generic environment names are
+`AISSENCE_LLM_API`, `AISSENCE_LLM_BASE_URL`, `AISSENCE_LLM_MODEL`,
+`AISSENCE_LLM_API_KEY`, `AISSENCE_LLM_API_KEY_ENV`, and
+`AISSENCE_LLM_PROVIDER`. Existing `OPENROUTER_API_KEY`, `OPENROUTER_MODEL`, and
+`OPENROUTER_PROVIDER` settings remain supported and OpenRouter remains the
+zero-configuration backend.
+
+Compatible endpoints use `POST <base_url>/chat/completions` with standard
+system/user messages, `temperature`, and `max_tokens`. OpenRouter-specific
+provider routing, ZDR policy fields, streaming usage, and cost metadata are
+only enabled for OpenRouter. Other endpoints use the more widely implemented
+non-streaming response path; token usage is recorded when returned, but cost is
+reported as unpriced unless the endpoint supplies OpenRouter-compatible cost
+metadata.
 
 ## Server
 
@@ -112,5 +156,6 @@ cargo run -p aissence --bin aissence-benchmark -- \
   --source-folder /path/to/project
 ```
 
-Set `OPENROUTER_API_KEY` first. Pass `--meta-summaries` to include the extended
+The benchmark remains OpenRouter-specific. Set `OPENROUTER_API_KEY` first. Pass
+`--meta-summaries` to include the extended
 aggregate and overview fields.

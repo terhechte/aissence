@@ -114,7 +114,7 @@ struct AissenceApp {
     folder: PathBuf,
     runtime: tokio::runtime::Runtime,
     phase: Arc<Mutex<Phase>>,
-    /// `None` when `OPENROUTER_API_KEY` is unset (Summarize disabled).
+    /// `None` when no valid local LLM configuration is available.
     summarizer: Option<Arc<Summarizer>>,
     meta_summaries_enabled: bool,
     /// On-disk cache of summaries, git metadata, and ignore flags.
@@ -170,9 +170,9 @@ impl AissenceApp {
             .ok()
             .map(|summarizer| summarizer.with_meta_summaries(meta_summaries_enabled))
             .map(Arc::new);
-        let notice = summarizer
-            .is_none()
-            .then(|| "Set OPENROUTER_API_KEY to enable AI summaries.".to_string());
+        let notice = summarizer.is_none().then(|| {
+            "Configure an OpenRouter or OpenAI-compatible API to enable AI summaries.".to_string()
+        });
 
         let (results_tx, results_rx) = std::sync::mpsc::channel();
 
@@ -499,7 +499,7 @@ impl AissenceApp {
                             }));
                     }
                     if self.summarizer.is_none() {
-                        button.on_disabled_hover_text("Set OPENROUTER_API_KEY");
+                        button.on_disabled_hover_text("Configure a local LLM API");
                     }
                     let active = self.in_progress.len();
                     let queued = self.queue.len();
@@ -716,7 +716,7 @@ impl AissenceApp {
                             self.start_summarize(group_idx, group, None, ui.ctx().clone());
                         }
                         if self.summarizer.is_none() {
-                            summarize.on_disabled_hover_text("Set OPENROUTER_API_KEY");
+                            summarize.on_disabled_hover_text("Configure a local LLM API");
                         }
                         if group.commit.is_some() {
                             let ignore_label = if ignored { "Un-ignore" } else { "Ignore" };

@@ -29,7 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = db::create_pool(&config.database_url)?;
     db::migrate(&pool).await?;
     let summarizer = Arc::new(
-        Summarizer::from_env()?
+        Summarizer::openrouter_from_env()?
             .with_max_request_retries(worker::HOSTED_REQUEST_RETRIES)
             .with_hosted_policy(),
     );

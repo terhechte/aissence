@@ -34,6 +34,7 @@ pub mod document;
 pub mod error;
 pub mod git;
 pub mod highlight;
+pub mod llm;
 pub mod model;
 pub mod persist;
 pub mod redact;
@@ -50,6 +51,7 @@ pub use document::{
 };
 pub use error::Error;
 pub use git::ProjectMetadata;
+pub use llm::{LlmApi, LlmConfig, LlmConfigOverrides};
 pub use model::{
     AgentUsage, CoalescedHistory, CodeChange, CommitFileChange, CommitFileStatus, CommitGroup,
     CommitInfo, CommitStats, CommitSummary, MessageKind, MessageSummary, TimedMessage, TokenCount,

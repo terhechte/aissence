@@ -1,5 +1,5 @@
 //! LLM summarization of a commit's conversation and code changes, via
-//! [OpenRouter](https://openrouter.ai/).
+//! OpenRouter or a standard OpenAI-compatible chat-completions endpoint.
 //!
 //! For each [`CommitGroup`] we summarize every user entry and retain assistant
 //! entries locally. Trivially short user entries are kept verbatim; the rest
@@ -17,8 +17,12 @@
 //! ```no_run
 //! # async fn run() -> Result<(), aissence::Error> {
 //! let mut history = aissence::analyze("/path/to/project")?;
-//! let summarizer = aissence::Summarizer::from_env()?;
-//! // OPENROUTER_API_KEY / OPENROUTER_MODEL / OPENROUTER_PROVIDER
+//! let config = aissence::LlmConfig::load(
+//!     std::path::Path::new("/path/to/project"),
+//!     None,
+//!     aissence::LlmConfigOverrides::default(),
+//! )?;
+//! let summarizer = aissence::Summarizer::from_config(config)?;
 //! summarizer.summarize_history(&mut history).await?;
 //! # Ok(()) }
 //! ```
@@ -32,32 +36,29 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use openrouter_rs::OpenRouterClient;
 use openrouter_rs::api::chat::{ChatCompletionRequest, Message, StreamOptions};
 use openrouter_rs::error::OpenRouterError;
-use openrouter_rs::types::completion::ResponseUsage;
+use openrouter_rs::types::completion::{CompletionsResponse, ResponseUsage};
 use openrouter_rs::types::{DataCollectionPolicy, ProviderPreferences, Role as OrRole};
 use serde::Deserialize;
 use tokio::sync::Semaphore;
 
 use crate::error::Error;
+pub use crate::llm::{
+    DEFAULT_MODEL, ENV_OPENROUTER_API_KEY as ENV_API_KEY, ENV_OPENROUTER_MODEL as ENV_MODEL,
+    ENV_OPENROUTER_PROVIDER as ENV_PROVIDER,
+};
+use crate::llm::{LlmApi, LlmConfig};
 use crate::model::{
     CoalescedHistory, CodeChange, CommitGroup, CommitSummary, MessageKind, MessageSummary,
     TimedMessage, TokenCount,
 };
 use crate::ncs;
 
-/// Environment variable holding the OpenRouter API key.
-pub const ENV_API_KEY: &str = "OPENROUTER_API_KEY";
-/// Environment variable selecting the model (e.g. `inclusionai/ling-2.6-flash`).
-pub const ENV_MODEL: &str = "OPENROUTER_MODEL";
-/// Environment variable selecting a preferred provider (e.g. `deepinfra`).
-pub const ENV_PROVIDER: &str = "OPENROUTER_PROVIDER";
-/// Model used when [`ENV_MODEL`] is unset.
-pub const DEFAULT_MODEL: &str = "inclusionai/ling-2.6-flash";
 /// Maximum number of commit groups summarized concurrently.
 ///
 /// Groups are cheap to keep in flight; the global request limit
 /// ([`MAX_CONCURRENT_REQUESTS`]) is the real governor of API pressure.
 pub const MAX_CONCURRENT_GROUPS: usize = 32;
-/// Maximum number of OpenRouter requests in flight across all commit groups.
+/// Maximum number of LLM requests in flight across all commit groups.
 pub const MAX_CONCURRENT_REQUESTS: usize = 24;
 /// Number of retries after the initial request for transient failures.
 /// Provider rate limits (429) can persist well beyond a few seconds when a
@@ -87,7 +88,7 @@ const CORE_PROMPT_CHARS: usize = 8_000;
 /// Maximum changed paths included in a committed implementation fingerprint.
 const CORE_FILE_LIMIT: usize = 20;
 
-/// Actual billing reported by OpenRouter for one summarization operation.
+/// Billing reported by the endpoint for one summarization operation.
 ///
 /// Costs are denominated in US dollars. A request is counted as unpriced when
 /// it succeeds but the provider response omits billing data.
@@ -125,7 +126,7 @@ pub struct SummarizationRequestUsage {
 ///
 /// While a request is streaming, [`Self::TokensReceived`] is an estimate based
 /// on received text. The completed event contains the provider's exact usage
-/// when OpenRouter returned it.
+/// when the endpoint returned it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SummarizationProgress {
     Started {
@@ -180,9 +181,19 @@ impl CostTracker {
     }
 }
 
-/// Summarizes commit groups using an OpenRouter-hosted model.
+enum CompletionClient {
+    OpenRouter(OpenRouterClient),
+    OpenaiCompatible {
+        client: reqwest::Client,
+        endpoint: String,
+        api_key: Option<String>,
+    },
+}
+
+/// Summarizes commit groups using OpenRouter or an OpenAI-compatible API.
 pub struct Summarizer {
-    client: OpenRouterClient,
+    client: CompletionClient,
+    api: LlmApi,
     model: String,
     provider: Option<String>,
     hosted_policy: bool,
@@ -196,19 +207,52 @@ pub struct Summarizer {
 impl Summarizer {
     /// Build a summarizer from the environment.
     ///
-    /// Reads [`ENV_API_KEY`] (required), [`ENV_MODEL`] (optional, defaulting to
-    /// [`DEFAULT_MODEL`]), and [`ENV_PROVIDER`] (optional).
-    ///
-    /// The provider is sent as the first entry in OpenRouter's provider
-    /// preference order. OpenRouter may still fall back to another provider.
+    /// Generic `AISSENCE_LLM_*` variables take precedence over the legacy
+    /// `OPENROUTER_*` variables. OpenAI-compatible endpoints may omit a key.
     pub fn from_env() -> Result<Self, Error> {
-        let api_key = std::env::var(ENV_API_KEY).map_err(|_| Error::MissingEnv(ENV_API_KEY))?;
-        let model = std::env::var(ENV_MODEL).unwrap_or_else(|_| DEFAULT_MODEL.to_string());
-        let provider = std::env::var(ENV_PROVIDER)
-            .ok()
-            .map(|provider| provider.trim().to_string())
-            .filter(|provider| !provider.is_empty());
-        Self::new_with_provider(api_key, model, provider)
+        Self::from_config(LlmConfig::from_environment()?)
+    }
+
+    /// Build the OpenRouter-only client used by the hosted Aissence server.
+    pub fn openrouter_from_env() -> Result<Self, Error> {
+        Self::from_config(LlmConfig::openrouter_from_environment()?)
+    }
+
+    /// Build a summarizer from a fully resolved endpoint configuration.
+    pub fn from_config(config: LlmConfig) -> Result<Self, Error> {
+        let client = match config.api {
+            LlmApi::OpenRouter => {
+                let api_key = config
+                    .api_key
+                    .as_deref()
+                    .ok_or(Error::MissingEnv(ENV_API_KEY))?;
+                let client = OpenRouterClient::builder()
+                    .base_url(config.base_url.clone())
+                    .api_key(api_key)
+                    .build()
+                    .map_err(|e| Error::Llm(format!("client build: {e}")))?;
+                CompletionClient::OpenRouter(client)
+            }
+            LlmApi::OpenaiCompatible => CompletionClient::OpenaiCompatible {
+                client: reqwest::Client::builder()
+                    .build()
+                    .map_err(|e| Error::Llm(format!("client build: {e}")))?,
+                endpoint: format!("{}/chat/completions", config.base_url),
+                api_key: config.api_key.clone(),
+            },
+        };
+        Ok(Self {
+            client,
+            api: config.api,
+            model: config.model,
+            provider: config.provider,
+            hosted_policy: false,
+            meta_summaries: false,
+            max_request_retries: DEFAULT_MAX_REQUEST_RETRIES,
+            request_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
+            progress: None,
+            next_request_id: AtomicUsize::new(0),
+        })
     }
 
     /// Build a summarizer with an explicit key and model.
@@ -222,21 +266,18 @@ impl Summarizer {
         model: impl Into<String>,
         provider: Option<String>,
     ) -> Result<Self, Error> {
-        let client = OpenRouterClient::builder()
-            .api_key(api_key.into())
-            .build()
-            .map_err(|e| Error::Llm(format!("client build: {e}")))?;
-        Ok(Self {
-            client,
+        Self::from_config(LlmConfig {
+            api: LlmApi::OpenRouter,
+            base_url: crate::llm::OPENROUTER_BASE_URL.to_string(),
+            api_key: Some(api_key.into()),
             model: model.into(),
             provider,
-            hosted_policy: false,
-            meta_summaries: false,
-            max_request_retries: DEFAULT_MAX_REQUEST_RETRIES,
-            request_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
-            progress: None,
-            next_request_id: AtomicUsize::new(0),
         })
+    }
+
+    /// The configured request dialect.
+    pub fn api(&self) -> LlmApi {
+        self.api
     }
 
     /// The model id this summarizer uses.
@@ -276,9 +317,9 @@ impl Summarizer {
 
     /// Attach a callback that receives live request progress.
     ///
-    /// Enabling progress also switches requests to OpenRouter's streaming
-    /// endpoint so token estimates can be updated while a response is in
-    /// flight. Callbacks should be quick; they run on the request task.
+    /// OpenRouter requests stream token estimates while in flight. Generic
+    /// compatible requests emit lifecycle and final usage events, using the
+    /// broadly supported non-streaming contract. Callbacks should be quick.
     pub fn with_progress<F>(mut self, callback: F) -> Self
     where
         F: Fn(SummarizationProgress) + Send + Sync + 'static,
@@ -300,7 +341,7 @@ impl Summarizer {
         self.summarize_history_with_cost(history).await.0
     }
 
-    /// Summarize every non-empty group and return the actual OpenRouter cost.
+    /// Summarize every non-empty group and return any endpoint-reported cost.
     ///
     /// The returned cost includes successful requests made before a later
     /// request failed. As with [`Self::summarize_history`], summaries are only
@@ -343,7 +384,7 @@ impl Summarizer {
         self.summarize_group_with_cost(group).await.0
     }
 
-    /// Summarize one group and return the actual OpenRouter cost incurred,
+    /// Summarize one group and return any endpoint-reported cost incurred,
     /// including costs from requests made before a later request failed.
     pub async fn summarize_group_with_cost(
         &self,
@@ -673,6 +714,11 @@ impl Summarizer {
         kind: SummarizationRequestKind,
         costs: &CostTracker,
     ) -> Result<String, Error> {
+        if self.hosted_policy && self.api != LlmApi::OpenRouter {
+            return Err(Error::Llm(
+                "the hosted privacy policy requires the OpenRouter API".to_string(),
+            ));
+        }
         let mut request = ChatCompletionRequest::builder();
         request
             .model(self.model.as_str())
@@ -685,7 +731,7 @@ impl Summarizer {
         if let Some(preferences) = self.provider_preferences() {
             request.provider(preferences);
         }
-        if self.progress.is_some() {
+        if self.progress.is_some() && self.api == LlmApi::OpenRouter {
             let mut stream_options = StreamOptions::default();
             stream_options.include_usage = Some(true);
             request.stream_options(stream_options);
@@ -702,32 +748,15 @@ impl Summarizer {
                     let _permit = self.request_limit.acquire().await.map_err(|_| {
                         Error::Llm("summarization request limiter closed".to_string())
                     })?;
-                    if self.progress.is_some() {
-                        self.emit_progress(SummarizationProgress::Started {
-                            id: request_id,
-                            kind,
-                        });
-                        self.stream_completion(&request, request_id).await
-                    } else {
-                        self.client.chat().create(&request).await.map(|response| {
-                            CompletionResponse {
-                                text: response
-                                    .choices
-                                    .first()
-                                    .and_then(|choice| choice.content())
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                usage: response.usage,
-                            }
-                        })
-                    }
+                    self.emit_progress(SummarizationProgress::Started {
+                        id: request_id,
+                        kind,
+                    });
+                    self.send_completion(&request, request_id).await
                 };
                 match result {
                     Ok(response) => break response,
-                    Err(error)
-                        if is_retryable_request_error(&error)
-                            && retry < self.max_request_retries =>
-                    {
+                    Err(error) if error.retryable && retry < self.max_request_retries => {
                         self.emit_progress(SummarizationProgress::Retrying {
                             id: request_id,
                             kind,
@@ -766,6 +795,9 @@ impl Summarizer {
     }
 
     fn provider_preferences(&self) -> Option<ProviderPreferences> {
+        if self.api != LlmApi::OpenRouter {
+            return None;
+        }
         if self.provider.is_none() && !self.hosted_policy {
             return None;
         }
@@ -787,16 +819,21 @@ impl Summarizer {
 
     async fn stream_completion(
         &self,
+        client: &OpenRouterClient,
         request: &ChatCompletionRequest,
         request_id: usize,
-    ) -> Result<CompletionResponse, OpenRouterError> {
-        let mut stream = self.client.chat().stream(request).await?;
+    ) -> Result<CompletionResponse, CompletionError> {
+        let mut stream = client
+            .chat()
+            .stream(request)
+            .await
+            .map_err(CompletionError::openrouter)?;
         let mut text = String::new();
         let mut received_chars = 0;
         let mut usage = None;
 
         while let Some(event) = stream.next().await {
-            let response = event?;
+            let response = event.map_err(CompletionError::openrouter)?;
             if let Some(response_usage) = response.usage {
                 usage = Some(response_usage);
             }
@@ -821,6 +858,58 @@ impl Summarizer {
         Ok(CompletionResponse { text, usage })
     }
 
+    async fn send_completion(
+        &self,
+        request: &ChatCompletionRequest,
+        request_id: usize,
+    ) -> Result<CompletionResponse, CompletionError> {
+        match &self.client {
+            CompletionClient::OpenRouter(client) if self.progress.is_some() => {
+                self.stream_completion(client, request, request_id).await
+            }
+            CompletionClient::OpenRouter(client) => client
+                .chat()
+                .create(request)
+                .await
+                .map(completion_response)
+                .map_err(CompletionError::openrouter),
+            CompletionClient::OpenaiCompatible {
+                client,
+                endpoint,
+                api_key,
+            } => {
+                let mut request_builder = client.post(endpoint).json(request);
+                if let Some(api_key) = api_key {
+                    request_builder = request_builder.bearer_auth(api_key);
+                }
+                let response = request_builder
+                    .send()
+                    .await
+                    .map_err(|error| CompletionError {
+                        message: error.to_string(),
+                        retryable: error.is_timeout() || error.is_connect(),
+                    })?;
+                let status = response.status();
+                if !status.is_success() {
+                    let body = response.text().await.unwrap_or_default();
+                    let detail = extract_api_error(&body);
+                    return Err(CompletionError {
+                        message: format!("upstream returned {status}: {detail}"),
+                        retryable: is_retryable_status(status.as_u16()),
+                    });
+                }
+                response
+                    .json::<CompletionsResponse>()
+                    .await
+                    .map(completion_response)
+                    .map_err(|error| CompletionError {
+                        message: format!("invalid chat completion response: {error}"),
+                        retryable: false,
+                    })
+            }
+        }
+    }
+
     fn emit_progress(&self, progress: SummarizationProgress) {
         if let Some(callback) = &self.progress {
             callback(progress);
@@ -831,6 +920,59 @@ impl Summarizer {
 struct CompletionResponse {
     text: String,
     usage: Option<ResponseUsage>,
+}
+
+fn completion_response(response: CompletionsResponse) -> CompletionResponse {
+    CompletionResponse {
+        text: response
+            .choices
+            .first()
+            .and_then(|choice| choice.content())
+            .unwrap_or_default()
+            .to_string(),
+        usage: response.usage,
+    }
+}
+
+#[derive(Debug)]
+struct CompletionError {
+    message: String,
+    retryable: bool,
+}
+
+impl CompletionError {
+    fn openrouter(error: OpenRouterError) -> Self {
+        Self {
+            retryable: is_retryable_request_error(&error),
+            message: error.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for CompletionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+fn extract_api_error(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .or_else(|| value.get("message"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| {
+            let trimmed = body.trim();
+            if trimmed.is_empty() {
+                "empty response body".to_string()
+            } else {
+                truncate_head(trimmed, 500)
+            }
+        })
 }
 
 fn request_usage(usage: &ResponseUsage) -> SummarizationRequestUsage {
@@ -1658,6 +1800,7 @@ fn is_edit_tool(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn item(kind: MessageKind, text: &str) -> RawItem {
         RawItem {
@@ -1919,6 +2062,97 @@ mod tests {
 
         assert!(outcome.is_ok());
         assert_eq!(cost, SummarizationCost::default());
+    }
+
+    #[tokio::test]
+    async fn openai_compatible_endpoint_supports_requests_without_authentication() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut socket).await;
+            let body = serde_json::json!({
+                "id": "test-completion",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "local-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "Local summary."},
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 4,
+                    "completion_tokens": 2,
+                    "total_tokens": 6
+                }
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            request
+        });
+        let summarizer = Summarizer::from_config(LlmConfig {
+            api: LlmApi::OpenaiCompatible,
+            base_url: format!("http://{address}/v1"),
+            api_key: None,
+            model: "local-model".to_string(),
+            provider: None,
+        })
+        .unwrap();
+        let costs = CostTracker::default();
+
+        let summary = summarizer
+            .complete(
+                "Summarize.",
+                "Some input".to_string(),
+                100,
+                SummarizationRequestKind::CoreOutcome,
+                &costs,
+            )
+            .await
+            .unwrap();
+        let request = server.await.unwrap();
+
+        assert_eq!(summary, "Local summary.");
+        assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
+        assert!(!request.to_ascii_lowercase().contains("authorization:"));
+        assert!(!request.contains("\"provider\""));
+        assert!(!request.contains("\"stream_options\""));
+        assert_eq!(costs.total().unpriced_request_count, 1);
+    }
+
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> String {
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let read = socket.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+            let Some(headers_end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") else {
+                continue;
+            };
+            let header_text = String::from_utf8_lossy(&bytes[..headers_end]);
+            let content_length = header_text
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if bytes.len() >= headers_end + 4 + content_length {
+                break;
+            }
+        }
+        String::from_utf8(bytes).unwrap()
     }
 
     #[test]

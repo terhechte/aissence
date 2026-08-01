@@ -25,7 +25,11 @@ pub enum Error {
     #[error("missing environment variable: {0}")]
     MissingEnv(&'static str),
 
-    /// The OpenRouter client or a summarization request failed.
+    /// LLM configuration could not be loaded or validated.
+    #[error("llm configuration error: {0}")]
+    LlmConfig(String),
+
+    /// The configured LLM client or a summarization request failed.
     #[error("llm error: {0}")]
     Llm(String),
 }

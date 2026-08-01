@@ -55,6 +55,7 @@ thiserror.workspace = true
 # (the `ncs::ContentBlock::ToolUse` payload is a serde_json::Value).
 serde.workspace = true
 serde_json.workspace = true
+toml = "0.9"
 # OpenCode stores current sessions in a SQLite database. `bundled` keeps the
 # desktop app independent of a system SQLite installation.
 rusqlite = { version = "0.40.1", features = ["bundled"] }
