@@ -272,7 +272,7 @@ impl LiveProgress {
             if let Some(line) = lines.get(index) {
                 let _ = write!(stderr, "{line}");
             }
-            let _ = write!(stderr, "\n");
+            let _ = writeln!(stderr);
         }
         let _ = stderr.flush();
         self.rendered_lines = slots;
@@ -403,7 +403,7 @@ async fn run() -> Result<(), String> {
         ));
     }
 
-    let mut store = SummaryStore::empty_at(&cache_path);
+    let mut store = SummaryStore::empty_at_for_folder(&cache_path, &args.source_folder);
     store
         .replace_from_groups(&history.groups)
         .map_err(|error| format!("cannot write {}: {error}", cache_path.display()))?;

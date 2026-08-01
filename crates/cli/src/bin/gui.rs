@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 
 use aissence::{
     CoalescedHistory, CommitGroup, CommitSummary, DiffView, MAX_CONCURRENT_GROUPS, MessageKind,
-    SummarizationCost, Summarizer, SummaryStore, TokenCount, analyze, git, persist, summarize,
+    SummarizationCost, Summarizer, SummaryStore, TokenCount, analyze, git, summarize,
 };
 use eframe::egui;
 use elegance::{Accent, Button, Callout, CalloutTone, Card, Spinner, Theme};
@@ -91,7 +91,6 @@ enum Phase {
 /// Result of one background summarization, sent back to the UI thread.
 struct SummarizeResult {
     group_index: usize,
-    signature: u64,
     batch_id: Option<u64>,
     cost: SummarizationCost,
     outcome: Result<CommitSummary, String>,
@@ -203,57 +202,28 @@ impl AissenceApp {
     }
 
     fn on_ready(&mut self, mut history: CoalescedHistory) {
-        // Apply summaries cached in `.aissence` (resume without re-summarizing).
-        // Token counts and retained source text come from the session data, not
-        // the model, so backfill them onto older caches — for display now, and
-        // once back to disk so the `.aissence` output carries them too.
-        let mut backfills: Vec<(String, u64, CommitSummary)> = Vec::new();
+        // Apply summaries whose stable source digest still matches, then write
+        // every committed source group so the file is uploadable even before
+        // local summarization has run.
         for group in history.groups.iter_mut() {
-            let Some(commit_id) = group.commit.as_ref().map(|c| c.id.clone()) else {
-                continue;
-            };
-            let signature = persist::signature(group);
-            if let Some(cached) = self.store.get(&commit_id, signature) {
-                let mut summary = cached.clone();
-                let current_agents = aissence::agents_for(group);
-                let token_backfill = (summary.tokens.is_none() && group.token_usage().is_some())
-                    || summary.agents != current_agents;
-                summarize::attach_token_usage(group, &mut summary);
-                let content_backfill = summarize::attach_source_content(group, &mut summary);
+            if let Some(cached) = self.store.get_for_group(group) {
+                let summary = cached.clone();
                 if !summarize::has_required_user_summaries(group, &summary) {
                     continue;
                 }
                 if !summarize::has_required_core_summaries(group, &summary) {
                     continue;
                 }
-                let core_backfill = if self.meta_summaries_enabled {
-                    summarize::attach_core_fallbacks(group, &mut summary)
-                } else {
-                    false
-                };
                 if self.meta_summaries_enabled
                     && (!summarize::has_required_extended_summaries(group, &summary)
                         || !summarize::has_required_meta_summary(&summary))
                 {
                     continue;
                 }
-                if token_backfill || content_backfill || core_backfill {
-                    backfills.push((commit_id, signature, summary.clone()));
-                }
                 group.summary = Some(summary);
             }
         }
-        if !backfills.is_empty()
-            && let Err(err) = self.store.backfill_summaries(backfills)
-        {
-            self.notice = Some(format!("Could not write .aissence: {err}"));
-        }
-        if let Err(err) = self.store.backfill_commit_metadata(
-            history
-                .groups
-                .iter()
-                .filter_map(|group| group.commit.as_ref()),
-        ) {
+        if let Err(err) = self.store.sync_groups(&history.groups) {
             self.notice = Some(format!("Could not write .aissence: {err}"));
         }
 
@@ -275,16 +245,9 @@ impl AissenceApp {
                 Ok(summary) => {
                     if let Some(group) = history.groups.get_mut(result.group_index) {
                         group.summary = Some(summary.clone());
-                    }
-                    if let Some(commit) = history
-                        .groups
-                        .get(result.group_index)
-                        .and_then(|group| group.commit.as_ref())
-                        && let Err(err) =
-                            self.store
-                                .insert_and_save(commit, result.signature, summary)
-                    {
-                        self.notice = Some(format!("Could not write .aissence: {err}"));
+                        if let Err(err) = self.store.insert_and_save(group, summary) {
+                            self.notice = Some(format!("Could not write .aissence: {err}"));
+                        }
                     }
                 }
                 Err(err) => self.notice = Some(format!("Summarization failed: {err}")),
@@ -311,7 +274,6 @@ impl AissenceApp {
         }
 
         let commit_id = group.commit.as_ref().map(|c| c.id.clone());
-        let signature = persist::signature(group);
         if let Some(id) = &commit_id
             && let Err(err) = self.store.set_ignored(id, false)
         {
@@ -325,7 +287,6 @@ impl AissenceApp {
             let (outcome, cost) = summarizer.summarize_group_with_cost(&group).await;
             let _ = tx.send(SummarizeResult {
                 group_index,
-                signature,
                 batch_id,
                 cost,
                 outcome: outcome.map_err(|e| e.to_string()),

@@ -30,24 +30,33 @@
 //! ```
 
 pub mod coalesce;
+pub mod document;
 pub mod error;
 pub mod git;
 pub mod highlight;
 pub mod model;
 pub mod persist;
+pub mod redact;
+pub mod remote;
 pub mod sessions;
 pub mod summarize;
 pub mod ui;
 
 use std::path::Path;
 
+pub use document::{
+    AissenceCommit, AissenceDocument, AissenceProject, CommitSource, DOCUMENT_VERSION,
+    SANITIZER_VERSION,
+};
 pub use error::Error;
+pub use git::ProjectMetadata;
 pub use model::{
     AgentUsage, CoalescedHistory, CodeChange, CommitFileChange, CommitFileStatus, CommitGroup,
     CommitInfo, CommitStats, CommitSummary, MessageKind, MessageSummary, TimedMessage, TokenCount,
     agents_for, friendly_agent,
 };
 pub use persist::SummaryStore;
+pub use redact::Redactor;
 pub use summarize::{
     MAX_CONCURRENT_GROUPS, MAX_CONCURRENT_REQUESTS, SummarizationCost, SummarizationProgress,
     SummarizationRequestKind, SummarizationRequestUsage, Summarizer,

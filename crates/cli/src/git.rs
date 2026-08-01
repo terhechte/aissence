@@ -4,9 +4,70 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use chrono::DateTime;
+use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
 use crate::model::{CommitFileChange, CommitFileStatus, CommitInfo, CommitStats};
+
+/// Optional project identity captured in the `.aissence` cache.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectMetadata {
+    /// The name of the repository's working-tree directory, if available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The configured remote in `host/path` form, without credentials or a
+    /// protocol prefix (for example, `github.com/org/repo`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+}
+
+/// Best-effort project identity for the repository containing `folder`.
+///
+/// This intentionally returns optional fields rather than an error: a git
+/// repository may have no working tree, no configured remote, or a remote that
+/// cannot be parsed as a host/path pair.
+pub fn project_metadata(folder: &Path) -> Option<ProjectMetadata> {
+    let repo = gix::discover(folder).ok()?;
+    let name = repo
+        .workdir()
+        .or(Some(folder))
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned);
+    let repository = remote_repository(&repo);
+
+    (name.is_some() || repository.is_some()).then_some(ProjectMetadata { name, repository })
+}
+
+fn remote_repository(repo: &gix::Repository) -> Option<String> {
+    let remote = repo.find_remote("origin").ok().or_else(|| {
+        repo.find_default_remote(gix::remote::Direction::Fetch)
+            .and_then(Result::ok)
+    })?;
+    let url = remote.url(gix::remote::Direction::Fetch)?;
+    let host = url.host.as_deref()?.trim();
+    if host.is_empty() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(url.path.as_ref())
+        .trim_matches('/')
+        .to_owned();
+    let path = path
+        .strip_suffix(".git")
+        .unwrap_or(&path)
+        .trim_matches('/')
+        .to_owned();
+    if path.is_empty() {
+        return None;
+    }
+
+    let host = match url.port {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_owned(),
+    };
+    Some(format!("{host}/{path}"))
+}
 
 /// Return every commit reachable from `HEAD` for the repository containing
 /// `folder`, sorted oldest-first by committer time.
@@ -315,6 +376,46 @@ mod tests {
                 path: "renamed.txt".into(),
                 previous_path: Some("notes.txt".into()),
             }]
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn project_metadata_uses_worktree_name_and_remote_host_path() {
+        let dir = tmp_dir("project-metadata");
+        git(&dir, &["init", "-q"]);
+        git(
+            &dir,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:owner/aissence.git",
+            ],
+        );
+
+        let name = dir.file_name().unwrap().to_str().unwrap().to_owned();
+        assert_eq!(
+            project_metadata(&dir),
+            Some(ProjectMetadata {
+                name: Some(name),
+                repository: Some("github.com/owner/aissence".into()),
+            })
+        );
+
+        git(
+            &dir,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://git.example.test/team/aissence.git",
+            ],
+        );
+        assert_eq!(
+            project_metadata(&dir).and_then(|project| project.repository),
+            Some("git.example.test/team/aissence".into())
         );
 
         std::fs::remove_dir_all(&dir).ok();

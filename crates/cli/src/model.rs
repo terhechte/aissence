@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 /// Counts are calculated from the committed trees (against the first parent,
 /// or the empty tree for a root commit), not from assistant tool calls.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommitStats {
     /// Number of changed files, including binary files and submodules.
     pub files_changed: u64,
@@ -21,7 +22,7 @@ pub struct CommitStats {
 }
 
 /// How one file changed in the committed tree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommitFileStatus {
     Added,
     Modified,
@@ -44,7 +45,8 @@ impl CommitFileStatus {
 }
 
 /// One authoritative file-level change introduced by a git commit.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommitFileChange {
     pub status: CommitFileStatus,
     /// Destination/current path. For deletions, this is the deleted path.
@@ -156,6 +158,7 @@ impl TimedMessage {
 /// turns; per-message counts are the turn's usage attributed to the assistant
 /// message the turn produced (approximate — see `DATA.md`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TokenCount {
     /// Input (prompt) tokens.
     pub input: u64,
@@ -226,6 +229,7 @@ impl MessageKind {
 
 /// The coding agent + model used in a session — a commit's "provenance".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentUsage {
     /// Friendly agent name: `Claude Code`, `Codex`, `OpenCode`, `Gemini`.
     pub provider: String,
@@ -299,6 +303,7 @@ pub fn agents_for(group: &CommitGroup) -> Vec<AgentUsage> {
 /// A single code edit the assistant made, rendered as a unified diff so it can
 /// be shown in [`crate::DiffView`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CodeChange {
     /// Editing tool that produced the change (e.g. `Edit`, `Write`).
     pub tool: String,
@@ -310,6 +315,7 @@ pub struct CodeChange {
 
 /// One conversation entry within a commit group.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MessageSummary {
     pub kind: MessageKind,
     /// LLM-generated summary for [`MessageKind::UserWrote`]. Newly generated
@@ -337,6 +343,7 @@ pub struct MessageSummary {
 /// extended summaries. [`messages`](Self::messages) holds the conversation
 /// breakdown; only user entries receive per-entry LLM summaries.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommitSummary {
     /// Locally combined summaries of what the user asked for.
     pub user_requested: String,

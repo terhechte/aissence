@@ -33,7 +33,7 @@ use openrouter_rs::OpenRouterClient;
 use openrouter_rs::api::chat::{ChatCompletionRequest, Message, StreamOptions};
 use openrouter_rs::error::OpenRouterError;
 use openrouter_rs::types::completion::ResponseUsage;
-use openrouter_rs::types::{ProviderPreferences, Role as OrRole};
+use openrouter_rs::types::{DataCollectionPolicy, ProviderPreferences, Role as OrRole};
 use serde::Deserialize;
 use tokio::sync::Semaphore;
 
@@ -62,7 +62,7 @@ pub const MAX_CONCURRENT_REQUESTS: usize = 24;
 /// Number of retries after the initial request for transient failures.
 /// Provider rate limits (429) can persist well beyond a few seconds when a
 /// batch of groups starts at once, so the budget is generous.
-const MAX_REQUEST_RETRIES: usize = 7;
+const DEFAULT_MAX_REQUEST_RETRIES: usize = 7;
 /// Initial grace period before retrying; subsequent waits double.
 const RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
 /// Longest grace period between retries (before jitter).
@@ -185,7 +185,9 @@ pub struct Summarizer {
     client: OpenRouterClient,
     model: String,
     provider: Option<String>,
+    hosted_policy: bool,
     meta_summaries: bool,
+    max_request_retries: usize,
     request_limit: Arc<Semaphore>,
     progress: Option<Arc<dyn Fn(SummarizationProgress) + Send + Sync>>,
     next_request_id: AtomicUsize,
@@ -228,7 +230,9 @@ impl Summarizer {
             client,
             model: model.into(),
             provider,
+            hosted_policy: false,
             meta_summaries: false,
+            max_request_retries: DEFAULT_MAX_REQUEST_RETRIES,
             request_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
             progress: None,
             next_request_id: AtomicUsize::new(0),
@@ -250,6 +254,23 @@ impl Summarizer {
     /// Per-user-prompt summaries and `ai_answered` are always generated.
     pub fn with_meta_summaries(mut self, enabled: bool) -> Self {
         self.meta_summaries = enabled;
+        self
+    }
+
+    /// Set the number of transient retries after the initial upstream call.
+    /// The hosted service uses one; local mode retains the more forgiving
+    /// default.
+    pub fn with_max_request_retries(mut self, retries: usize) -> Self {
+        self.max_request_retries = retries;
+        self
+    }
+
+    /// Apply the hosted-service provider policy. Hosted requests reject
+    /// providers that retain prompt data, require zero-data-retention
+    /// endpoints, and never silently fall back outside the configured
+    /// provider. Local summarization keeps the user's OpenRouter defaults.
+    pub fn with_hosted_policy(mut self) -> Self {
+        self.hosted_policy = true;
         self
     }
 
@@ -333,6 +354,30 @@ impl Summarizer {
         (outcome, costs.total())
     }
 
+    /// Summarize one commit received from a version-2 `.aissence` document.
+    ///
+    /// The server uses this entry point so it consumes the exact sanitized
+    /// source represented by the upload rather than reconstructing local agent
+    /// session files.
+    pub async fn summarize_document_commit_with_cost(
+        &self,
+        commit: &crate::document::AissenceCommit,
+    ) -> (Result<CommitSummary, Error>, SummarizationCost) {
+        let costs = CostTracker::default();
+        let items = raw_items_from_source(&commit.source.messages);
+        let info = document_commit_info(commit);
+        let outcome = self
+            .summarize_items_tracked(
+                &items,
+                Some(&info),
+                commit.source.agents.clone(),
+                commit.source.tokens,
+                &costs,
+            )
+            .await;
+        (outcome, costs.total())
+    }
+
     async fn summarize_group_tracked(
         &self,
         group: &CommitGroup,
@@ -341,8 +386,25 @@ impl Summarizer {
         // Consecutive messages of the same kind (e.g. several "ai changed" in a
         // row) are merged locally into a single retained entry.
         let items = coalesce_consecutive(raw_items(group));
-        let commit_context = group
-            .commit
+        self.summarize_items_tracked(
+            &items,
+            group.commit.as_ref(),
+            crate::model::agents_for(group),
+            group.token_usage(),
+            costs,
+        )
+        .await
+    }
+
+    async fn summarize_items_tracked(
+        &self,
+        items: &[RawItem],
+        commit: Option<&crate::model::CommitInfo>,
+        agents: Vec<crate::model::AgentUsage>,
+        tokens: Option<TokenCount>,
+        costs: &CostTracker,
+    ) -> Result<CommitSummary, Error> {
+        let commit_context = commit
             .as_ref()
             .map(|c| c.summary.clone())
             .unwrap_or_else(|| "(uncommitted work in progress)".to_string());
@@ -351,11 +413,11 @@ impl Summarizer {
         // concurrently with the user-entry summaries instead of waiting on
         // them — one model round trip less on the per-group critical path.
         let (entry_summaries, (ai_answered, ai_implemented)) = futures::try_join!(
-            self.summarize_user_entries(&items, costs),
-            self.summarize_core_outcome(&items, group.commit.as_ref(), self.meta_summaries, costs),
+            self.summarize_user_entries(items, costs),
+            self.summarize_core_outcome(items, commit, self.meta_summaries, costs),
         )?;
         let user_requested = if self.meta_summaries {
-            aggregate_user_requests(&items, &entry_summaries)
+            aggregate_user_requests(items, &entry_summaries)
         } else {
             String::new()
         };
@@ -395,9 +457,9 @@ impl Summarizer {
             ai_answered,
             ai_implemented,
             messages,
-            agents: crate::model::agents_for(group),
+            agents,
             meta,
-            tokens: group.token_usage(),
+            tokens,
         })
     }
 
@@ -554,27 +616,11 @@ impl Summarizer {
                 .into_iter()
                 .map(|summary| summary.trim().to_string())
                 .collect()),
-            // The model returned something unusable — retry the batch's
-            // entries individually.
-            None => {
-                let mut summaries = Vec::with_capacity(batch.len());
-                for index in batch {
-                    summaries.push(
-                        self.complete(
-                            "You summarize one complete user prompt from a coding session. \
-                             Preserve every important request, constraint, question, correction, \
-                             and reported problem. Reply with a concise 2-3 sentence summary and \
-                             no preamble.",
-                            format!("Complete user prompt:\n\n{}", items[*index].text),
-                            300,
-                            SummarizationRequestKind::UserBatch { entries: 1 },
-                            costs,
-                        )
-                        .await?,
-                    );
-                }
-                Ok(summaries)
-            }
+            // Do not fan one malformed batch out into N paid calls. The caller
+            // may retry the bounded batch within its normal attempt budget.
+            None => Err(Error::Llm(
+                "model returned an invalid user-summary batch".to_string(),
+            )),
         }
     }
 
@@ -636,9 +682,7 @@ impl Summarizer {
             ])
             .temperature(0.2)
             .max_tokens(max_tokens);
-        if let Some(provider) = &self.provider {
-            let mut preferences = ProviderPreferences::default();
-            preferences.order = Some(vec![provider.clone()]);
+        if let Some(preferences) = self.provider_preferences() {
             request.provider(preferences);
         }
         if self.progress.is_some() {
@@ -681,7 +725,8 @@ impl Summarizer {
                 match result {
                     Ok(response) => break response,
                     Err(error)
-                        if is_retryable_request_error(&error) && retry < MAX_REQUEST_RETRIES =>
+                        if is_retryable_request_error(&error)
+                            && retry < self.max_request_retries =>
                     {
                         self.emit_progress(SummarizationProgress::Retrying {
                             id: request_id,
@@ -718,6 +763,26 @@ impl Summarizer {
 
         let text = response.text.trim().to_string();
         Ok(text)
+    }
+
+    fn provider_preferences(&self) -> Option<ProviderPreferences> {
+        if self.provider.is_none() && !self.hosted_policy {
+            return None;
+        }
+        let mut preferences = ProviderPreferences::default();
+        if let Some(provider) = &self.provider {
+            preferences.order = Some(vec![provider.clone()]);
+            if self.hosted_policy {
+                preferences.only = Some(vec![provider.clone()]);
+            }
+        }
+        if self.hosted_policy {
+            preferences.allow_fallbacks = Some(false);
+            preferences.require_parameters = Some(true);
+            preferences.data_collection = Some(DataCollectionPolicy::Deny);
+            preferences.zdr = Some(true);
+        }
+        Some(preferences)
     }
 
     async fn stream_completion(
@@ -1213,6 +1278,63 @@ fn raw_items(group: &CommitGroup) -> Vec<RawItem> {
         }
     }
     items
+}
+
+/// Build the model-independent source entries persisted in a version-2
+/// `.aissence` document. No LLM-generated text is included.
+pub fn source_messages(group: &CommitGroup) -> Vec<MessageSummary> {
+    coalesce_consecutive(raw_items(group))
+        .into_iter()
+        .map(|item| MessageSummary {
+            kind: item.kind,
+            summary: None,
+            content: retained_content(&item),
+            changes: item.changes,
+            timestamp: item.timestamp,
+            tokens: item.tokens,
+        })
+        .collect()
+}
+
+fn raw_items_from_source(messages: &[MessageSummary]) -> Vec<RawItem> {
+    let items = messages
+        .iter()
+        .map(|message| RawItem {
+            kind: message.kind,
+            text: message
+                .content
+                .clone()
+                .unwrap_or_else(|| render_changes(&message.changes)),
+            changes: message.changes.clone(),
+            timestamp: message.timestamp,
+            tokens: message.tokens,
+        })
+        .collect();
+    coalesce_consecutive(items)
+}
+
+fn document_commit_info(commit: &crate::document::AissenceCommit) -> crate::model::CommitInfo {
+    let message = match commit
+        .body
+        .as_deref()
+        .filter(|body| !body.trim().is_empty())
+    {
+        Some(body) => format!("{}\n\n{body}", commit.title),
+        None => commit.title.clone(),
+    };
+    crate::model::CommitInfo {
+        id: commit.commit_hash.clone(),
+        short_id: commit.commit_hash.chars().take(12).collect(),
+        summary: commit.title.clone(),
+        body: commit.body.clone(),
+        message,
+        // Author identity is deliberately not part of the share/upload format.
+        author_name: String::new(),
+        author_email: String::new(),
+        time: commit.date,
+        stats: commit.stats,
+        files: commit.files.clone(),
+    }
 }
 
 /// Merge runs of consecutive same-kind items into one. The merged item keeps
@@ -1847,6 +1969,29 @@ mod tests {
 
         let summarizer = summarizer.with_meta_summaries(true);
         assert!(summarizer.meta_summaries_enabled());
+    }
+
+    #[test]
+    fn hosted_policy_is_fail_closed_and_pins_the_provider() {
+        let summarizer = Summarizer::new_with_provider(
+            "test-key",
+            "example/model",
+            Some("deepinfra".to_string()),
+        )
+        .unwrap()
+        .with_hosted_policy();
+        let preferences = summarizer.provider_preferences().unwrap();
+        assert_eq!(
+            serde_json::to_value(preferences).unwrap(),
+            serde_json::json!({
+                "allow_fallbacks": false,
+                "require_parameters": true,
+                "data_collection": "deny",
+                "zdr": true,
+                "order": ["deepinfra"],
+                "only": ["deepinfra"]
+            })
+        );
     }
 
     #[test]
