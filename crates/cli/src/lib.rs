@@ -54,8 +54,8 @@ pub use git::ProjectMetadata;
 pub use llm::{LlmApi, LlmConfig, LlmConfigOverrides};
 pub use model::{
     AgentUsage, CoalescedHistory, CodeChange, CommitFileChange, CommitFileStatus, CommitGroup,
-    CommitInfo, CommitStats, CommitSummary, MessageKind, MessageSummary, TimedMessage, TokenCount,
-    agents_for, friendly_agent,
+    CommitInfo, CommitStats, CommitSummary, MessageKind, MessageSummary, PublicBeat, PublicStory,
+    TimedMessage, TokenCount, agents_for, friendly_agent,
 };
 pub use persist::SummaryStore;
 pub use redact::Redactor;

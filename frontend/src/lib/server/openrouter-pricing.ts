@@ -259,8 +259,8 @@ export function priceSnapshot(
     commits: snapshot.commits.map((commit) => ({
       ...commit,
       pricing: estimatePotentialCost(
-        commit.summary.tokens,
-        commit.summary.agents,
+        commit.source.tokens,
+        commit.source.agents,
         catalog,
         pricedAt
       )

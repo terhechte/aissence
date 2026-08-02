@@ -156,6 +156,5 @@ cargo run -p aissence --bin aissence-benchmark -- \
   --source-folder /path/to/project
 ```
 
-The benchmark remains OpenRouter-specific. Set `OPENROUTER_API_KEY` first. Pass
-`--meta-summaries` to include the extended
-aggregate and overview fields.
+The benchmark remains OpenRouter-specific. Set `OPENROUTER_API_KEY` first. It
+uses the same bounded, one-request public-story flow as normal generation.

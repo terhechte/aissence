@@ -26,7 +26,11 @@ pub async fn migrate(pool: &Pool) -> Result<(), String> {
         .await
         .map_err(|error| format!("cannot acquire database connection: {error}"))?;
     client
-        .batch_execute(include_str!("../migrations/0001_remote_summarization.sql"))
+        .batch_execute(&format!(
+            "{}\n{}",
+            include_str!("../../../frontend/supabase/migrations/202608010002_remote_ingestion.sql"),
+            include_str!("../../../frontend/supabase/migrations/202608020001_summary_tiers.sql")
+        ))
         .await
         .map_err(|error| format!("database migration failed: {error}"))
 }

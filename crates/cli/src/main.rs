@@ -57,8 +57,6 @@ enum Command {
         folder: PathBuf,
         #[arg(long, value_enum, default_value_t = Mode::Local)]
         mode: Mode,
-        #[arg(long)]
-        meta_summaries: bool,
         #[arg(long, default_value = DEFAULT_SERVER)]
         server: String,
         #[command(flatten)]
@@ -173,10 +171,9 @@ async fn run() -> Result<(), String> {
         Command::Summarize {
             folder,
             mode: Mode::Local,
-            meta_summaries,
             llm,
             ..
-        } => summarize_local(&folder, meta_summaries, llm).await,
+        } => summarize_local(&folder, llm).await,
         Command::Summarize {
             folder,
             mode: Mode::Server,
@@ -208,21 +205,22 @@ fn analyze_to_file(folder: &Path) -> Result<(), String> {
     Ok(())
 }
 
-async fn summarize_local(
-    folder: &Path,
-    meta_summaries: bool,
-    llm: LlmOptions,
-) -> Result<(), String> {
+async fn summarize_local(folder: &Path, llm: LlmOptions) -> Result<(), String> {
     let mut history = analyze(folder).map_err(|error| error.to_string())?;
+    let mut store = SummaryStore::load(folder);
+    for group in &mut history.groups {
+        if let Some(cached) = store.get_for_group(group)
+            && aissence::summarize::has_required_public_story(group, cached)
+        {
+            group.summary = Some(cached.clone());
+        }
+    }
     let config_path = llm.llm_config.clone();
     let config = LlmConfig::load(folder, config_path.as_deref(), llm.overrides())
         .map_err(|error| error.to_string())?;
-    let summarizer = Summarizer::from_config(config)
-        .map_err(|error| error.to_string())?
-        .with_meta_summaries(meta_summaries);
+    let summarizer = Summarizer::from_config(config).map_err(|error| error.to_string())?;
     let (outcome, cost) = summarizer.summarize_history_with_cost(&mut history).await;
     outcome.map_err(|error| error.to_string())?;
-    let mut store = SummaryStore::load(folder);
     store
         .replace_from_groups(&history.groups)
         .map_err(|error| error.to_string())?;

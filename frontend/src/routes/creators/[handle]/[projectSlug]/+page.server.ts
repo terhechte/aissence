@@ -1,5 +1,4 @@
 import { error } from '@sveltejs/kit';
-import { groupTranscript, redactPublicMessage } from '$lib/ledger';
 import {
   estimatePotentialCost,
   fetchOpenRouterCatalog
@@ -36,6 +35,14 @@ export const load: PageServerLoad = async ({ locals, params, setHeaders }) => {
     isEntitled = await hasCreatorAccess(locals.supabase, claims.sub, profile.id);
   }
 
+  const publicCommitFields = [
+    'id', 'commit_hash', 'title', 'committed_at', 'files_changed', 'lines_added',
+    'lines_deleted', 'public_story', 'public_beats', 'prompt_count', 'reply_count',
+    'change_message_count', 'token_input', 'token_output', 'token_cache_read',
+    'token_cache_create', 'sort_order', 'potential_cost_usd', 'input_cost_usd',
+    'output_cost_usd', 'pricing_model_ids', 'pricing_calculated_at', 'summary_status', 'commit_agents(*)'
+  ].join(',');
+  const entitledCommitFields = `${publicCommitFields},messages(id,kind,occurred_at,token_input,token_output,token_cache_read,token_cache_create,sort_order,changed_file_count,message_summaries(summary),message_sources(content),changes(tool,file_path,diff,sort_order))`;
   const [{ data: screenshots }, { data: commits }] = await Promise.all([
     locals.supabase
       .from('project_screenshots')
@@ -44,9 +51,7 @@ export const load: PageServerLoad = async ({ locals, params, setHeaders }) => {
       .order('sort_order'),
     locals.supabase
       .from('commits')
-      .select(
-        '*,commit_agents(*),messages(*,message_sources(content),changes(tool,file_path,diff,sort_order))'
-      )
+      .select(isEntitled ? entitledCommitFields : publicCommitFields)
       .eq('project_id', project.id)
       .order('sort_order')
   ]);
@@ -57,14 +62,17 @@ export const load: PageServerLoad = async ({ locals, params, setHeaders }) => {
         .createSignedUrls(screenshots.map((shot) => shot.storage_path), 60 * 60)
     : { data: [] };
 
-  const normalizedCommits = (commits ?? []).map((commit) => ({
+  const normalizedCommits = ((commits ?? []) as any[]).map((commit) => ({
     ...commit,
-    total_prompt_count: (commit.messages ?? []).filter((message: any) => message.kind === 'UserWrote').length,
+    total_prompt_count: Number(commit.prompt_count ?? 0),
     commit_agents: [...(commit.commit_agents ?? [])].sort((a, b) => a.sort_order - b.sort_order),
     messages: [...(commit.messages ?? [])]
       .sort((a, b) => a.sort_order - b.sort_order)
       .map((message) => ({
         ...message,
+        subscriber_summary: Array.isArray(message.message_summaries)
+          ? message.message_summaries[0]?.summary ?? null
+          : message.message_summaries?.summary ?? null,
         changes: [...(message.changes ?? [])].sort((a, b) => a.sort_order - b.sort_order)
       }))
   }));
@@ -101,23 +109,6 @@ export const load: PageServerLoad = async ({ locals, params, setHeaders }) => {
       pricing_calculated_at: pricing.priced_at
     };
   });
-  const visibleCommits = isEntitled
-    ? pricedCommits
-    : pricedCommits.map((commit) => ({
-        ...commit,
-        messages: groupTranscript(commit.messages).flatMap((turn) =>
-          turn.asked
-            ? [
-                {
-                  ...redactPublicMessage(turn.asked),
-                  following_reply_count: turn.replyCount,
-                  following_changed_file_count: turn.changedFileCount
-                }
-              ]
-            : []
-        )
-      }));
-
   return {
     profile,
     project,
@@ -127,6 +118,6 @@ export const load: PageServerLoad = async ({ locals, params, setHeaders }) => {
       ...shot,
       url: signed.data?.[index]?.signedUrl ?? ''
     })),
-    commits: visibleCommits
+    commits: pricedCommits
   };
 };

@@ -5,7 +5,7 @@ import type { Actions, PageServerLoad } from './$types';
 export const load: PageServerLoad = async ({ locals, params, parent }) => {
   const { claims } = await parent();
   const supabase = locals.supabase!;
-  const [{ data: project }, { data: screenshots }, { data: imports }, { count: commitCount }] =
+  const [{ data: project }, { data: screenshots }, { data: imports }, { count: commitCount }, { data: summaryJobs }] =
     await Promise.all([
       supabase
         .from('projects')
@@ -24,7 +24,12 @@ export const load: PageServerLoad = async ({ locals, params, parent }) => {
         .eq('project_id', params.id)
         .order('created_at', { ascending: false })
         .limit(10),
-      supabase.from('commits').select('*', { count: 'exact', head: true }).eq('project_id', params.id)
+      supabase.from('commits').select('*', { count: 'exact', head: true }).eq('project_id', params.id),
+      supabase
+        .from('summary_jobs')
+        .select('id,kind,status,error_detail,created_at,commits!inner(project_id)')
+        .eq('commits.project_id', params.id)
+        .order('created_at', { ascending: false })
     ]);
   if (!project) redirect(303, '/dashboard');
 
@@ -42,6 +47,7 @@ export const load: PageServerLoad = async ({ locals, params, parent }) => {
       profiles: Array.isArray(project.profiles) ? project.profiles[0] : project.profiles
     },
     imports: imports ?? [],
+    summaryJobs: summaryJobs ?? [],
     commitCount: commitCount ?? 0,
     screenshots: (screenshots ?? []).map((shot, index) => ({
       ...shot,
@@ -92,6 +98,13 @@ export const actions: Actions = {
       .eq('id', params.id);
     if (error) return fail(400, { error: error.message });
     return { unpublished: true };
+  },
+  retrySummaries: async ({ locals, params }) => {
+    const { error } = await locals.supabase!.rpc('enqueue_public_summary_jobs', {
+      p_project_id: params.id
+    });
+    if (error) return fail(400, { error: error.message });
+    return { summariesRetried: true };
   },
   moveScreenshot: async ({ request, locals }) => {
     const form = await request.formData();

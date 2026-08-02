@@ -52,13 +52,24 @@
   </section>
 
   <section>
-    <div class="section-head"><span>02</span><div><h2>Project history</h2><p>This is a continuously updated ledger. A new upload replaces the current snapshot atomically.</p></div></div>
+    <div class="section-head"><span>02</span><div><h2>Project history</h2><p>Uploads store new or changed source immediately. Public stories are generated only after publishing.</p></div></div>
     <ImportUploader projectId={data.project.id} />
     {#if data.imports.length}
       <div class="import-log">
         {#each data.imports as item}
           <div><span>{item.status}</span><span>{item.commit_count ?? '—'} commits</span><time>{formatDate(item.created_at)}</time></div>
         {/each}
+      </div>
+    {/if}
+    {#if data.summaryJobs.length}
+      <div class="summary-job-note">
+        <strong>Summary work</strong>
+        <span>{data.summaryJobs.filter((job: any) => ['queued', 'processing'].includes(job.status)).length} pending</span>
+        <span>{data.summaryJobs.filter((job: any) => job.status === 'succeeded').length} complete</span>
+        <span>{data.summaryJobs.filter((job: any) => job.status === 'failed').length} failed</span>
+        {#if data.summaryJobs.some((job: any) => job.kind === 'public' && job.status === 'failed')}
+          <form method="POST" action="?/retrySummaries" use:enhance><button>Retry failed public stories</button></form>
+        {/if}
       </div>
     {/if}
   </section>
@@ -165,6 +176,15 @@
     color: var(--muted);
     font: 400 10px/1.4 'JetBrains Mono', monospace;
   }
+  .summary-job-note {
+    display: flex;
+    gap: 18px;
+    margin-top: 18px;
+    color: var(--muted);
+    font: 400 10px/1.4 'JetBrains Mono', monospace;
+  }
+  .summary-job-note strong { color: var(--body); }
+  .summary-job-note button { color: var(--accent); text-decoration: underline; }
   .shots {
     display: grid;
     grid-template-columns: repeat(2, 1fr);

@@ -1,8 +1,7 @@
-import { createHash } from 'node:crypto';
+import { env } from '$env/dynamic/private';
 import { json } from '@sveltejs/kit';
 import { parseAissence, AissenceValidationError } from '$lib/aissence/schema';
 import { requireProjectOwner } from '$lib/server/auth';
-import { fetchOpenRouterCatalog, priceSnapshot } from '$lib/server/openrouter-pricing';
 
 export const POST = async (event) => {
   const claims = await requireProjectOwner(event, event.params.id);
@@ -19,70 +18,31 @@ export const POST = async (event) => {
 
     const raw = await blob.text();
     const parsed = parseAissence(raw);
-    const checksum = createHash('sha256').update(raw).digest('hex');
-    const pricedSnapshot = priceSnapshot(parsed.snapshot, await fetchOpenRouterCatalog());
-    const unpricedCommits = pricedSnapshot.commits.filter(
-      (commit) =>
-        commit.summary.tokens &&
-        commit.pricing.potential_cost_usd === null
-    ).length;
-    const fallbackPricedCommits = pricedSnapshot.commits.filter(
-      (commit) =>
-        commit.summary.tokens &&
-        ['highest_rate_fallback', 'per_agent_with_fallback'].includes(
-          commit.pricing.pricing_method
-        )
-    ).length;
-    const warnings = [
-      ...parsed.warnings,
-      ...(unpricedCommits
-        ? [
-            `OpenRouter pricing could not be matched for ${unpricedCommits} ${
-              unpricedCommits === 1 ? 'commit' : 'commits'
-            }.`
-          ]
-        : []),
-      ...(fallbackPricedCommits
-        ? [
-            `${fallbackPricedCommits} ${
-              fallbackPricedCommits === 1 ? 'commit includes' : 'commits include'
-            } conservative pricing where complete OpenRouter model rates or per-model token usage were unavailable.`
-          ]
-        : [])
-    ];
+    const { data: sessionData } = await event.locals.supabase!.auth.getSession();
+    const accessToken = sessionData.session?.access_token;
+    if (!accessToken) return json({ error: 'Authentication expired.' }, { status: 401 });
 
-    const { data: importRow, error: importError } = await event.locals.supabase!
-      .from('imports')
-      .insert({
-        project_id: event.params.id,
-        uploader_id: claims.sub,
-        checksum,
-        source_version: parsed.file.version,
-        status: 'processing',
-        warnings
-      })
-      .select('id')
-      .single();
-    if (importError) throw new Error(importError.message);
-
-    const { data: result, error: rpcError } = await event.locals.supabase!.rpc(
-      'replace_project_snapshot',
+    const apiUrl = (env.AISSENCE_API_URL ?? 'http://127.0.0.1:8787').replace(/\/$/, '');
+    const response = await event.fetch(
+      `${apiUrl}/v1/projects/${encodeURIComponent(event.params.id)}/browser-imports`,
       {
-        p_project_id: event.params.id,
-        p_import_id: importRow.id,
-        p_checksum: checksum,
-        p_source_version: parsed.file.version,
-        p_snapshot: pricedSnapshot
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${accessToken}`,
+          'content-type': 'application/vnd.aissence+json'
+        },
+        body: raw
       }
     );
-    if (rpcError) throw new Error(rpcError.message);
-    if (!result?.ok) throw new Error(result?.error ?? 'The snapshot could not be applied.');
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.detail ?? result.error ?? 'The snapshot could not be applied.');
 
     return json({
       ok: true,
-      noop: Boolean(result.noop),
-      commitCount: parsed.snapshot.commits.length,
-      warnings
+      noop: result.status === 'noop',
+      commitCount: result.submitted_commit_count ?? parsed.snapshot.commits.length,
+      queuedCommitCount: result.queued_commit_count ?? 0,
+      warnings: parsed.warnings
     });
   } catch (error) {
     if (error instanceof AissenceValidationError) {

@@ -35,7 +35,6 @@ const DIM: egui::Color32 = egui::Color32::from_gray(140);
 const DISABLED: egui::Color32 = egui::Color32::from_gray(90); // faded / ignored
 
 fn main() -> eframe::Result {
-    let meta_summaries = meta_summaries_from_args();
     let folder = match folder_from_args() {
         Some(folder) => folder,
         None => match rfd::FileDialog::new()
@@ -59,7 +58,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "aissence",
         options,
-        Box::new(move |cc| Ok(Box::new(AissenceApp::new(cc, folder, meta_summaries)))),
+        Box::new(move |cc| Ok(Box::new(AissenceApp::new(cc, folder)))),
     )
 }
 
@@ -75,10 +74,6 @@ fn folder_from_args() -> Option<PathBuf> {
         }
     }
     None
-}
-
-fn meta_summaries_from_args() -> bool {
-    std::env::args().any(|arg| arg == "--meta-summaries")
 }
 
 /// Parse lifecycle, shared between the worker task and the UI thread.
@@ -116,7 +111,6 @@ struct AissenceApp {
     phase: Arc<Mutex<Phase>>,
     /// `None` when no valid local LLM configuration is available.
     summarizer: Option<Arc<Summarizer>>,
-    meta_summaries_enabled: bool,
     /// On-disk cache of summaries, git metadata, and ignore flags.
     store: SummaryStore,
 
@@ -149,11 +143,7 @@ struct AissenceApp {
 }
 
 impl AissenceApp {
-    fn new(
-        cc: &eframe::CreationContext<'_>,
-        folder: PathBuf,
-        meta_summaries_enabled: bool,
-    ) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, folder: PathBuf) -> Self {
         Theme::slate().install(&cc.egui_ctx);
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -166,10 +156,7 @@ impl AissenceApp {
         // thread (summaries are kicked off on demand).
         runtime.spawn(load(folder.clone(), phase.clone(), cc.egui_ctx.clone()));
         let store = SummaryStore::load(&folder);
-        let summarizer = Summarizer::from_env()
-            .ok()
-            .map(|summarizer| summarizer.with_meta_summaries(meta_summaries_enabled))
-            .map(Arc::new);
+        let summarizer = Summarizer::from_env().ok().map(Arc::new);
         let notice = summarizer.is_none().then(|| {
             "Configure an OpenRouter or OpenAI-compatible API to enable AI summaries.".to_string()
         });
@@ -181,7 +168,6 @@ impl AissenceApp {
             runtime,
             phase,
             summarizer,
-            meta_summaries_enabled,
             store,
             history: None,
             notice,
@@ -208,16 +194,7 @@ impl AissenceApp {
         for group in history.groups.iter_mut() {
             if let Some(cached) = self.store.get_for_group(group) {
                 let summary = cached.clone();
-                if !summarize::has_required_user_summaries(group, &summary) {
-                    continue;
-                }
-                if !summarize::has_required_core_summaries(group, &summary) {
-                    continue;
-                }
-                if self.meta_summaries_enabled
-                    && (!summarize::has_required_extended_summaries(group, &summary)
-                        || !summarize::has_required_meta_summary(&summary))
-                {
+                if !summarize::has_required_public_story(group, &summary) {
                     continue;
                 }
                 group.summary = Some(summary);
@@ -749,13 +726,10 @@ impl AissenceApp {
                         .color(DISABLED),
                     );
                 } else if let Some(summary) = &group.summary {
-                    // Synthesized overview of the whole commit.
-                    if !summary.meta.trim().is_empty() {
-                        Card::new().heading("Overview").show(ui, |ui| {
-                            ui.label(&summary.meta);
-                        });
-                        ui.add_space(8.0);
-                    }
+                    Card::new().heading("Public story").show(ui, |ui| {
+                        ui.label(&summary.public.summary);
+                    });
+                    ui.add_space(8.0);
                     if summary.messages.is_empty() {
                         ui.label(egui::RichText::new("No conversation summarized.").color(DIM));
                     }
@@ -830,7 +804,7 @@ impl AissenceApp {
                 self.selected_message = Some(index);
             }
         } else if message.kind == MessageKind::UserWrote {
-            if let Some(summary) = message.summary.as_deref() {
+            if let Some(summary) = message.subscriber_summary.as_deref() {
                 ui.label(summary);
             } else {
                 let preview = message

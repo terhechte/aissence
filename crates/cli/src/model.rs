@@ -318,10 +318,11 @@ pub struct CodeChange {
 #[serde(deny_unknown_fields)]
 pub struct MessageSummary {
     pub kind: MessageKind,
-    /// LLM-generated summary for [`MessageKind::UserWrote`]. Newly generated
-    /// assistant-text and editing entries always leave this absent.
+    /// Subscriber-only summary for [`MessageKind::UserWrote`]. Public ledger
+    /// payloads never expose this field. It remains absent until a creator has
+    /// an active subscriber (or explicitly requests a local paid-view build).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub summary: Option<String>,
+    pub subscriber_summary: Option<String>,
     /// Complete source text for user and assistant-text entries, regardless of
     /// length. Consecutive source messages represented by one coalesced entry
     /// are joined with blank lines. Absent for code-change entries.
@@ -336,30 +337,46 @@ pub struct MessageSummary {
     pub tokens: Option<TokenCount>,
 }
 
-/// Summary data for what went into a commit.
+/// One public, privacy-safe moment in a commit's story.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PublicBeat {
+    /// Index in the coalesced source message list. It must point at a
+    /// [`MessageKind::UserWrote`] entry.
+    pub message_index: usize,
+    /// Short semantic label such as "Initial request" or "Correction".
+    pub label: String,
+    /// One safe, paraphrased sentence. Never raw prompt text.
+    pub text: String,
+}
+
+/// The only narrative generated for the free/public ledger.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PublicStory {
+    /// Concise account of why the change was requested, how it was approached,
+    /// and what the commit actually produced.
+    pub summary: String,
+    /// At most three representative prompt moments generated in the same call.
+    #[serde(default)]
+    pub beats: Vec<PublicBeat>,
+}
+
+/// Generated data for what went into a commit.
 ///
-/// Produced by the [`crate::summarize::Summarizer`]. `ai_answered` is generated
-/// when assistant evidence is present. The other aggregate fields are optional
-/// extended summaries. [`messages`](Self::messages) holds the conversation
-/// breakdown; only user entries receive per-entry LLM summaries.
+/// Public generation produces exactly one [`PublicStory`] and copies the
+/// model-independent message shape. Subscriber prompt summaries remain empty
+/// until a separate, entitlement-triggered job fills them.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommitSummary {
-    /// Locally combined summaries of what the user asked for.
-    pub user_requested: String,
-    /// Concise summary of what the assistant explained or concluded.
-    pub ai_answered: String,
-    /// Concise summary of the implementation recorded by the commit.
-    pub ai_implemented: String,
+    pub public: PublicStory,
     /// Conversation entries in chronological order.
     pub messages: Vec<MessageSummary>,
     /// Coding agent(s) + model(s) that produced this commit's sessions,
     /// including exact per-pair token totals when reported.
     #[serde(default)]
     pub agents: Vec<AgentUsage>,
-    /// Optional cohesive overview synthesizing the three aggregate fields.
-    #[serde(default)]
-    pub meta: String,
     /// Exact total token usage of the whole conversation that led to this
     /// commit (the sum of every turn's usage). Absent when no session reported
     /// usage for this commit.

@@ -177,18 +177,16 @@ describe('OpenRouter pricing', () => {
       {
         commits: [
           {
-            hash: '8f2a1c4e9b7d6a5f0c3e2b1a4d8c7e6f9a0b1c2d',
-            signature: 1,
+            commit_hash: '8f2a1c4e9b7d6a5f0c3e2b1a4d8c7e6f9a0b1c2d',
+            source_digest: `sha256:${'0'.repeat(64)}`,
+            sanitizer_version: 1,
             title: 'Unknown model',
             date: '2026-07-30T10:00:00Z',
             stats: { files_changed: 0, lines_added: 0, lines_deleted: 0 },
-            summary: {
-              user_requested: 'Test',
-              ai_answered: 'Test',
-              ai_implemented: 'Test',
+            files: [],
+            source: {
               messages: [],
               agents: [{ provider: 'Mystery', model: 'unlisted-model' }],
-              meta: '',
               tokens: { input: 10, output: 2 }
             }
           }

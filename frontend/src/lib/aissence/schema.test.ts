@@ -4,151 +4,91 @@ import { AissenceValidationError, parseAissence } from './schema';
 
 const hash = '8f2a1c4e9b7d6a5f0c3e2b1a4d8c7e6f9a0b1c2d';
 
+function userMessage(content = 'Please add retries.') {
+  return { kind: 'UserWrote', content, changes: [], timestamp: '2026-06-20T09:14:02Z' };
+}
+
 function validFile(overrides: Record<string, unknown> = {}) {
+  const sourceMessage = userMessage();
   return {
-    version: 1,
-    commits: {
-      [hash]: {
-        signature: 17712209936023450000,
-        title: 'Add retry support',
-        date: '2026-06-20T09:18:03Z',
-        stats: { files_changed: 3, lines_added: 21, lines_deleted: 4 },
-        summary: {
-          user_requested: 'Add retries.',
-          ai_answered: 'Use backoff.',
-          ai_implemented: 'Added retries.',
-          messages: [
-            {
-              kind: 'UserWrote',
-              summary: 'Asked for retries.',
-              content: 'Please add retries.',
-              changes: [],
-              timestamp: '2026-06-20T09:14:02Z'
-            }
-          ],
-          agents: [
-            {
-              provider: 'Codex',
-              model: 'gpt-test',
-              tokens: { input: 100, output: 20, cache_read: 80 }
-            }
-          ],
-          meta: 'Retry support.',
-          tokens: { input: 100, output: 20 }
-        }
-      }
+    version: 2,
+    project: {
+      source_id: 'd9428888-122b-11e1-b85c-61cd3cbb3210',
+      name: 'Emyn',
+      repository: 'github.com/terhechte/Emyn'
     },
+    commits: [{
+      commit_hash: hash,
+      source_digest: `sha256:${'0'.repeat(64)}`,
+      sanitizer_version: 1,
+      title: 'Add retry support',
+      date: '2026-06-20T09:18:03Z',
+      stats: { files_changed: 3, lines_added: 21, lines_deleted: 4 },
+      files: [],
+      source: {
+        messages: [sourceMessage],
+        agents: [{ provider: 'Codex', model: 'gpt-test', tokens: { input: 100, output: 20 } }],
+        tokens: { input: 100, output: 20 }
+      },
+      summary: {
+        public: {
+          summary: 'Retry support was requested and implemented with backoff.',
+          beats: [{ message_index: 0, label: 'Initial request', text: 'The creator asked for resilient retries.' }]
+        },
+        messages: [{ ...sourceMessage, subscriber_summary: 'Add retry support.' }],
+        agents: [{ provider: 'Codex', model: 'gpt-test', tokens: { input: 100, output: 20 } }],
+        tokens: { input: 100, output: 20 }
+      }
+    }],
     ignored: [],
     ...overrides
   };
 }
 
 describe('parseAissence', () => {
-  it('normalizes a valid v1 file', () => {
-    const result = parseAissence(
-      JSON.stringify(
-        validFile({
-          project: { name: 'Emyn', repository: 'github.com/terhechte/Emyn' }
-        })
-      )
-    );
-    expect(result.file.version).toBe(1);
-    expect(result.file.project).toEqual({ name: 'Emyn', repository: 'github.com/terhechte/Emyn' });
-    expect(result.snapshot.commits).toHaveLength(1);
-    expect(result.snapshot.commits[0].hash).toBe(hash);
-    expect(result.snapshot.commits[0].summary.messages[0].content).toBe('Please add retries.');
-    expect(result.snapshot.commits[0].summary.agents[0].tokens).toEqual({
-      input: 100,
-      output: 20,
-      cache_read: 80
-    });
+  it('parses the v2 source/summary contract', () => {
+    const result = parseAissence(JSON.stringify(validFile()));
+    expect(result.file.version).toBe(2);
+    expect(result.snapshot.commits[0]!.commit_hash).toBe(hash);
+    expect(result.snapshot.commits[0]!.source.messages[0]!.content).toBe('Please add retries.');
+    expect(result.snapshot.commits[0]!.summary?.public.beats).toHaveLength(1);
   });
 
-  it('retains a summary for every user prompt without a per-commit cap', () => {
+  it('accepts a complete unsummarized upload', () => {
     const input = validFile();
-    (input.commits[hash] as any).summary.messages = Array.from({ length: 20 }, (_, index) => ({
-      kind: 'UserWrote',
-      summary: `Prompt summary ${index + 1}`,
-      content: `Complete prompt ${index + 1}`,
-      changes: [],
-      timestamp: `2026-06-20T09:${String(index).padStart(2, '0')}:00Z`
-    }));
-
-    const messages = parseAissence(JSON.stringify(input)).snapshot.commits[0].summary.messages;
-    expect(messages).toHaveLength(20);
-    expect(messages.map((message) => message.summary)).toEqual(
-      Array.from({ length: 20 }, (_, index) => `Prompt summary ${index + 1}`)
-    );
+    delete (input.commits[0] as any).summary;
+    expect(parseAissence(JSON.stringify(input)).snapshot.commits).toHaveLength(1);
   });
 
-  it('accepts legacy v1 entries and emits warnings', () => {
+  it('keeps subscriber summaries separate from source', () => {
     const input = validFile();
-    delete (input.commits[hash] as any).title;
-    delete (input.commits[hash] as any).date;
-    delete (input.commits[hash] as any).stats;
-    const result = parseAissence(JSON.stringify(input));
-    expect(result.warnings).toHaveLength(3);
+    (input.commits[0] as any).source.messages[0].subscriber_summary = 'leak';
+    expect(() => parseAissence(JSON.stringify(input))).toThrow(AissenceValidationError);
   });
 
-  it('ignores unknown fields and ignored commits', () => {
-    const input = validFile({ ignored: [hash], future_field: 'ok' });
-    (input.commits[hash] as any).future_field = { anything: true };
-    expect(parseAissence(JSON.stringify(input)).snapshot.commits).toEqual([]);
+  it('rejects public beats that do not point to a prompt', () => {
+    const input = validFile();
+    (input.commits[0] as any).summary.public.beats[0].message_index = 3;
+    expect(() => parseAissence(JSON.stringify(input))).toThrow(/public beat/i);
   });
 
-  it('does not depend on exact signature precision', () => {
-    const raw = JSON.stringify(validFile()).replace(
-      '"signature":17712209936023450000',
-      '"signature":18446744073709551615'
-    );
-    expect(parseAissence(raw).snapshot.commits).toHaveLength(1);
+  it('ignores commits listed in ignored', () => {
+    expect(parseAissence(JSON.stringify(validFile({ ignored: [hash] }))).snapshot.commits).toEqual([]);
   });
 
   it.each([
-    ['unknown version', { ...validFile(), version: 2 }],
-    ['bad hash', { ...validFile(), commits: { bad: validFile().commits[hash] } }],
-    [
-      'negative stats',
-      {
-        ...validFile(),
-        commits: {
-          [hash]: { ...validFile().commits[hash], stats: { files_changed: 1, lines_added: -1, lines_deleted: 0 } }
-        }
-      }
-    ],
-    [
-      'invalid date',
-      {
-        ...validFile(),
-        commits: { [hash]: { ...validFile().commits[hash], date: 'last Thursday' } }
-      }
-    ],
-    [
-      'negative per-agent tokens',
-      (() => {
-        const input = validFile();
-        (input.commits[hash] as any).summary.agents[0].tokens.input = -1;
-        return input;
-      })()
-    ]
+    ['old version', { ...validFile(), version: 1 }],
+    ['bad digest', (() => { const value = validFile(); value.commits[0].source_digest = 'bad'; return value; })()],
+    ['negative stats', (() => { const value = validFile(); value.commits[0].stats.lines_added = -1; return value; })()]
   ])('rejects %s', (_name, input) => {
     expect(() => parseAissence(JSON.stringify(input))).toThrow(AissenceValidationError);
   });
 
-  it('rejects changes on non-change messages', () => {
+  it('preserves hostile prompt strings as inert data', () => {
     const input = validFile();
-    (input.commits[hash] as any).summary.messages[0].changes = [
-      { tool: 'Edit', file: 'src/a.ts', diff: '+unsafe' }
-    ];
-    expect(() => parseAissence(JSON.stringify(input))).toThrow(/Only AiChanged/);
-  });
-
-  it('preserves hostile strings as plain data', () => {
-    const input = validFile();
-    (input.commits[hash] as any).summary.messages[0].content =
-      '<script>globalThis.compromised=true</script>';
+    (input.commits[0] as any).source.messages[0].content = '<script>globalThis.compromised=true</script>';
     const parsed = parseAissence(JSON.stringify(input));
-    expect(parsed.snapshot.commits[0].summary.messages[0].content).toContain('<script>');
+    expect(parsed.snapshot.commits[0]!.source.messages[0]!.content).toContain('<script>');
     expect((globalThis as any).compromised).toBeUndefined();
   });
 
@@ -165,39 +105,15 @@ describe('optional project metadata', () => {
     });
   });
 
-  it('accepts a project without a repository label', () => {
-    const parsed = projectMetadataSchema.parse({
-      name: 'Project',
-      slug: 'project',
-      tagline: 'A project',
-      description: 'Description',
-      product_url: 'https://example.com',
-      repository_label: '',
-      repository_url: ''
+  it('accepts optional project URLs and screenshot alt text', () => {
+    const project = projectMetadataSchema.parse({
+      name: 'Project', slug: 'project', tagline: 'A project', description: 'Description',
+      product_url: '', repository_label: '', repository_url: ''
     });
-    expect(parsed.repository_label).toBeNull();
-  });
-
-  it('accepts a project without a product URL', () => {
-    const parsed = projectMetadataSchema.parse({
-      name: 'Project',
-      slug: 'project',
-      tagline: 'A project',
-      description: 'Description',
-      product_url: '',
-      repository_label: '',
-      repository_url: ''
-    });
-    expect(parsed.product_url).toBeNull();
-  });
-
-  it('accepts a screenshot without alt text', () => {
-    const parsed = screenshotMetadataSchema.parse({
-      storage_path: 'creator/project/image.png',
-      alt_text: '',
-      caption: '',
-      sort_order: 0
-    });
-    expect(parsed.alt_text).toBe('');
+    expect(project.product_url).toBeNull();
+    expect(project.repository_label).toBeNull();
+    expect(screenshotMetadataSchema.parse({
+      storage_path: 'creator/project/image.png', alt_text: '', caption: '', sort_order: 0
+    }).alt_text).toBe('');
   });
 });

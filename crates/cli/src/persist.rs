@@ -256,7 +256,10 @@ mod tests {
             }),
             messages: Vec::new(),
             summary: Some(CommitSummary {
-                ai_answered: "Done".into(),
+                public: crate::model::PublicStory {
+                    summary: "Done".into(),
+                    beats: Vec::new(),
+                },
                 ..Default::default()
             }),
         }

@@ -48,6 +48,10 @@ pub fn router(state: AppState) -> Router {
             "/v1/projects/{project_id}/imports",
             routing::post(create_import),
         )
+        .route(
+            "/v1/projects/{project_id}/browser-imports",
+            routing::post(create_browser_import),
+        )
         .route("/v1/imports/{import_id}", routing::get(import_status))
         .route(
             "/v1/imports/{import_id}/result",
@@ -580,13 +584,7 @@ async fn sync_plan(
                 commit_hash: commit.commit_hash.clone(),
                 reason: UploadReason::Missing,
             }),
-            Some((digest, status))
-                if digest.as_deref() == Some(commit.source_digest.as_str())
-                    && matches!(
-                        status.as_deref(),
-                        Some("queued" | "processing" | "succeeded")
-                    ) =>
-            {
+            Some((digest, _status)) if digest.as_deref() == Some(commit.source_digest.as_str()) => {
                 unchanged_count += 1;
             }
             Some(_) => upload.push(RequestedCommit {
@@ -631,6 +629,26 @@ async fn create_import(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, ApiError> {
+    create_import_for_user(state, user.id, project_id, headers, body).await
+}
+
+async fn create_browser_import(
+    State(state): State<AppState>,
+    user: SupabaseUser,
+    Path(project_id): Path<Uuid>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, ApiError> {
+    create_import_for_user(state, user.id, project_id, headers, body).await
+}
+
+async fn create_import_for_user(
+    state: AppState,
+    user_id: Uuid,
+    project_id: Uuid,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, ApiError> {
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
@@ -648,7 +666,7 @@ async fn create_import(
     }
     let mut document = parse_upload(&state.config, &body)?;
     let checksum = format!("sha256:{}", hex::encode(Sha256::digest(&body)));
-    let accepted = ingest_document(&state, user.id, project_id, checksum, &mut document).await?;
+    let accepted = ingest_document(&state, user_id, project_id, checksum, &mut document).await?;
     Ok((StatusCode::ACCEPTED, Json(accepted)))
 }
 
@@ -743,9 +761,9 @@ fn validate_document(
         }
         for message in &commit.source.messages {
             validate_token_count(message.tokens)?;
-            if message.summary.is_some() {
+            if message.subscriber_summary.is_some() {
                 return Err(ApiError::Invalid(format!(
-                    "commit {} includes generated text in source.messages",
+                    "commit {} includes subscriber text in source.messages",
                     commit.commit_hash
                 )));
             }
@@ -791,10 +809,13 @@ fn validate_summary(commit: &AissenceCommit, max_entry_chars: usize) -> Result<(
     let Some(summary) = &commit.summary else {
         return Ok(());
     };
-    let total_chars = summary.user_requested.chars().count()
-        + summary.ai_answered.chars().count()
-        + summary.ai_implemented.chars().count()
-        + summary.meta.chars().count();
+    let total_chars = summary.public.summary.chars().count()
+        + summary
+            .public
+            .beats
+            .iter()
+            .map(|beat| beat.label.chars().count() + beat.text.chars().count())
+            .sum::<usize>();
     if total_chars > 32_000 || summary.messages.len() != commit.source.messages.len() {
         return Err(ApiError::Invalid(format!(
             "invalid local summary for {}",
@@ -803,11 +824,11 @@ fn validate_summary(commit: &AissenceCommit, max_entry_chars: usize) -> Result<(
     }
     validate_token_count(summary.tokens)?;
     for message in &summary.messages {
-        validate_optional_text(message.summary.as_deref(), max_entry_chars)?;
+        validate_optional_text(message.subscriber_summary.as_deref(), max_entry_chars)?;
         validate_token_count(message.tokens)?;
         let correct_shape = match message.kind {
-            MessageKind::UserWrote => message.summary.is_some(),
-            MessageKind::AiWrote | MessageKind::AiChanged => message.summary.is_none(),
+            MessageKind::UserWrote => true,
+            MessageKind::AiWrote | MessageKind::AiChanged => message.subscriber_summary.is_none(),
         };
         if !correct_shape {
             return Err(ApiError::Invalid(format!(
@@ -829,6 +850,24 @@ fn validate_summary(commit: &AissenceCommit, max_entry_chars: usize) -> Result<(
     {
         return Err(ApiError::Invalid(format!(
             "local summary message shape differs for {}",
+            commit.commit_hash
+        )));
+    }
+    if summary.public.summary.trim().is_empty()
+        || summary.public.beats.len() > 3
+        || aissence::summarize::public_story_has_verbatim_prompt(
+            &summary.public,
+            &commit.source.messages,
+        )
+        || summary.public.beats.iter().any(|beat| {
+            beat.message_index >= commit.source.messages.len()
+                || commit.source.messages[beat.message_index].kind != MessageKind::UserWrote
+                || beat.label.trim().is_empty()
+                || beat.text.trim().is_empty()
+        })
+    {
+        return Err(ApiError::Invalid(format!(
+            "invalid public story for {}",
             commit.commit_hash
         )));
     }
@@ -887,18 +926,28 @@ async fn ingest_document(
 ) -> Result<ImportAccepted, ApiError> {
     let mut client = state.pool.get().await?;
     let transaction = client.transaction().await?;
-    let source_id: Uuid = transaction
+    let project = transaction
         .query_opt(
-            "select source_id from public.projects where id = $1 and owner_id = $2 for update",
+            "select source_id, visibility::text from public.projects \
+             where id = $1 and owner_id = $2 for update",
             &[&project_id, &user_id],
         )
         .await?
-        .ok_or(ApiError::NotFound)?
-        .get(0);
-    if source_id != document.project.source_id {
+        .ok_or(ApiError::NotFound)?;
+    let source_id: Option<Uuid> = project.get(0);
+    let is_published = project.get::<_, String>(1) == "published";
+    if source_id.is_some_and(|source_id| source_id != document.project.source_id) {
         return Err(ApiError::Conflict(
             "document belongs to a different project".into(),
         ));
+    }
+    if source_id.is_none() {
+        transaction
+            .execute(
+                "update public.projects set source_id=$2 where id=$1",
+                &[&project_id, &document.project.source_id],
+            )
+            .await?;
     }
     if let Some(row) = transaction
         .query_opt(
@@ -908,11 +957,20 @@ async fn ingest_document(
         )
         .await?
     {
+        let existing_import_id: Uuid = row.get(0);
+        let queued_commit_count: i64 = transaction
+            .query_one(
+                "select count(distinct commit_id) from public.summary_jobs \
+                 where import_id=$1 and status in ('queued','processing')",
+                &[&existing_import_id],
+            )
+            .await?
+            .get(0);
         return Ok(ImportAccepted {
-            import_id: row.get(0),
+            import_id: existing_import_id,
             status: row.get(1),
             submitted_commit_count: row.get::<_, i32>(2) as usize,
-            queued_commit_count: 0,
+            queued_commit_count: queued_commit_count as usize,
             skipped_commit_count: row.get::<_, i32>(4) as usize,
         });
     }
@@ -937,20 +995,30 @@ async fn ingest_document(
     let mut queued = 0usize;
     let mut skipped = 0usize;
     let mut locally_summarized = 0usize;
+    let has_subscriber: bool = is_published
+        && transaction
+            .query_one(
+                "select exists(select 1 from public.creator_subscriptions \
+                 where creator_id=$1 and status in ('active','trialing') \
+                 and (current_period_end is null or current_period_end > now()))",
+                &[&user_id],
+            )
+            .await?
+            .get(0);
     for (sort_order, commit) in document.commits.iter_mut().enumerate() {
         let existing = transaction
             .query_opt(
-                "select id, source_digest, summary_status::text from public.commits \
+                "select c.id, c.source_digest, c.summary_status::text, \
+                 exists(select 1 from public.summary_jobs sj where sj.commit_id=c.id \
+                        and sj.status in ('queued','processing')) \
+                 from public.commits c \
                  where project_id = $1 and commit_hash = $2",
                 &[&project_id, &commit.commit_hash],
             )
             .await?;
         if existing.as_ref().is_some_and(|row| {
             row.get::<_, Option<String>>(1).as_deref() != Some(commit.source_digest.as_str())
-                && matches!(
-                    row.get::<_, Option<String>>(2).as_deref(),
-                    Some("queued" | "processing")
-                )
+                && row.get::<_, bool>(3)
         }) {
             return Err(ApiError::Conflict(format!(
                 "commit {} is already being summarized; retry after it finishes",
@@ -959,10 +1027,6 @@ async fn ingest_document(
         }
         let unchanged = existing.as_ref().is_some_and(|row| {
             row.get::<_, Option<String>>(1).as_deref() == Some(commit.source_digest.as_str())
-                && matches!(
-                    row.get::<_, Option<String>>(2).as_deref(),
-                    Some("queued" | "processing" | "succeeded")
-                )
         });
         if unchanged {
             let commit_id: Uuid = existing.expect("checked existing").get(0);
@@ -984,30 +1048,53 @@ async fn ingest_document(
         }
 
         let summary = commit.summary.as_ref();
+        let prompt_count = commit
+            .source
+            .messages
+            .iter()
+            .filter(|message| message.kind == MessageKind::UserWrote)
+            .count();
+        let reply_count = commit
+            .source
+            .messages
+            .iter()
+            .filter(|message| message.kind == MessageKind::AiWrote)
+            .count();
+        let change_message_count = commit
+            .source
+            .messages
+            .iter()
+            .filter(|message| message.kind == MessageKind::AiChanged)
+            .count();
         let status = if summary.is_some() {
             "succeeded"
-        } else {
+        } else if is_published && prompt_count > 0 {
             "queued"
+        } else {
+            "skipped"
         };
         let commit_id: Uuid = transaction
             .query_one(
                 "insert into public.commits \
                  (project_id, commit_hash, title, committed_at, files_changed, lines_added, \
-                  lines_deleted, user_requested, ai_answered, ai_implemented, meta, token_input, \
-                  token_output, token_cache_read, token_cache_create, sort_order, source_digest, \
-                  sanitizer_version, summarizer_version, summary_status, summarized_at, summary_error) \
-                 values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19, \
-                         $20::public.summary_job_status, case when $20 = 'succeeded' then now() end, null) \
+                  lines_deleted, public_story, public_beats, token_input, token_output, \
+                  token_cache_read, token_cache_create, sort_order, source_digest, \
+                  sanitizer_version, summarizer_version, summary_status, summarized_at, summary_error, \
+                  prompt_count,reply_count,change_message_count) \
+                 values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17, \
+                         $18::public.summary_job_status, case when $18 = 'succeeded' then now() end, null, \
+                         $19,$20,$21) \
                  on conflict (project_id, commit_hash) do update set \
                   title=excluded.title, committed_at=excluded.committed_at, files_changed=excluded.files_changed, \
                   lines_added=excluded.lines_added, lines_deleted=excluded.lines_deleted, \
-                  user_requested=excluded.user_requested, ai_answered=excluded.ai_answered, \
-                  ai_implemented=excluded.ai_implemented, meta=excluded.meta, token_input=excluded.token_input, \
+                  public_story=excluded.public_story, public_beats=excluded.public_beats, token_input=excluded.token_input, \
                   token_output=excluded.token_output, token_cache_read=excluded.token_cache_read, \
                   token_cache_create=excluded.token_cache_create, sort_order=excluded.sort_order, \
                   source_digest=excluded.source_digest, sanitizer_version=excluded.sanitizer_version, \
                   summarizer_version=excluded.summarizer_version, summary_status=excluded.summary_status, \
-                  summarized_at=excluded.summarized_at, summary_error=null \
+                  summarized_at=excluded.summarized_at, summary_error=null, \
+                  prompt_count=excluded.prompt_count,reply_count=excluded.reply_count, \
+                  change_message_count=excluded.change_message_count \
                  returning id",
                 &[
                     &project_id,
@@ -1017,10 +1104,12 @@ async fn ingest_document(
                     &u64_to_i64(commit.stats.files_changed)?,
                     &u64_to_i64(commit.stats.lines_added)?,
                     &u64_to_i64(commit.stats.lines_deleted)?,
-                    &summary.map(|s| s.user_requested.as_str()).unwrap_or(""),
-                    &summary.map(|s| s.ai_answered.as_str()).unwrap_or(""),
-                    &summary.map(|s| s.ai_implemented.as_str()).unwrap_or(""),
-                    &summary.map(|s| s.meta.as_str()).unwrap_or(""),
+                    &summary.map(|s| s.public.summary.as_str()).unwrap_or(""),
+                    &summary
+                        .map(|s| serde_json::to_value(&s.public.beats))
+                        .transpose()
+                        .map_err(|error| ApiError::Internal(error.to_string()))?
+                        .unwrap_or_else(|| serde_json::json!([])),
                     &optional_token(summary.and_then(|s| s.tokens), commit.source.tokens, |t| t.input)?,
                     &optional_token(summary.and_then(|s| s.tokens), commit.source.tokens, |t| t.output)?,
                     &optional_optional_token(summary.and_then(|s| s.tokens), commit.source.tokens, |t| t.cache_read)?,
@@ -1030,6 +1119,9 @@ async fn ingest_document(
                     &(commit.sanitizer_version as i32),
                     &summary.map(|_| 1i32),
                     &status,
+                    &(prompt_count as i32),
+                    &(reply_count as i32),
+                    &(change_message_count as i32),
                 ],
             )
             .await?
@@ -1054,21 +1146,52 @@ async fn ingest_document(
             .execute(
                 "insert into public.import_commits \
                  (import_id, commit_id, status, payload, completed_at) \
-                 values ($1,$2,$3::public.summary_job_status,$4, \
-                         case when $3 = 'succeeded' then now() end)",
-                &[&import_id, &commit_id, &status, &payload],
+                 values ($1,$2,'succeeded',$3,now())",
+                &[&import_id, &commit_id, &payload],
             )
             .await?;
         if summary.is_some() {
             locally_summarized += 1;
-        } else {
+        } else if is_published && prompt_count > 0 {
+            transaction
+                .execute(
+                    "insert into public.summary_jobs (import_id,commit_id,kind,payload) \
+                     values ($1,$2,'public',$3) \
+                     on conflict (commit_id,kind) do update set import_id=excluded.import_id, \
+                     payload=excluded.payload,status='queued',attempts=0,error_detail=null, \
+                     lease_expires_at=null,started_at=null,completed_at=null",
+                    &[&import_id, &commit_id, &payload],
+                )
+                .await?;
             queued += 1;
+        }
+        let summarized_prompts = summary
+            .map(|summary| {
+                summary
+                    .messages
+                    .iter()
+                    .filter(|message| {
+                        message.kind == MessageKind::UserWrote
+                            && message.subscriber_summary.is_some()
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        if has_subscriber && prompt_count > summarized_prompts {
+            transaction
+                .execute(
+                    "insert into public.summary_jobs (import_id,commit_id,kind,payload) \
+                     values ($1,$2,'subscriber',$3) \
+                     on conflict (commit_id,kind) do update set import_id=excluded.import_id, \
+                     payload=excluded.payload,status='queued',attempts=0,error_detail=null, \
+                     lease_expires_at=null,started_at=null,completed_at=null",
+                    &[&import_id, &commit_id, &payload],
+                )
+                .await?;
         }
     }
 
-    let import_status = if queued > 0 {
-        "processing"
-    } else if locally_summarized > 0 {
+    let import_status = if document.commits.len() > skipped {
         "succeeded"
     } else {
         "noop"
@@ -1076,7 +1199,7 @@ async fn ingest_document(
     transaction
         .execute(
             "update public.imports set status=$2::public.import_status, skipped_commit_count=$3, \
-             summarized_commit_count=$4, completed_at=case when $2 <> 'processing' then now() end \
+             summarized_commit_count=$4, completed_at=now() \
              where id=$1",
             &[
                 &import_id,
@@ -1133,28 +1256,43 @@ async fn insert_source_rows(
             .and_then(|tokens| tokens.cache_create)
             .map(u64_to_i64)
             .transpose()?;
+        let changed_file_count = message
+            .changes
+            .iter()
+            .map(|change| change.file.as_str())
+            .collect::<HashSet<_>>()
+            .len();
         let message_id: Uuid = transaction
             .query_one(
                 "insert into public.messages \
-                 (commit_id,kind,summary,occurred_at,token_input,token_output,token_cache_read, \
-                  token_cache_create,sort_order,changed_file_count,preview) \
-                 values ($1,$2::public.message_kind,$3,$4,$5,$6,$7,$8,$9,$10,$11) returning id",
+                 (commit_id,kind,occurred_at,token_input,token_output,token_cache_read, \
+                  token_cache_create,sort_order,changed_file_count) \
+                 values ($1,$2::public.message_kind,$3,$4,$5,$6,$7,$8,$9) returning id",
                 &[
                     &commit_id,
                     &kind,
-                    &generated.and_then(|message| message.summary.as_deref()),
                     &message.timestamp,
                     &token_input,
                     &token_output,
                     &token_cache_read,
                     &token_cache_create,
                     &(sort_order as i32),
-                    &(message.changes.len() as i32),
-                    &message.content.as_deref().map(preview),
+                    &(changed_file_count as i32),
                 ],
             )
             .await?
             .get(0);
+        if let Some(subscriber_summary) =
+            generated.and_then(|message| message.subscriber_summary.as_deref())
+        {
+            transaction
+                .execute(
+                    "insert into public.message_summaries \
+                     (message_id,summary,summarizer_version) values ($1,$2,1)",
+                    &[&message_id, &subscriber_summary],
+                )
+                .await?;
+        }
         if let Some(content) = &message.content {
             transaction
                 .execute(
@@ -1181,16 +1319,6 @@ fn kind_name(kind: MessageKind) -> &'static str {
         MessageKind::AiWrote => "AiWrote",
         MessageKind::AiChanged => "AiChanged",
     }
-}
-
-fn preview(value: &str) -> String {
-    value
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .take(280)
-        .collect()
 }
 
 fn u64_to_i64(value: u64) -> Result<i64, ApiError> {
@@ -1346,7 +1474,7 @@ mod tests {
             source: aissence::CommitSource {
                 messages: vec![aissence::MessageSummary {
                     kind: MessageKind::UserWrote,
-                    summary: None,
+                    subscriber_summary: None,
                     content: Some("Please update the documentation.".into()),
                     changes: Vec::new(),
                     timestamp: None,

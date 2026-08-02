@@ -11,7 +11,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use aissence::{
-    CoalescedHistory, CommitSummary, MessageKind, SummarizationCost, SummarizationProgress,
+    CoalescedHistory, CommitSummary, SummarizationCost, SummarizationProgress,
     SummarizationRequestKind, Summarizer, SummaryStore, analyze,
 };
 use terminal_size::{Width, terminal_size};
@@ -20,10 +20,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const USAGE: &str = "\
 Usage:
-  aissence-benchmark --model <MODEL> --source-folder <FOLDER> [--meta-summaries]
-
-Options:
-  --meta-summaries     Also generate User requested, AI implemented, and Overview
+  aissence-benchmark --model <MODEL> --source-folder <FOLDER>
 
 Environment:
   OPENROUTER_API_KEY    Required OpenRouter API key
@@ -34,7 +31,6 @@ Environment:
 struct Args {
     model: String,
     source_folder: PathBuf,
-    meta_summaries: bool,
 }
 
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -502,8 +498,7 @@ fn truncate_to_width(text: &str, max_width: usize) -> (String, usize) {
 fn request_kind_label(kind: SummarizationRequestKind) -> String {
     match kind {
         SummarizationRequestKind::UserBatch { entries } => format!("user×{entries}"),
-        SummarizationRequestKind::CoreOutcome => "core".to_string(),
-        SummarizationRequestKind::MetaSummary => "meta".to_string(),
+        SummarizationRequestKind::PublicStory => "public".to_string(),
     }
 }
 
@@ -572,8 +567,7 @@ async fn run() -> Result<(), String> {
         .map(|provider| provider.trim().to_string())
         .filter(|provider| !provider.is_empty());
     let summarizer = Summarizer::new_with_provider(api_key, &args.model, provider)
-        .map_err(|error| error.to_string())?
-        .with_meta_summaries(args.meta_summaries);
+        .map_err(|error| error.to_string())?;
 
     eprintln!(
         "Summarizing {} group(s) and {} prompt(s) with `{}` …",
@@ -645,13 +639,11 @@ async fn run() -> Result<(), String> {
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Args>, String> {
     let mut model = None;
     let mut source_folder = None;
-    let mut meta_summaries = false;
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => return Ok(None),
-            "--meta-summaries" => meta_summaries = true,
             "--model" | "-m" => {
                 model = Some(
                     args.next()
@@ -682,7 +674,6 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Args>, St
     Ok(Some(Args {
         model,
         source_folder,
-        meta_summaries,
     }))
 }
 
@@ -760,19 +751,14 @@ fn find_prompt_sample(history: &CoalescedHistory, reverse: bool) -> Option<Promp
         let Some(summary) = &group.summary else {
             continue;
         };
-        let prompt = if reverse {
-            summary.messages.iter().rev().find_map(prompt_summary)
-        } else {
-            summary.messages.iter().find_map(prompt_summary)
-        };
-        if let Some(prompt) = prompt {
+        if !summary.public.summary.trim().is_empty() {
             let group_label = group
                 .commit
                 .as_ref()
                 .map(|commit| format!("{} — {}", commit.short_id, commit.summary))
                 .unwrap_or_else(|| "uncommitted work in progress".to_string());
             return Some(PromptSample {
-                prompt,
+                prompt: &summary.public.summary,
                 group: summary,
                 group_label,
             });
@@ -781,17 +767,10 @@ fn find_prompt_sample(history: &CoalescedHistory, reverse: bool) -> Option<Promp
     None
 }
 
-fn prompt_summary(message: &aissence::MessageSummary) -> Option<&str> {
-    (message.kind == MessageKind::UserWrote)
-        .then_some(message.summary.as_deref())
-        .flatten()
-        .filter(|summary| !summary.trim().is_empty())
-}
-
 fn append_sample(markdown: &mut String, position: &str, sample: Option<PromptSample<'_>>) {
-    writeln!(markdown, "\n## {position} prompt summary").unwrap();
+    writeln!(markdown, "\n## {position} public story").unwrap();
     let Some(sample) = sample else {
-        writeln!(markdown, "\n_No summarized user prompt was available._").unwrap();
+        writeln!(markdown, "\n_No public story was available._").unwrap();
         return;
     };
 
@@ -803,25 +782,11 @@ fn append_sample(markdown: &mut String, position: &str, sample: Option<PromptSam
     .unwrap();
     append_quote(markdown, sample.prompt);
 
-    writeln!(markdown, "\n### {position} aggregate summaries").unwrap();
-    if !sample.group.user_requested.trim().is_empty() {
-        append_named_summary(markdown, "User requested", &sample.group.user_requested);
-    }
-    append_named_summary(markdown, "AI answered", &sample.group.ai_answered);
-    if !sample.group.ai_implemented.trim().is_empty() {
-        append_named_summary(markdown, "AI implemented", &sample.group.ai_implemented);
-    }
-    if !sample.group.meta.trim().is_empty() {
-        append_named_summary(markdown, "Overview", &sample.group.meta);
-    }
-}
-
-fn append_named_summary(markdown: &mut String, heading: &str, text: &str) {
-    writeln!(markdown, "\n#### {heading}").unwrap();
-    if text.trim().is_empty() {
-        writeln!(markdown, "\n_None._").unwrap();
-    } else {
-        append_quote(markdown, text);
+    if !sample.group.public.beats.is_empty() {
+        writeln!(markdown, "\n### Representative beats").unwrap();
+        for beat in &sample.group.public.beats {
+            writeln!(markdown, "\n- **{}:** {}", beat.label, beat.text).unwrap();
+        }
     }
 }
 
@@ -905,27 +870,8 @@ mod tests {
             Args {
                 model: "vendor/model".to_string(),
                 source_folder: PathBuf::from("../project"),
-                meta_summaries: false,
             }
         );
-    }
-
-    #[test]
-    fn meta_summaries_are_opt_in() {
-        let args = parse_args(
-            [
-                "--model",
-                "vendor/model",
-                "--source-folder",
-                "../project",
-                "--meta-summaries",
-            ]
-            .into_iter()
-            .map(str::to_string),
-        )
-        .unwrap()
-        .unwrap();
-        assert!(args.meta_summaries);
     }
 
     #[test]
@@ -975,7 +921,7 @@ mod tests {
         });
         live.handle(SummarizationProgress::Failed {
             id: 2,
-            kind: SummarizationRequestKind::CoreOutcome,
+            kind: SummarizationRequestKind::PublicStory,
             error: "429: provider rate limit".into(),
         });
         let lines = live.dashboard_lines(120);
@@ -998,17 +944,17 @@ mod tests {
         for id in [1, 2] {
             live.handle(SummarizationProgress::Started {
                 id,
-                kind: SummarizationRequestKind::CoreOutcome,
+                kind: SummarizationRequestKind::PublicStory,
             });
         }
         live.handle(SummarizationProgress::Completed {
             id: 1,
-            kind: SummarizationRequestKind::CoreOutcome,
+            kind: SummarizationRequestKind::PublicStory,
             usage: None,
         });
         live.handle(SummarizationProgress::Started {
             id: 3,
-            kind: SummarizationRequestKind::MetaSummary,
+            kind: SummarizationRequestKind::PublicStory,
         });
 
         assert_eq!(live.slots, vec![Some(3), Some(2)]);
@@ -1031,30 +977,16 @@ mod tests {
     }
 
     #[test]
-    fn stats_include_first_and_last_prompt_and_every_group_summary() {
+    fn stats_include_public_story_and_beats() {
         let summary = CommitSummary {
-            user_requested: "Aggregate request".into(),
-            ai_answered: "Aggregate answer".into(),
-            ai_implemented: "Aggregate implementation".into(),
-            meta: "Complete overview".into(),
-            messages: vec![
-                aissence::MessageSummary {
-                    kind: MessageKind::UserWrote,
-                    summary: Some("First prompt".into()),
-                    content: None,
-                    changes: vec![],
-                    timestamp: None,
-                    tokens: None,
-                },
-                aissence::MessageSummary {
-                    kind: MessageKind::UserWrote,
-                    summary: Some("Last prompt".into()),
-                    content: None,
-                    changes: vec![],
-                    timestamp: None,
-                    tokens: None,
-                },
-            ],
+            public: aissence::PublicStory {
+                summary: "Complete public overview".into(),
+                beats: vec![aissence::PublicBeat {
+                    message_index: 0,
+                    label: "Initial request".into(),
+                    text: "A privacy-safe request paraphrase.".into(),
+                }],
+            },
             ..Default::default()
         };
         let history = CoalescedHistory {
@@ -1076,50 +1008,7 @@ mod tests {
             &history,
         );
 
-        assert!(stats.contains("> First prompt"));
-        assert!(stats.contains("> Last prompt"));
-        assert!(stats.contains("> Aggregate request"));
-        assert!(stats.contains("> Aggregate answer"));
-        assert!(stats.contains("> Aggregate implementation"));
-        assert!(stats.contains("> Complete overview"));
-    }
-
-    #[test]
-    fn stats_omit_disabled_extended_summary_sections() {
-        let summary = CommitSummary {
-            ai_answered: "Aggregate answer".into(),
-            messages: vec![aissence::MessageSummary {
-                kind: MessageKind::UserWrote,
-                summary: Some("Prompt summary".into()),
-                content: None,
-                changes: vec![],
-                timestamp: None,
-                tokens: None,
-            }],
-            ..Default::default()
-        };
-        let history = CoalescedHistory {
-            folder: PathBuf::from("/source"),
-            groups: vec![aissence::CommitGroup {
-                commit: None,
-                messages: vec![],
-                summary: Some(summary),
-            }],
-            undated: vec![],
-            warnings: vec![],
-        };
-
-        let stats = stats_markdown(
-            "vendor/model",
-            Path::new("/source"),
-            Duration::ZERO,
-            SummarizationCost::default(),
-            &history,
-        );
-
-        assert!(stats.contains("#### AI answered"));
-        assert!(!stats.contains("#### User requested"));
-        assert!(!stats.contains("#### AI implemented"));
-        assert!(!stats.contains("#### Overview"));
+        assert!(stats.contains("> Complete public overview"));
+        assert!(stats.contains("**Initial request:** A privacy-safe request paraphrase."));
     }
 }

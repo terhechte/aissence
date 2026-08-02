@@ -1,6 +1,6 @@
 <script lang="ts">
   import PromptMarkdown from '$lib/components/PromptMarkdown.svelte';
-  import { abridgeTranscript, groupTranscript } from '$lib/ledger';
+  import { groupTranscript } from '$lib/ledger';
   import { formatCount, formatDate } from '$lib/utils';
 
   let {
@@ -117,7 +117,7 @@
   }
 
   function messagePreview(message: any) {
-    return sourceContent(message) || message.preview || 'Text unavailable.';
+    return sourceContent(message) || 'Text unavailable.';
   }
 
   function changeDescription(message: any) {
@@ -139,10 +139,11 @@
 
   function promptBlurb(commit: any) {
     const count = promptCount(commit);
-    const firstPrompt = commit.messages.find((message: any) => message.kind === 'UserWrote');
-    const summary = String(firstPrompt?.summary ?? '').trim();
-    if (!summary) return count ? `${count} ${count === 1 ? 'prompt' : 'prompts'}` : 'No prompt summary available.';
-    return count > 1 ? `${count} prompts · ${summary}` : summary;
+    const story = String(commit.public_story ?? '').trim();
+    if (story) return story;
+    return count
+      ? `${count} ${count === 1 ? 'prompt' : 'prompts'} · public story is being prepared`
+      : 'No user prompt was associated with this commit.';
   }
 
   function changedSummary(commit: any) {
@@ -160,13 +161,11 @@
   }
 
   function transcriptItems(commit: any) {
-    const turns = groupTranscript(commit.messages);
-    if (isEntitled) return turns.map((turn) => ({ kind: 'turn' as const, turn }));
-    return abridgeTranscript(turns, sourceContent, commit.commit_hash);
+    return groupTranscript(commit.messages ?? []);
   }
 
-  function hiddenActivityText(promptCount: number, replyCount: number, changedFileCount: number) {
-    return `${promptCount} hidden user ${promptCount === 1 ? 'prompt' : 'prompts'} and ${activityText(replyCount, changedFileCount)}`;
+  function publicBeats(commit: any) {
+    return Array.isArray(commit.public_beats) ? commit.public_beats : [];
   }
 
   function formatUsd(value: number | string | null | undefined) {
@@ -317,49 +316,52 @@
               <div class="commit-meta"><span>{formatDate(commit.committed_at)}</span><span>{commit.commit_hash.slice(0, 10)}</span></div>
               <div>
                 <div class="summary-grid">
-                  <div><span>Assistant summary</span><PromptMarkdown content={commit.ai_answered} /></div>
+                  <div><span>How this commit came to be</span><PromptMarkdown content={commit.public_story || 'This public story is being prepared.'} /></div>
                   <div><span>Changed</span><p>{changedSummary(commit)}</p></div>
                 </div>
 
-                {#if commit.messages.length}
-                  <div class="transcript">
-                    <h4>{isEntitled ? 'Transcript' : 'Transcript, abridged'}</h4>
-                    {#each transcriptItems(commit) as item}
-                      {#if item.kind === 'hidden'}
-                        <div class="message activity-summary hidden-summary">
-                          <span>hidden</span>
-                          <time></time>
-                          <div><p>{hiddenActivityText(item.promptCount, item.replyCount, item.changedFileCount)}</p></div>
+                {#if !isEntitled}
+                  <div class="public-story">
+                    <h4>Representative prompt moments</h4>
+                    {#if publicBeats(commit).length}
+                      {#each publicBeats(commit) as beat}
+                        <div class="public-beat">
+                          <span>{beat.label}</span>
+                          <PromptMarkdown content={beat.text} />
                         </div>
-                      {:else}
-                        {@const turn = item.turn}
+                      {/each}
+                    {:else}
+                      <p class="source-unavailable">No prompt wording is exposed. A privacy-safe story will appear here once prepared.</p>
+                    {/if}
+                    <p class="public-activity">{promptCount(commit)} user {promptCount(commit) === 1 ? 'prompt' : 'prompts'}, {Number(commit.reply_count ?? 0)} agent replies, and {Number(commit.change_message_count ?? 0)} recorded change steps.</p>
+                    <div class="locked">
+                      <span>Every prompt summary and full prompt is reserved for subscribers</span>
+                      <a href={`/creators/${profile.handle}/subscribe`}>Unlock the full ledger →</a>
+                    </div>
+                  </div>
+                {:else if commit.messages.length}
+                  <div class="transcript">
+                    <h4>Subscriber ledger</h4>
+                    {#each transcriptItems(commit) as turn}
                       {#if turn.asked}
+                        {@const content = sourceContent(turn.asked)}
                         <div class="message asked-message">
                           <span>asked</span>
                           <time>{messageTime(turn.asked)}</time>
                           <div>
-                            <PromptMarkdown content={turn.asked.summary} />
-                            {#if isEntitled}
-                              {@const content = sourceContent(turn.asked)}
-                              {#if content}
-                                <details class="full-prompt">
-                                  <summary>Read full prompt</summary>
-                                  <PromptMarkdown content={content} />
-                                </details>
-                              {:else}
-                                <p class="source-unavailable">Full prompt unavailable in this source file.</p>
-                              {/if}
+                            <PromptMarkdown content={turn.asked.subscriber_summary || 'This prompt summary is being prepared.'} />
+                            {#if content}
+                              <details class="full-prompt">
+                                <summary>Read full prompt</summary>
+                                <PromptMarkdown content={content} />
+                              </details>
                             {:else}
-                              <div class="locked">
-                                <span>Full prompt for subscribers</span>
-                                <a href={`/creators/${profile.handle}/subscribe`}>Unlock prompts →</a>
-                              </div>
+                              <p class="source-unavailable">Full prompt unavailable in this source file.</p>
                             {/if}
                           </div>
                         </div>
                       {/if}
 
-                      {#if isEntitled}
                         {#if turn.activity.length}
                           <details class="agent-activity">
                             <summary>
@@ -383,14 +385,6 @@
                               {/each}
                             </div>
                           </details>
-                        {/if}
-                      {:else if turn.asked}
-                        <div class="message activity-summary">
-                          <span>agent</span>
-                          <time></time>
-                          <div><p>{activityText(turn.replyCount, turn.changedFileCount)}</p></div>
-                        </div>
-                      {/if}
                       {/if}
                     {/each}
                   </div>
@@ -883,6 +877,36 @@
   .transcript h4 {
     color: var(--muted);
   }
+  .public-story {
+    margin-top: 28px;
+    padding-top: 19px;
+    border-top: 1px solid var(--rule2);
+  }
+  .public-story h4,
+  .public-beat > span {
+    color: var(--muted);
+    font: 400 9px/1 'JetBrains Mono', monospace;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+  }
+  .public-beat {
+    display: grid;
+    grid-template-columns: 150px minmax(0, 1fr);
+    gap: 18px;
+    padding: 14px 0;
+    border-bottom: 1px solid var(--rule2);
+  }
+  .public-beat :global(p),
+  .public-activity {
+    margin: 0;
+    color: var(--body);
+    line-height: 1.5;
+  }
+  .public-activity {
+    margin-top: 16px;
+    font: 400 10px/1.5 'JetBrains Mono', monospace;
+    color: var(--muted);
+  }
   .message {
     display: grid;
     grid-template-columns: 70px 46px 1fr;
@@ -972,19 +996,6 @@
   .activity-rows {
     padding: 4px 12px 8px;
   }
-  .activity-summary {
-    margin-left: 130px;
-    border-left: 2px solid var(--rule2);
-    padding: 10px 12px;
-    color: var(--muted);
-  }
-  .activity-summary > span {
-    color: var(--faint);
-  }
-  .activity-summary p {
-    color: var(--muted);
-    font-style: italic;
-  }
   footer {
     display: flex;
     justify-content: space-between;
@@ -1054,8 +1065,7 @@
     .message > time {
       display: none;
     }
-    .agent-activity,
-    .activity-summary {
+    .agent-activity {
       margin-left: 0;
     }
     footer {

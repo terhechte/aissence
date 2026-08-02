@@ -67,15 +67,32 @@ redaction upgrades explicit synchronization changes.
 
 `summary` is absent or `null` until generated. When present it contains:
 
-- `user_requested`
-- `ai_answered`
-- `ai_implemented`
-- `meta`
-- chronological `messages`, with generated summaries only on `UserWrote`
-  entries
+- `public.summary`: the single privacy-safe commit narrative
+- `public.beats`: zero to three representative, paraphrased prompt moments
+- chronological `messages`; `subscriber_summary` is optional and only valid on
+  `UserWrote` entries
 - `agents` and `tokens`
 
 The summary message list must have the same length and kinds as `source.messages`.
+Normal public generation makes exactly one model request per commit and leaves
+every `subscriber_summary` absent. The subscriber summaries are a separate
+on-demand tier and are never needed to publish the free ledger.
+
+## Hosted generation lifecycle
+
+Uploading stores sanitized source and completes the import immediately. Draft
+projects do not create public summary jobs. Publishing queues one public-story
+job for each unsummarized commit. The public job receives bounded evidence: the
+first and final user prompts, at most two high-signal corrections, a bounded
+tail of assistant conclusions, and a metadata-only git fingerprint. Diff bodies
+are not sent for public summarization.
+
+The first active or trialing subscriber for a creator queues subscriber jobs for
+the creator's published commits. Those jobs summarize every user prompt in
+batches of at most eight/6,000 characters; prompts of 200 characters or fewer
+are copied without a model request because the entitled reader may already read
+the complete source. Later imports queue both tiers only when the creator still
+has an active subscriber.
 
 ## Redaction
 

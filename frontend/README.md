@@ -5,9 +5,10 @@ AI-assisted software project. Creators upload a `.aissence` file, add project
 context and screenshots, preview the result privately, and publish a public
 ledger.
 
-Public readers see summaries. Active creator subscribers can additionally read
-retained `UserWrote.content`; assistant source text and edit diffs remain
-creator-only.
+Public readers see one privacy-safe story and up to three representative beats
+per commit; the public query never selects message rows. Active creator
+subscribers additionally see every prompt summary and retained
+`UserWrote.content`; assistant source text and edit diffs remain creator-only.
 
 ## Local development
 
@@ -33,7 +34,9 @@ pnpm dev
 ```
 
 For the normal local workflow, one command starts Supabase, Mailpit, and
-Aissence and derives the local URLs and publishable key automatically:
+Aissence's frontend and Rust API, and derives the local URLs and publishable
+key automatically. Export `OPENROUTER_API_KEY` first so the hosted summary
+worker can start:
 
 ```sh
 pnpm dev:local
@@ -43,15 +46,18 @@ Use `pnpm dev:local:open` to also open Aissence and Mailpit in the default
 browser. Press Ctrl-C to stop the Aissence server; Supabase remains available
 for the next run. Stop its containers explicitly with `pnpm local:stop`.
 
-The local migration creates the database schema, RLS policies, private Storage
-buckets, atomic snapshot replacement function, and manual subscription helper.
+The local migrations create the database schema, audience-specific RLS
+policies, private Storage buckets, durable summary jobs, and the manual
+subscription helper. Browser uploads are validated and ingested by the Rust
+server configured through `AISSENCE_API_URL`; the frontend does not write JSON
+snapshots into Postgres itself.
 
 ## Supabase configuration
 
 For a hosted project:
 
 1. Link the project with the Supabase CLI.
-2. Apply `supabase/migrations/202607300001_initial.sql`.
+2. Apply every migration in `supabase/migrations` in timestamp order.
 3. Add the production URL and Vercel preview URLs to Auth redirect URLs.
 4. Configure the email provider and magic-link template.
 5. Set the environment variables from `.env.example` in Vercel. Never expose

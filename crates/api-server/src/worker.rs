@@ -11,9 +11,11 @@ const HOSTED_CORE_INPUT_CHARS: usize = 8_192;
 const HOSTED_FIXED_INPUT_CHARS_PER_REQUEST: usize = 4_096;
 
 struct Job {
+    id: Uuid,
     import_id: Uuid,
     commit_id: Uuid,
     uploader_id: Uuid,
+    kind: String,
     commit: AissenceCommit,
     attempt_id: Option<Uuid>,
 }
@@ -35,70 +37,59 @@ async fn claim(state: &AppState) -> Result<Option<Job>, Box<dyn std::error::Erro
     let mut client = state.pool.get().await?;
     let transaction = client.transaction().await?;
 
-    // An expired processing lease is deliberately failed rather than blindly
-    // replayed: the previous worker may already have spent the upstream budget.
-    let expired_imports = transaction
-        .query(
-            "update public.import_commits set status='failed', \
-             error_detail='worker lease expired; retry requires a new import', completed_at=now() \
-             where status='processing' and lease_expires_at < now() returning import_id,commit_id",
+    transaction
+        .execute(
+            "update public.summary_jobs set \
+               status=case when attempts < 3 then 'queued'::public.summary_job_status \
+                           else 'failed'::public.summary_job_status end, \
+               error_detail=case when attempts < 3 then 'recovered stale worker lease' \
+                                 else 'summary worker repeatedly lost its lease' end, \
+               lease_expires_at=null, completed_at=case when attempts < 3 then null else now() end \
+             where status='processing' and lease_expires_at < now()",
             &[],
         )
         .await?;
-    for row in expired_imports {
-        transaction
-            .execute(
-                "update public.commits set summary_status='failed', \
-                 summary_error='worker lease expired; retry requires a new import' where id=$1",
-                &[&row.get::<_, Uuid>(1)],
-            )
-            .await?;
-        refresh_import(&transaction, row.get(0)).await?;
-    }
 
     let row = transaction
         .query_opt(
             "with candidate as ( \
-                select ic.import_id,ic.commit_id from public.import_commits ic \
-                where ic.status='queued' order by ic.created_at \
+                select sj.id from public.summary_jobs sj \
+                where sj.status='queued' order by sj.created_at \
                 for update skip locked limit 1 \
              ) \
-             update public.import_commits ic set status='processing', attempts=attempts+1, \
+             update public.summary_jobs sj set status='processing', attempts=attempts+1, \
                  started_at=now(), lease_expires_at=now()+interval '10 minutes' \
              from candidate c, public.imports i \
-             where ic.import_id=c.import_id and ic.commit_id=c.commit_id and i.id=ic.import_id \
-             returning ic.import_id,ic.commit_id,i.uploader_id,ic.payload",
+             where sj.id=c.id and i.id=sj.import_id \
+             returning sj.id,sj.import_id,sj.commit_id,i.uploader_id,sj.kind::text,sj.payload",
             &[],
         )
         .await?;
     if let Some(row) = &row {
-        transaction
-            .execute(
-                "update public.commits set summary_status='processing' where id=$1",
-                &[&row.get::<_, Uuid>(1)],
-            )
-            .await?;
+        if row.get::<_, String>(4) == "public" {
+            transaction
+                .execute(
+                    "update public.commits set summary_status='processing' where id=$1",
+                    &[&row.get::<_, Uuid>(2)],
+                )
+                .await?;
+        }
     }
     transaction.commit().await?;
     let Some(row) = row else { return Ok(None) };
-    let payload: Value = row.get(3);
+    let payload: Value = row.get(5);
     Ok(Some(Job {
-        import_id: row.get(0),
-        commit_id: row.get(1),
-        uploader_id: row.get(2),
+        id: row.get(0),
+        import_id: row.get(1),
+        commit_id: row.get(2),
+        uploader_id: row.get(3),
+        kind: row.get(4),
         commit: serde_json::from_value(payload)?,
         attempt_id: None,
     }))
 }
 
 async fn process(state: &AppState, mut job: Job) {
-    let user_message_count = job
-        .commit
-        .source
-        .messages
-        .iter()
-        .filter(|message| message.kind == aissence::MessageKind::UserWrote)
-        .count();
     let source_input_chars = job
         .commit
         .source
@@ -106,11 +97,16 @@ async fn process(state: &AppState, mut job: Job) {
         .iter()
         .filter(|message| message.kind == aissence::MessageKind::UserWrote)
         .filter_map(|message| message.content.as_deref())
+        .filter(|content| content.chars().count() > 200)
         .map(str::chars)
-        .map(Iterator::count)
+        .map(|chars| chars.count().min(6_000))
         .fold(0usize, usize::saturating_add);
-    let (request_ceiling, input_char_ceiling) =
-        hosted_usage_ceiling(user_message_count, source_input_chars);
+    let (request_ceiling, input_char_ceiling) = if job.kind == "public" {
+        hosted_usage_ceiling(1, source_input_chars.min(6_000))
+    } else {
+        let planned = planned_subscriber_requests(&job.commit);
+        hosted_usage_ceiling(planned, source_input_chars)
+    };
     match reserve_budget(state, &job, request_ceiling, input_char_ceiling).await {
         Ok(Some(attempt_id)) => job.attempt_id = Some(attempt_id),
         Ok(None) => {
@@ -135,32 +131,84 @@ async fn process(state: &AppState, mut job: Job) {
         }
     }
 
-    let (result, cost) = state
-        .summarizer
-        .summarize_document_commit_with_cost(&job.commit)
-        .await;
-    match result {
-        Ok(summary) => {
-            let mut summary = summary;
-            aissence::Redactor::global().redact_summary(&mut summary);
-            job.commit.summary = Some(summary.clone());
-            if let Err(error) = succeed_job(state, &job, &summary, cost).await {
-                tracing::error!(error = %error, import_id = %job.import_id, "cannot persist summary");
+    if job.kind == "public" {
+        let (result, cost) = state
+            .summarizer
+            .summarize_document_commit_with_cost(&job.commit)
+            .await;
+        match result {
+            Ok(summary) => {
+                let mut summary = summary;
+                aissence::Redactor::global().redact_summary(&mut summary);
+                job.commit.summary = Some(summary.clone());
+                if let Err(error) = succeed_public_job(state, &job, &summary, cost).await {
+                    tracing::error!(error = %error, job_id = %job.id, "cannot persist public story");
+                }
             }
+            Err(error) => fail_job(state, &job, &error.to_string(), Some(cost)).await,
         }
-        Err(error) => fail_job(state, &job, &error.to_string(), Some(cost)).await,
+    } else {
+        let (result, cost) = state
+            .summarizer
+            .summarize_subscriber_prompts_with_cost(&job.commit)
+            .await;
+        match result {
+            Ok(summaries) => {
+                if let Err(error) = succeed_subscriber_job(state, &job, &summaries, cost).await {
+                    tracing::error!(error = %error, job_id = %job.id, "cannot persist subscriber summaries");
+                }
+            }
+            Err(error) => fail_job(state, &job, &error.to_string(), Some(cost)).await,
+        }
     }
 }
 
-fn hosted_usage_ceiling(user_message_count: usize, source_input_chars: usize) -> (usize, usize) {
-    let request_ceiling = user_message_count
-        .saturating_add(1)
-        .saturating_mul(HOSTED_REQUEST_RETRIES + 1);
+fn hosted_usage_ceiling(planned_requests: usize, source_input_chars: usize) -> (usize, usize) {
+    if planned_requests == 0 {
+        return (0, 0);
+    }
+    let request_ceiling = planned_requests.saturating_mul(HOSTED_REQUEST_RETRIES + 1);
     let input_char_ceiling = source_input_chars
         .saturating_add(HOSTED_CORE_INPUT_CHARS)
         .saturating_mul(HOSTED_REQUEST_RETRIES + 1)
         .saturating_add(request_ceiling.saturating_mul(HOSTED_FIXED_INPUT_CHARS_PER_REQUEST));
     (request_ceiling, input_char_ceiling)
+}
+
+fn planned_subscriber_requests(commit: &AissenceCommit) -> usize {
+    let mut requests = 0usize;
+    let mut batch_entries = 0usize;
+    let mut batch_chars = 0usize;
+    for message in commit
+        .source
+        .messages
+        .iter()
+        .filter(|message| message.kind == aissence::MessageKind::UserWrote)
+    {
+        let chars = message
+            .content
+            .as_deref()
+            .map(str::chars)
+            .map(Iterator::count)
+            .unwrap_or(0)
+            .min(6_000);
+        if chars <= 200 {
+            continue;
+        }
+        if batch_entries > 0 && (batch_entries >= 8 || batch_chars + chars > 6_000) {
+            requests += 1;
+            batch_entries = 0;
+            batch_chars = 0;
+        }
+        batch_entries += 1;
+        batch_chars += chars;
+        if batch_chars >= 6_000 {
+            requests += 1;
+            batch_entries = 0;
+            batch_chars = 0;
+        }
+    }
+    requests + usize::from(batch_entries > 0)
 }
 
 async fn reserve_budget(
@@ -214,11 +262,12 @@ async fn reserve_budget(
     let attempt_id: Uuid = transaction
         .query_one(
             "insert into public.summarization_attempts \
-             (import_id,commit_id,uploader_id,request_count,reserved_request_count,reserved_input_chars,status) \
-             values ($1,$2,$3,0,$4,$5,'reserved') returning id",
+             (import_id,commit_id,summary_job_id,uploader_id,request_count,reserved_request_count,reserved_input_chars,status) \
+             values ($1,$2,$3,$4,0,$5,$6,'reserved') returning id",
             &[
                 &job.import_id,
                 &job.commit_id,
+                &job.id,
                 &job.uploader_id,
                 &request_ceiling_i32,
                 &input_char_ceiling,
@@ -230,7 +279,7 @@ async fn reserve_budget(
     Ok(Some(attempt_id))
 }
 
-async fn succeed_job(
+async fn succeed_public_job(
     state: &AppState,
     job: &Job,
     summary: &CommitSummary,
@@ -245,16 +294,14 @@ async fn succeed_job(
     let token_cache_create = checked_token(tokens.and_then(|tokens| tokens.cache_create))?;
     transaction
         .execute(
-            "update public.commits set user_requested=$2,ai_answered=$3,ai_implemented=$4,meta=$5, \
-             token_input=$6,token_output=$7,token_cache_read=$8,token_cache_create=$9, \
+            "update public.commits set public_story=$2,public_beats=$3, \
+             token_input=$4,token_output=$5,token_cache_read=$6,token_cache_create=$7, \
              summarizer_version=1,summary_status='succeeded',summarized_at=now(),summary_error=null \
              where id=$1",
             &[
                 &job.commit_id,
-                &summary.user_requested,
-                &summary.ai_answered,
-                &summary.ai_implemented,
-                &summary.meta,
+                &summary.public.summary,
+                &serde_json::to_value(&summary.public.beats)?,
                 &token_input,
                 &token_output,
                 &token_cache_read,
@@ -262,24 +309,54 @@ async fn succeed_job(
             ],
         )
         .await?;
-    for (sort_order, message) in summary.messages.iter().enumerate() {
-        transaction
-            .execute(
-                "update public.messages set summary=$3 where commit_id=$1 and sort_order=$2",
-                &[&job.commit_id, &(sort_order as i32), &message.summary],
-            )
-            .await?;
-    }
     let payload = serde_json::to_value(&job.commit)?;
     transaction
         .execute(
-            "update public.import_commits set status='succeeded',payload=$3,error_detail=null, \
-             lease_expires_at=null,completed_at=now() where import_id=$1 and commit_id=$2",
+            "update public.import_commits set payload=$3 where import_id=$1 and commit_id=$2",
             &[&job.import_id, &job.commit_id, &payload],
         )
         .await?;
+    transaction
+        .execute(
+            "update public.summary_jobs set status='succeeded',error_detail=null, \
+             lease_expires_at=null,completed_at=now() where id=$1",
+            &[&job.id],
+        )
+        .await?;
     record_attempt(&transaction, job, "succeeded", None, cost).await?;
-    refresh_import(&transaction, job.import_id).await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
+async fn succeed_subscriber_job(
+    state: &AppState,
+    job: &Job,
+    summaries: &[(usize, String)],
+    cost: SummarizationCost,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut client = state.pool.get().await?;
+    let transaction = client.transaction().await?;
+    for (sort_order, summary) in summaries {
+        let sort_order = i32::try_from(*sort_order)?;
+        transaction
+            .execute(
+                "insert into public.message_summaries (message_id,summary,summarizer_version) \
+                 select id,$3,1 from public.messages \
+                 where commit_id=$1 and sort_order=$2 and kind='UserWrote' \
+                 on conflict (message_id) do update set summary=excluded.summary, \
+                 summarizer_version=excluded.summarizer_version, generated_at=now()",
+                &[&job.commit_id, &sort_order, summary],
+            )
+            .await?;
+    }
+    transaction
+        .execute(
+            "update public.summary_jobs set status='succeeded',error_detail=null, \
+             lease_expires_at=null,completed_at=now() where id=$1",
+            &[&job.id],
+        )
+        .await?;
+    record_attempt(&transaction, job, "succeeded", None, cost).await?;
     transaction.commit().await?;
     Ok(())
 }
@@ -290,17 +367,19 @@ async fn fail_job(state: &AppState, job: &Job, detail: &str, cost: Option<Summar
         let transaction = client.transaction().await?;
         transaction
             .execute(
-                "update public.import_commits set status='failed',error_detail=$3, \
-                 lease_expires_at=null,completed_at=now() where import_id=$1 and commit_id=$2",
-                &[&job.import_id, &job.commit_id, &detail],
+                "update public.summary_jobs set status='failed',error_detail=$2, \
+                 lease_expires_at=null,completed_at=now() where id=$1",
+                &[&job.id, &detail],
             )
             .await?;
-        transaction
-            .execute(
-                "update public.commits set summary_status='failed',summary_error=$2 where id=$1",
-                &[&job.commit_id, &detail],
-            )
-            .await?;
+        if job.kind == "public" {
+            transaction
+                .execute(
+                    "update public.commits set summary_status='failed',summary_error=$2 where id=$1",
+                    &[&job.commit_id, &detail],
+                )
+                .await?;
+        }
         if job.attempt_id.is_some() {
             record_attempt(
                 &transaction,
@@ -311,7 +390,6 @@ async fn fail_job(state: &AppState, job: &Job, detail: &str, cost: Option<Summar
             )
             .await?;
         }
-        refresh_import(&transaction, job.import_id).await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -354,31 +432,6 @@ fn checked_token(
     value.map(i64::try_from).transpose().map_err(Into::into)
 }
 
-async fn refresh_import(
-    transaction: &tokio_postgres::Transaction<'_>,
-    import_id: Uuid,
-) -> Result<(), tokio_postgres::Error> {
-    transaction
-        .execute(
-            "with counts as (select \
-                count(*) filter (where status in ('queued','processing')) as pending, \
-                count(*) filter (where status='succeeded') as succeeded, \
-                count(*) filter (where status='skipped') as skipped, \
-                count(*) filter (where status='failed') as failed \
-             from public.import_commits where import_id=$1) \
-             update public.imports i set \
-                summarized_commit_count=counts.succeeded,skipped_commit_count=counts.skipped, \
-                status=(case when counts.pending>0 then 'processing' \
-                             when counts.failed>0 then 'failed' else 'succeeded' end)::public.import_status, \
-                error_detail=case when counts.failed>0 then 'one or more commits failed' else null end, \
-                completed_at=case when counts.pending=0 then now() else null end \
-             from counts where i.id=$1",
-            &[&import_id],
-        )
-        .await?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,7 +439,7 @@ mod tests {
     #[test]
     fn usage_reservation_includes_core_prompts_fixed_overhead_and_retries() {
         let (requests, chars) = hosted_usage_ceiling(1, 100);
-        assert_eq!(requests, 4);
-        assert_eq!(chars, (100 + 8_192) * 2 + 4 * 4_096);
+        assert_eq!(requests, 2);
+        assert_eq!(chars, (100 + 8_192) * 2 + 2 * 4_096);
     }
 }

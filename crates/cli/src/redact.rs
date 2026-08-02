@@ -49,13 +49,14 @@ impl Redactor {
     }
 
     pub fn redact_summary(&self, summary: &mut CommitSummary) {
-        summary.user_requested = self.redact_text(&summary.user_requested);
-        summary.ai_answered = self.redact_text(&summary.ai_answered);
-        summary.ai_implemented = self.redact_text(&summary.ai_implemented);
-        summary.meta = self.redact_text(&summary.meta);
+        summary.public.summary = self.redact_text(&summary.public.summary);
+        for beat in &mut summary.public.beats {
+            beat.label = self.redact_text(&beat.label);
+            beat.text = self.redact_text(&beat.text);
+        }
         for message in &mut summary.messages {
-            message.summary = message
-                .summary
+            message.subscriber_summary = message
+                .subscriber_summary
                 .as_deref()
                 .map(|value| self.redact_text(value));
             message.content = message
@@ -123,6 +124,7 @@ fn redact_secrets(text: &str) -> String {
     static DIRECT: OnceLock<Vec<Regex>> = OnceLock::new();
     static ASSIGNMENT: OnceLock<Regex> = OnceLock::new();
     static CREDENTIAL_URL: OnceLock<Regex> = OnceLock::new();
+    static LOCAL_PATH: OnceLock<Regex> = OnceLock::new();
     let direct = DIRECT.get_or_init(|| {
         [
             r"\bsk-[A-Za-z0-9_-]{20,}\b",
@@ -158,8 +160,17 @@ fn redact_secrets(text: &str) -> String {
         Regex::new(r"(?i)\b([a-z][a-z0-9+.-]*://[^/\s:@]+:)[^@\s/]+@")
             .expect("valid credential URL regex")
     });
-    credential_url
+    output = credential_url
         .replace_all(&output, "${1}[REDACTED_SECRET]@")
+        .into_owned();
+    let local_path = LOCAL_PATH.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?:/(?:Users|home)/[^\s/]+/[^\s\]\[\)\(\}"']+|[A-Z]:\\Users\\[^\s\\]+\\[^\s\]\[\)\(\}"']+)"#,
+        )
+        .expect("valid local path regex")
+    });
+    local_path
+        .replace_all(&output, "[REDACTED_PATH]")
         .into_owned()
 }
 
@@ -191,5 +202,13 @@ mod tests {
         assert!(!output.contains("correct-horse-battery"));
         assert!(!output.contains("eyJabcdefghij"));
         assert!(!output.contains("glpat-abcdefghijklmnopqrstuvwxyz"));
+    }
+
+    #[test]
+    fn removes_absolute_home_paths() {
+        let output =
+            redact_secrets("See /Users/alice/Desktop/private.png and C:\\Users\\alice\\secret.txt");
+        assert!(!output.contains("alice"));
+        assert!(output.contains("[REDACTED_PATH]"));
     }
 }
