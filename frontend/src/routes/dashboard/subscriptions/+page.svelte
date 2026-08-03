@@ -85,7 +85,7 @@
           <a href={`/creators/${ledger.creator.handle}/${ledger.slug}`}>
             <div>
               <h2>{ledger.name}</h2>
-              <p>{ledger.tagline}</p>
+              {#if ledger.tagline}<p>{ledger.tagline}</p>{/if}
             </div>
             <div class="creator">
               <span>Creator</span>

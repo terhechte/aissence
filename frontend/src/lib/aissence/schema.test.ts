@@ -116,4 +116,13 @@ describe('optional project metadata', () => {
       storage_path: 'creator/project/image.png', alt_text: '', caption: '', sort_order: 0
     }).alt_text).toBe('');
   });
+
+  it('accepts projects without a tagline or description', () => {
+    const project = projectMetadataSchema.parse({
+      name: 'Project', slug: 'project', tagline: '', description: '',
+      product_url: '', repository_label: '', repository_url: ''
+    });
+    expect(project.tagline).toBe('');
+    expect(project.description).toBe('');
+  });
 });

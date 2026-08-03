@@ -141,7 +141,7 @@
                 {#if project.product_url}<span>Product</span>{/if}
               </div>
               <h3>{project.name}</h3>
-              <p>{project.tagline}</p>
+              {#if project.tagline}<p>{project.tagline}</p>{/if}
             </div>
             <div class="card-meta">
               <span>{project.profiles.display_name}</span>

@@ -60,6 +60,7 @@ pub struct AccessTokenResponse {
 pub struct ResolveProjectRequest {
     pub source_id: Uuid,
     pub name: Option<String>,
+    pub description: Option<String>,
     pub repository: Option<String>,
 }
 
@@ -68,6 +69,8 @@ pub struct ResolveProjectRequest {
 pub struct ProjectState {
     pub id: Uuid,
     pub sync_revision: i64,
+    pub preview_url: String,
+    pub created: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

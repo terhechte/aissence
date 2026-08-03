@@ -200,8 +200,8 @@
     <div>
       <p class="eyebrow">A project, reconstructed from its commits</p>
       <h1>{project.name}</h1>
-      <p class="tagline">{project.tagline}</p>
-      <p class="description">{project.description}</p>
+      {#if project.tagline}<p class="tagline">{project.tagline}</p>{/if}
+      {#if project.description}<p class="description">{project.description}</p>{/if}
       <div class="project-links">
         {#if project.product_url}<a href={project.product_url} target="_blank" rel="noreferrer">Visit project ↗</a>{/if}
         {#if project.repository_url}<a href={project.repository_url} target="_blank" rel="noreferrer">Repository ↗</a>{/if}

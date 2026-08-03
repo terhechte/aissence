@@ -61,7 +61,7 @@
             <a href={`/dashboard/projects/${project.id}`}>
               <div>
                 <h2>{project.name}</h2>
-                <p>{project.tagline}</p>
+                {#if project.tagline}<p>{project.tagline}</p>{/if}
               </div>
               <span class:published={project.visibility === 'published'}>{project.visibility}</span>
               <span>

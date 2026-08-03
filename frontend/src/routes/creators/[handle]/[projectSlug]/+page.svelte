@@ -10,7 +10,7 @@
 
 <svelte:head>
   <title>{data.project.name} — {data.profile.display_name} on aissence</title>
-  <meta name="description" content={data.project.tagline} />
+  <meta name="description" content={data.project.tagline || data.project.description || `The ${data.project.name} project ledger`} />
 </svelte:head>
 
 {#if data.project.visibility === 'draft'}

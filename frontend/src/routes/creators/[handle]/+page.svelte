@@ -43,7 +43,7 @@
       <div class="projects">
         {#each data.projects as project}
           <a href={`/creators/${data.profile.handle}/${project.slug}`}>
-            <div><h2>{project.name}</h2><p>{project.tagline}</p>{#if project.repository_label}<span>{project.repository_label}</span>{/if}</div>
+            <div><h2>{project.name}</h2>{#if project.tagline}<p>{project.tagline}</p>{/if}{#if project.repository_label}<span>{project.repository_label}</span>{/if}</div>
             <span>{project.commits?.[0]?.count ?? 0} entries</span>
             <time>{formatDate(project.published_at)}</time>
           </a>

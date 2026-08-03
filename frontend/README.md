@@ -34,13 +34,16 @@ pnpm dev
 ```
 
 For the normal local workflow, one command starts Supabase, Mailpit, and
-Aissence's frontend and Rust API, and derives the local URLs and publishable
-key automatically. Export `OPENROUTER_API_KEY` first so the hosted summary
-worker can start:
+Aissence's frontend and Rust API, and derives the local URLs, database URL,
+JWT secret, and publishable key automatically. Configure `OPENROUTER_API_KEY`
+in the repository root `.env` (or export it) so the hosted summary worker can
+start:
 
 ```sh
 pnpm dev:local
 ```
+
+The equivalent repository-root entry point is `scripts/dev.sh`.
 
 Use `pnpm dev:local:open` to also open Aissence and Mailpit in the default
 browser. Press Ctrl-C to stop the Aissence server; Supabase remains available

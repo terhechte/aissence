@@ -9,6 +9,7 @@ pub struct Config {
     pub token_issuer: String,
     pub token_audience: String,
     pub public_url: String,
+    pub site_url: String,
     pub access_token_seconds: i64,
     pub refresh_token_days: i64,
     pub supabase_auth_url: String,
@@ -46,6 +47,9 @@ impl Config {
             token_issuer: value("AISSENCE_TOKEN_ISSUER", "aissence-server"),
             token_audience: value("AISSENCE_TOKEN_AUDIENCE", "aissence-cli"),
             public_url: value("AISSENCE_PUBLIC_URL", "http://127.0.0.1:8787")
+                .trim_end_matches('/')
+                .to_string(),
+            site_url: value("AISSENCE_SITE_URL", "http://127.0.0.1:5173")
                 .trim_end_matches('/')
                 .to_string(),
             access_token_seconds: number("AISSENCE_ACCESS_TOKEN_SECONDS", 900)?,
@@ -101,11 +105,20 @@ impl Config {
         if !local_auth && auth_url.scheme() != "https" {
             return Err("SUPABASE_AUTH_URL must use HTTPS outside localhost".into());
         }
+        let site_url = reqwest::Url::parse(&self.site_url)
+            .map_err(|error| format!("invalid AISSENCE_SITE_URL: {error}"))?;
+        let local_site = matches!(site_url.host_str(), Some("127.0.0.1" | "localhost" | "::1"));
+        if !local_site && site_url.scheme() != "https" {
+            return Err("AISSENCE_SITE_URL must use HTTPS outside localhost".into());
+        }
         if !local
             && (std::env::var("AISSENCE_TOKEN_SECRET").is_err()
-                || std::env::var("SUPABASE_JWT_SECRET").is_err())
+                || std::env::var("SUPABASE_JWT_SECRET").is_err()
+                || std::env::var("AISSENCE_SITE_URL").is_err())
         {
-            return Err("production JWT secrets must be explicitly configured".into());
+            return Err(
+                "production JWT secrets and AISSENCE_SITE_URL must be explicitly configured".into(),
+            );
         }
         Ok(())
     }

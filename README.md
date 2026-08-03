@@ -27,8 +27,9 @@ cargo run -p aissence -- summarize --mode local /path/to/project \
   --base-url http://127.0.0.1:11434/v1 \
   --model qwen2.5-coder:7b
 
-# Browser login, then incremental server summarization.
-cargo run -p aissence -- login
+# Incremental server summarization. The CLI offers browser login automatically
+# when needed. A new folder also asks once for its project name and optional
+# description, creates a private draft, and prints its creator preview URL.
 cargo run -p aissence -- summarize --mode server /path/to/project
 
 # Upload an existing locally summarized file without another model call.
@@ -97,13 +98,31 @@ The server also reads:
 - `OPENROUTER_API_KEY` and optional `OPENROUTER_MODEL` / `OPENROUTER_PROVIDER`.
 - `SUPABASE_JWT_SECRET` for validating browser login approval.
 - `SUPABASE_ANON_KEY` for the browser consent page.
-- `AISSENCE_TOKEN_SECRET`, issuer, audience, public URL, and token lifetimes.
+- `AISSENCE_TOKEN_SECRET`, issuer, audience, public API URL, frontend site URL,
+  and token lifetimes. Set `AISSENCE_SITE_URL` to the frontend origin used for
+  creator preview links.
 - Configurable upload, entry, concurrency, and daily request safety limits.
 
 Run it with:
 
 ```sh
 cargo run -p aissence-server
+```
+
+For the complete local workflow, configure `OPENROUTER_API_KEY` in the root
+`.env` file (or export it) and run this from the repository root:
+
+```sh
+scripts/dev.sh
+```
+
+This starts local Supabase, the Rust API, and the frontend against the same
+Postgres database. Use `scripts/dev.sh --open` to also open the frontend and
+Mailpit. Then exercise project creation and incremental uploads from another
+terminal:
+
+```sh
+cargo run -p aissence -- sync /path/to/project
 ```
 
 The startup migration is idempotent and creates the import queue, usage ledger,

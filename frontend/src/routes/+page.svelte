@@ -85,7 +85,7 @@
           <a href={`/creators/${project.profiles.handle}/${project.slug}`}>
             <div>
               <h2>{project.name}</h2>
-              <p>{project.tagline}</p>
+              {#if project.tagline}<p>{project.tagline}</p>{/if}
               {#if project.repository_label}<span>{project.repository_label}</span>{/if}
             </div>
             <span>{project.profiles.display_name}</span>

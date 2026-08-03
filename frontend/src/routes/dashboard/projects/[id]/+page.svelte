@@ -34,8 +34,8 @@
     <form class="metadata form-grid" method="POST" action="?/updateMetadata" use:enhance>
       <div class="field"><label for="name">Project name</label><input id="name" name="name" value={data.project.name} required /></div>
       <div class="field"><label for="slug">Public slug</label><input id="slug" name="slug" value={data.project.slug} required /></div>
-      <div class="field wide"><label for="tagline">Tagline</label><input id="tagline" name="tagline" value={data.project.tagline} required /></div>
-      <div class="field wide"><label for="description">Description</label><textarea id="description" name="description" required>{data.project.description}</textarea></div>
+      <div class="field wide"><label for="tagline">Tagline (optional)</label><input id="tagline" name="tagline" maxlength="240" value={data.project.tagline} /></div>
+      <div class="field wide"><label for="description">Description (optional)</label><textarea id="description" name="description" maxlength="3000">{data.project.description}</textarea></div>
       <div class="field"><label for="product_url">Product URL <span>(optional)</span></label><input id="product_url" name="product_url" type="url" value={data.project.product_url ?? ''} pattern="https://.*" /></div>
       <div class="field"><label for="repository_label">Repository label <span>(optional)</span></label><input id="repository_label" name="repository_label" value={data.project.repository_label ?? ''} /></div>
       <div class="field wide"><label for="repository_url">Repository URL</label><input id="repository_url" name="repository_url" type="url" value={data.project.repository_url ?? ''} /></div>

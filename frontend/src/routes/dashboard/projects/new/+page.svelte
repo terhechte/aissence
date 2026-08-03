@@ -224,12 +224,12 @@
           <input id="slug" name="slug" required value={slug} oninput={(e) => { slugTouched = true; slug = slugify(e.currentTarget.value); }} />
         </div>
         <div class="field wide">
-          <label for="tagline">Tagline</label>
-          <input id="tagline" name="tagline" required maxlength="240" bind:value={tagline} />
+          <label for="tagline">Tagline <span>(optional)</span></label>
+          <input id="tagline" name="tagline" maxlength="240" bind:value={tagline} />
         </div>
         <div class="field wide">
-          <label for="description">Description</label>
-          <textarea id="description" name="description" required maxlength="3000" bind:value={description}></textarea>
+          <label for="description">Description <span>(optional)</span></label>
+          <textarea id="description" name="description" maxlength="3000" bind:value={description}></textarea>
         </div>
         <div class="field">
           <label for="product_url">Product URL <span>(optional)</span></label>

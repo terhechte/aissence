@@ -39,6 +39,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/auth/logout", routing::post(logout))
         .route("/login/cli", routing::get(cli_login_page))
         .route("/v1/whoami", routing::get(whoami))
+        .route(
+            "/v1/projects/by-source/{source_id}",
+            routing::get(project_by_source),
+        )
         .route("/v1/projects/resolve", routing::put(resolve_project))
         .route(
             "/v1/projects/{project_id}/sync-plan",
@@ -407,6 +411,24 @@ async fn whoami(user: AuthUser) -> Json<WhoAmI> {
     Json(WhoAmI { user_id: user.id })
 }
 
+async fn project_by_source(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(source_id): Path<Uuid>,
+) -> Result<Json<ProjectState>, ApiError> {
+    let client = state.pool.get().await?;
+    let row = client
+        .query_opt(
+            "select p.id, p.sync_revision, p.slug::text, profile.handle::text \
+             from public.projects p join public.profiles profile on profile.id=p.owner_id \
+             where p.owner_id=$1 and p.source_id=$2",
+            &[&user.id, &source_id],
+        )
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    Ok(Json(project_state(&state, &row, false)))
+}
+
 async fn resolve_project(
     State(state): State<AppState>,
     user: AuthUser,
@@ -415,11 +437,16 @@ async fn resolve_project(
     if request.source_id.is_nil() {
         return Err(ApiError::Invalid("source_id cannot be nil".into()));
     }
-    validate_optional_text(request.name.as_deref(), state.config.max_entry_chars)?;
-    validate_optional_text(request.repository.as_deref(), state.config.max_entry_chars)?;
-    for value in [request.name.as_deref(), request.repository.as_deref()]
-        .into_iter()
-        .flatten()
+    validate_optional_text(request.name.as_deref(), 120)?;
+    validate_optional_text(request.description.as_deref(), 3_000)?;
+    validate_optional_text(request.repository.as_deref(), 160)?;
+    for value in [
+        request.name.as_deref(),
+        request.description.as_deref(),
+        request.repository.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
     {
         if aissence::Redactor::global().redact_text(value) != value {
             return Err(ApiError::Invalid(
@@ -428,18 +455,33 @@ async fn resolve_project(
         }
     }
     let mut client = state.pool.get().await?;
+    let profile_handle: String = client
+        .query_opt(
+            "select handle::text from public.profiles where id=$1",
+            &[&user.id],
+        )
+        .await?
+        .map(|row| row.get(0))
+        .ok_or_else(|| {
+            ApiError::Conflict(format!(
+                "create your creator profile first at {}/dashboard",
+                state.config.site_url
+            ))
+        })?;
     if let Some(row) = client
         .query_opt(
-            "select id, sync_revision from public.projects \
+            "select id, sync_revision, slug::text from public.projects \
              where owner_id = $1 and source_id = $2",
             &[&user.id, &request.source_id],
         )
         .await?
     {
-        return Ok(Json(ProjectState {
-            id: row.get(0),
-            sync_revision: row.get(1),
-        }));
+        return Ok(Json(project_state_with_handle(
+            &state,
+            &row,
+            &profile_handle,
+            false,
+        )));
     }
 
     // Attach an old project with the same normalized repository before making
@@ -450,18 +492,21 @@ async fn resolve_project(
                 "update public.projects set source_id = $3, updated_at = now() \
                  where id = (select id from public.projects where owner_id = $1 \
                  and source_id is null and repository_label = $2 limit 1) \
-                 returning id, sync_revision",
+                 returning id, sync_revision, slug::text",
                 &[&user.id, &repository, &request.source_id],
             )
             .await?
     {
-        return Ok(Json(ProjectState {
-            id: row.get(0),
-            sync_revision: row.get(1),
-        }));
+        return Ok(Json(project_state_with_handle(
+            &state,
+            &row,
+            &profile_handle,
+            false,
+        )));
     }
 
     let name = normalized_name(request.name.as_deref());
+    let description = request.description.as_deref().unwrap_or("").trim();
     let slug = unique_slug(&mut client, user.id, &name, request.source_id).await?;
     let repository_url = request
         .repository
@@ -473,24 +518,46 @@ async fn resolve_project(
              (owner_id, source_id, slug, name, tagline, description, repository_label, \
               repository_url, visibility, source_version) \
              values ($1, $2, $3::public.citext, $4, $5, $6, $7, $8, 'draft', $9) \
-             returning id, sync_revision",
+             returning id, sync_revision, slug::text",
             &[
                 &user.id,
                 &request.source_id,
                 &slug,
                 &name,
-                &"AI-assisted project history",
-                &"Conversation and commit history imported by Aissence.",
+                &"",
+                &description,
                 &request.repository,
                 &repository_url,
                 &(DOCUMENT_VERSION as i32),
             ],
         )
         .await?;
-    Ok(Json(ProjectState {
+    Ok(Json(project_state_with_handle(
+        &state,
+        &row,
+        &profile_handle,
+        true,
+    )))
+}
+
+fn project_state(state: &AppState, row: &tokio_postgres::Row, created: bool) -> ProjectState {
+    let handle: String = row.get(3);
+    project_state_with_handle(state, row, &handle, created)
+}
+
+fn project_state_with_handle(
+    state: &AppState,
+    row: &tokio_postgres::Row,
+    handle: &str,
+    created: bool,
+) -> ProjectState {
+    let slug: String = row.get(2);
+    ProjectState {
         id: row.get(0),
         sync_revision: row.get(1),
-    }))
+        preview_url: format!("{}/creators/{handle}/{slug}", state.config.site_url),
+        created,
+    }
 }
 
 async fn unique_slug(
@@ -1446,6 +1513,7 @@ mod tests {
             token_issuer: "test".into(),
             token_audience: "test".into(),
             public_url: "http://127.0.0.1:8787".into(),
+            site_url: "http://127.0.0.1:5173".into(),
             access_token_seconds: 900,
             refresh_token_days: 30,
             supabase_auth_url: "http://127.0.0.1/auth/v1".into(),

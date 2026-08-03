@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -153,6 +154,12 @@ struct StoredTokens {
     expires_at: i64,
 }
 
+struct UploadOutcome {
+    merged: usize,
+    preview_url: String,
+    created: bool,
+}
+
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
@@ -248,11 +255,13 @@ async fn sync_folder(folder: &Path, server: &str) -> Result<(), String> {
     let mut document = store.document().clone();
     let outcome = upload_document(&mut document, server).await;
     write_document(store.path(), &document).map_err(|error| error.to_string())?;
-    let merged = outcome?;
+    let outcome = outcome?;
     println!(
-        "Merged {merged} server summary result(s) into {}.",
+        "Merged {} server summary result(s) into {}.",
+        outcome.merged,
         store.path().display()
     );
+    print_ledger_link(&outcome);
     Ok(())
 }
 
@@ -260,28 +269,52 @@ async fn upload_file(path: &Path, server: &str) -> Result<(), String> {
     let mut document = read_document(path).map_err(|error| error.to_string())?;
     let outcome = upload_document(&mut document, server).await;
     write_document(path, &document).map_err(|error| error.to_string())?;
-    let merged = outcome?;
-    println!("Uploaded {} and merged {merged} result(s).", path.display());
+    let outcome = outcome?;
+    println!(
+        "Uploaded {} and merged {} result(s).",
+        path.display(),
+        outcome.merged
+    );
+    print_ledger_link(&outcome);
     Ok(())
 }
 
-async fn upload_document(document: &mut AissenceDocument, server: &str) -> Result<usize, String> {
+async fn upload_document(
+    document: &mut AissenceDocument,
+    server: &str,
+) -> Result<UploadOutcome, String> {
     validate_server_url(server)?;
     aissence::Redactor::global().redact_document(document);
     let client = reqwest::Client::new();
-    let mut tokens = load_tokens(server)?;
-    refresh_if_needed(&client, server, &mut tokens).await?;
-    let project: ProjectState = send_json(
-        client
-            .put(format!("{server}/v1/projects/resolve"))
-            .bearer_auth(&tokens.access_token),
-        &ResolveProjectRequest {
-            source_id: document.project.source_id,
-            name: document.project.name.clone(),
-            repository: document.project.repository.clone(),
-        },
+    let mut tokens = load_or_login(&client, server).await?;
+    let project: ProjectState = match authenticated_get_optional(
+        &client,
+        &format!(
+            "{server}/v1/projects/by-source/{}",
+            document.project.source_id
+        ),
+        &tokens.access_token,
     )
-    .await?;
+    .await?
+    {
+        Some(project) => project,
+        None => {
+            let (name, description) = prompt_project_metadata(document)?;
+            document.project.name = Some(name.clone());
+            send_json(
+                client
+                    .put(format!("{server}/v1/projects/resolve"))
+                    .bearer_auth(&tokens.access_token),
+                &ResolveProjectRequest {
+                    source_id: document.project.source_id,
+                    name: Some(name),
+                    description: Some(description),
+                    repository: document.project.repository.clone(),
+                },
+            )
+            .await?
+        }
+    };
     let plan: SyncPlanResponse = send_json(
         client
             .post(format!("{server}/v1/projects/{}/sync-plan", project.id))
@@ -309,7 +342,11 @@ async fn upload_document(document: &mut AissenceDocument, server: &str) -> Resul
             "Server already has every commit at revision {}.",
             plan.project_revision
         );
-        return Ok(0);
+        return Ok(UploadOutcome {
+            merged: 0,
+            preview_url: project.preview_url,
+            created: project.created,
+        });
     }
     let delta = document.delta(&requested);
     if delta.commits.len() != requested.len() {
@@ -353,9 +390,136 @@ async fn upload_document(document: &mut AissenceDocument, server: &str) -> Resul
                     .error_detail
                     .unwrap_or_else(|| "remote summarization failed".into()));
             }
-            return Ok(merged);
+            return Ok(UploadOutcome {
+                merged,
+                preview_url: project.preview_url,
+                created: project.created,
+            });
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+fn print_ledger_link(outcome: &UploadOutcome) {
+    let label = if outcome.created {
+        "Created draft ledger"
+    } else {
+        "View your ledger"
+    };
+    println!("{label}: {}", outcome.preview_url);
+}
+
+async fn load_or_login(client: &reqwest::Client, server: &str) -> Result<StoredTokens, String> {
+    let mut tokens = match load_tokens(server) {
+        Ok(tokens) => tokens,
+        Err(_) if io::stdin().is_terminal() => {
+            println!("You are not logged in to {server}.");
+            if !prompt_confirmation("Log in now?", true)? {
+                return Err("login is required to create or sync a ledger".into());
+            }
+            login(server).await?;
+            load_tokens(server)?
+        }
+        Err(error) => return Err(error),
+    };
+    if let Err(error) = validate_login(client, server, &mut tokens).await {
+        if !is_unauthorized_error(&error) || !io::stdin().is_terminal() {
+            return Err(error);
+        }
+        println!("Your saved login is no longer valid for {server}.");
+        if !prompt_confirmation("Log in again?", true)? {
+            return Err("login is required to create or sync a ledger".into());
+        }
+        login(server).await?;
+        tokens = load_tokens(server)?;
+        validate_login(client, server, &mut tokens).await?;
+    }
+    Ok(tokens)
+}
+
+async fn validate_login(
+    client: &reqwest::Client,
+    server: &str,
+    tokens: &mut StoredTokens,
+) -> Result<(), String> {
+    refresh_if_needed(client, server, tokens).await?;
+    let _: WhoAmI =
+        authenticated_get(client, &format!("{server}/v1/whoami"), &tokens.access_token).await?;
+    Ok(())
+}
+
+fn is_unauthorized_error(error: &str) -> bool {
+    error.contains("401 Unauthorized") || error.contains("unauthorized")
+}
+
+fn prompt_project_metadata(document: &AissenceDocument) -> Result<(String, String), String> {
+    let default_name = document
+        .project
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("Aissence project");
+    if !io::stdin().is_terminal() {
+        return Ok((default_name.to_string(), String::new()));
+    }
+
+    println!("This folder does not have a remote ledger yet.");
+    let name = loop {
+        let name = prompt_value("Project name", default_name)?;
+        let name = name.trim();
+        if name.is_empty() {
+            eprintln!("Project name cannot be empty.");
+        } else if name.chars().count() > 120 {
+            eprintln!("Project name must be at most 120 characters.");
+        } else {
+            break name.to_string();
+        }
+    };
+    let description = loop {
+        let description = prompt_value("Description (optional)", "")?;
+        let description = description.trim();
+        if description.chars().count() > 3_000 {
+            eprintln!("Description must be at most 3000 characters.");
+        } else {
+            break description.to_string();
+        }
+    };
+    Ok((name, description))
+}
+
+fn prompt_value(label: &str, default: &str) -> Result<String, String> {
+    if default.is_empty() {
+        print!("{label}: ");
+    } else {
+        print!("{label} [{default}]: ");
+    }
+    io::stdout().flush().map_err(|error| error.to_string())?;
+    let mut value = String::new();
+    io::stdin()
+        .read_line(&mut value)
+        .map_err(|error| error.to_string())?;
+    let value = value.trim_end_matches(['\r', '\n']);
+    Ok(if value.is_empty() {
+        default.to_string()
+    } else {
+        value.to_string()
+    })
+}
+
+fn prompt_confirmation(label: &str, default: bool) -> Result<bool, String> {
+    let hint = if default { "Y/n" } else { "y/N" };
+    print!("{label} [{hint}] ");
+    io::stdout().flush().map_err(|error| error.to_string())?;
+    let mut value = String::new();
+    io::stdin()
+        .read_line(&mut value)
+        .map_err(|error| error.to_string())?;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" => Ok(default),
+        "y" | "yes" => Ok(true),
+        "n" | "no" => Ok(false),
+        _ => Err("please answer yes or no".into()),
     }
 }
 
@@ -536,6 +700,24 @@ async fn authenticated_get<T: DeserializeOwned>(
             .map_err(|error| error.to_string())?,
     )
     .await
+}
+
+async fn authenticated_get_optional<T: DeserializeOwned>(
+    client: &reqwest::Client,
+    url: &str,
+    access_token: &str,
+) -> Result<Option<T>, String> {
+    let response = client
+        .get(url)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        Ok(None)
+    } else {
+        decode_response(response).await.map(Some)
+    }
 }
 
 async fn send_json<T: DeserializeOwned>(
