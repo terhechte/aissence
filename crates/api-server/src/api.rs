@@ -12,7 +12,6 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
-use axum::response::Html;
 use axum::response::IntoResponse;
 use axum::response::Response;
 use axum::{Json, Router, routing};
@@ -37,7 +36,6 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/auth/device/token", routing::post(poll_device_login))
         .route("/v1/auth/refresh", routing::post(refresh_access_token))
         .route("/v1/auth/logout", routing::post(logout))
-        .route("/login/cli", routing::get(cli_login_page))
         .route("/v1/whoami", routing::get(whoami))
         .route(
             "/v1/projects/by-source/{source_id}",
@@ -66,8 +64,7 @@ pub fn router(state: AppState) -> Router {
 }
 
 async fn no_store_auth_responses(request: axum::extract::Request, next: Next) -> Response {
-    let sensitive =
-        request.uri().path().starts_with("/v1/auth/") || request.uri().path() == "/login/cli";
+    let sensitive = request.uri().path().starts_with("/v1/auth/");
     let mut response = next.run(request).await;
     if sensitive {
         response.headers_mut().insert(
@@ -86,66 +83,6 @@ async fn service_configuration(State(state): State<AppState>) -> Json<ServiceCon
     Json(ServiceConfiguration {
         login_start_endpoint: format!("{}/v1/auth/device", state.config.public_url),
     })
-}
-
-#[derive(serde::Deserialize)]
-struct ConsentQuery {
-    request_id: Uuid,
-    browser_code: String,
-}
-
-async fn cli_login_page(
-    State(state): State<AppState>,
-    axum::extract::Query(query): axum::extract::Query<ConsentQuery>,
-) -> Result<impl IntoResponse, ApiError> {
-    let client = state.pool.get().await?;
-    let valid = client
-        .query_opt(
-            "select 1 from public.cli_login_requests where id=$1 and browser_code_hash=$2 \
-             and status='pending' and expires_at>now()",
-            &[&query.request_id, &token_hash(&query.browser_code)],
-        )
-        .await?
-        .is_some();
-    if !valid {
-        return Err(ApiError::NotFound);
-    }
-    let request_id = serde_json::to_string(&query.request_id).unwrap();
-    let browser_code = serde_json::to_string(&query.browser_code).unwrap();
-    let auth_url = serde_json::to_string(&state.config.supabase_auth_url).unwrap();
-    let anon_key = serde_json::to_string(&state.config.supabase_anon_key).unwrap();
-    let server_url = serde_json::to_string(&state.config.public_url).unwrap();
-    let html = Html(format!(
-        r#"<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta name="referrer" content="no-referrer">
-<title>Authorize Aissence CLI</title>
-<style>body{{font:16px system-ui;max-width:32rem;margin:10vh auto;padding:1rem}}label{{display:block;margin:.8rem 0}}input,button{{font:inherit;width:100%;padding:.7rem;box-sizing:border-box}}button{{margin-top:1rem}}#error{{color:#b42318;white-space:pre-wrap}}</style></head>
-<body><h1>Authorize Aissence CLI</h1><p>Sign in to let the CLI upload and summarize projects owned by your account.</p>
-<form id="login"><label>Email<input id="email" type="email" autocomplete="username" required></label>
-<label>Password<input id="password" type="password" autocomplete="current-password" required></label>
-<button>Sign in and authorize</button></form><p id="error"></p>
-<script>
-const requestId={request_id}; const browserCode={browser_code}; const authUrl={auth_url}; const apiKey={anon_key}; const serverUrl={server_url};
-document.getElementById('login').addEventListener('submit', async event => {{
- event.preventDefault(); const error=document.getElementById('error'); error.textContent='';
- try {{
-  const authHeaders={{'Content-Type':'application/json'}}; if(apiKey) authHeaders.apikey=apiKey;
-  const login=await fetch(`${{authUrl}}/token?grant_type=password`,{{method:'POST',headers:authHeaders,body:JSON.stringify({{email:email.value,password:password.value}})}});
-  const session=await login.json(); if(!login.ok) throw new Error(session.msg||session.error_description||'Login failed');
-  const consent=await fetch(`${{serverUrl}}/v1/auth/device/${{encodeURIComponent(requestId)}}/approve`,{{method:'POST',headers:{{'Content-Type':'application/json','Authorization':`Bearer ${{session.access_token}}`}},body:JSON.stringify({{browser_code:browserCode}})}});
-  const result=await consent.json(); if(!consent.ok) throw new Error(result.msg||result.error_description||'Authorization failed');
-  document.body.innerHTML='<h1>Login complete</h1><p>You can close this window and return to Aissence.</p>';
- }} catch(e) {{ error.textContent=e.message; }}
-}});
-</script></body></html>"#
-    ));
-    Ok((
-        [
-            (header::CACHE_CONTROL, "no-store"),
-            (header::REFERRER_POLICY, "no-referrer"),
-        ],
-        html,
-    ))
 }
 
 async fn start_device_login(
@@ -189,7 +126,7 @@ async fn start_device_login(
         )
         .await?
         .get(0);
-    let mut verification = UrlBuilder::new(&format!("{}/login/cli", state.config.public_url));
+    let mut verification = UrlBuilder::new(&format!("{}/cli/authorize", state.config.site_url));
     verification.pair("request_id", &request_id.to_string());
     verification.pair("browser_code", &browser_code);
     Ok(Json(DeviceLoginStart {
@@ -1516,8 +1453,6 @@ mod tests {
             site_url: "http://127.0.0.1:5173".into(),
             access_token_seconds: 900,
             refresh_token_days: 30,
-            supabase_auth_url: "http://127.0.0.1/auth/v1".into(),
-            supabase_anon_key: String::new(),
             max_upload_bytes: 1_000_000,
             max_commits_per_upload: 10,
             max_messages_per_commit: 10,

@@ -12,8 +12,6 @@ pub struct Config {
     pub site_url: String,
     pub access_token_seconds: i64,
     pub refresh_token_days: i64,
-    pub supabase_auth_url: String,
-    pub supabase_anon_key: String,
     pub max_upload_bytes: usize,
     pub max_commits_per_upload: usize,
     pub max_messages_per_commit: usize,
@@ -29,7 +27,6 @@ impl Config {
         let bind = value("AISSENCE_BIND", "127.0.0.1:8787")
             .parse()
             .map_err(|error| format!("invalid AISSENCE_BIND: {error}"))?;
-        let auth_url = value("SUPABASE_AUTH_URL", "http://127.0.0.1:55421/auth/v1");
         let config = Self {
             bind,
             database_url: value(
@@ -54,8 +51,6 @@ impl Config {
                 .to_string(),
             access_token_seconds: number("AISSENCE_ACCESS_TOKEN_SECONDS", 900)?,
             refresh_token_days: number("AISSENCE_REFRESH_TOKEN_DAYS", 30)?,
-            supabase_auth_url: auth_url.trim_end_matches('/').to_string(),
-            supabase_anon_key: value("SUPABASE_ANON_KEY", ""),
             max_upload_bytes: number("AISSENCE_MAX_UPLOAD_BYTES", 32 * 1024 * 1024)?,
             max_commits_per_upload: number("AISSENCE_MAX_COMMITS", 2_000)?,
             max_messages_per_commit: number("AISSENCE_MAX_MESSAGES_PER_COMMIT", 2_000)?,
@@ -98,12 +93,6 @@ impl Config {
         );
         if !local && public_url.scheme() != "https" {
             return Err("AISSENCE_PUBLIC_URL must use HTTPS outside localhost".into());
-        }
-        let auth_url = reqwest::Url::parse(&self.supabase_auth_url)
-            .map_err(|error| format!("invalid SUPABASE_AUTH_URL: {error}"))?;
-        let local_auth = matches!(auth_url.host_str(), Some("127.0.0.1" | "localhost" | "::1"));
-        if !local_auth && auth_url.scheme() != "https" {
-            return Err("SUPABASE_AUTH_URL must use HTTPS outside localhost".into());
         }
         let site_url = reqwest::Url::parse(&self.site_url)
             .map_err(|error| format!("invalid AISSENCE_SITE_URL: {error}"))?;

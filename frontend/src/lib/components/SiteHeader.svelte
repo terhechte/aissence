@@ -1,5 +1,6 @@
 <script lang="ts">
   import ThemeToggle from './ThemeToggle.svelte';
+  import AccountMenu from './AccountMenu.svelte';
 
   let { claims = null } = $props<{ claims?: { sub: string; email?: string } | null }>();
 </script>
@@ -16,9 +17,10 @@
     {#if claims}
       <a href="/dashboard">Dashboard</a>
       <a href="/dashboard/subscriptions">Subscriptions</a>
+      <AccountMenu email={claims.email} />
     {:else}
       <a href="/auth">Sign in</a>
+      <ThemeToggle />
     {/if}
-    <ThemeToggle />
   </nav>
 </header>

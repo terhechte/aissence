@@ -37,11 +37,12 @@ cargo run -p aissence -- upload /path/to/project/.aissence
 ```
 
 Credentials from browser login are stored in the operating system credential
-store. Login uses a one-time device authorization: the browser sends the user's
-password directly to Supabase Auth, then presents the resulting Supabase access
-token to Aissence to approve the CLI. The CLI receives a short-lived Aissence
-access token and a rotating, revocable refresh token; neither the Supabase
-access token nor password is sent to the CLI.
+store. Login uses a one-time device authorization page on the frontend origin,
+so an existing dashboard session can approve the CLI without another sign-in.
+If the session is missing, the normal magic-link flow returns to the approval
+page. The frontend presents its Supabase access token to the API server-side;
+the CLI receives only a short-lived Aissence access token and a rotating,
+revocable refresh token.
 
 Set `AISSENCE_NER_MODEL` to a compatible ONNX NER model. Without it, local and
 server redaction still use `redact-core` pattern detection plus Aissence's
@@ -89,7 +90,6 @@ The development defaults target the local Supabase instance:
 
 ```text
 DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55422/postgres
-SUPABASE_AUTH_URL=http://127.0.0.1:55421/auth/v1
 AISSENCE_BIND=127.0.0.1:8787
 ```
 
@@ -97,10 +97,9 @@ The server also reads:
 
 - `OPENROUTER_API_KEY` and optional `OPENROUTER_MODEL` / `OPENROUTER_PROVIDER`.
 - `SUPABASE_JWT_SECRET` for validating browser login approval.
-- `SUPABASE_ANON_KEY` for the browser consent page.
 - `AISSENCE_TOKEN_SECRET`, issuer, audience, public API URL, frontend site URL,
   and token lifetimes. Set `AISSENCE_SITE_URL` to the frontend origin used for
-  creator preview links.
+  CLI authorization and creator preview links.
 - Configurable upload, entry, concurrency, and daily request safety limits.
 
 Run it with:
