@@ -30,7 +30,6 @@
       <h1>Subscriptions.</h1>
       <p>Every published ledger unlocked by your active creator subscriptions.</p>
     </div>
-    <a class="button secondary" href="/dashboard">Back to dashboard</a>
   </header>
 
   <section class="billing">

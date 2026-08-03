@@ -13,10 +13,6 @@
       <p class="eyebrow">Creator dashboard</p>
       <h1>{data.profile ? `Good to see you, ${data.profile.display_name}.` : 'Choose your creator identity.'}</h1>
     </div>
-    <div class="dashboard-actions">
-      {#if data.profile}<a class="button secondary" href="/dashboard/profile">Edit creator profile</a>{/if}
-      <form method="POST" action="/auth/signout"><button class="theme-toggle">Sign out</button></form>
-    </div>
   </div>
 
   {#if !data.profile}
@@ -91,12 +87,6 @@
     justify-content: space-between;
     align-items: flex-start;
     gap: 30px;
-  }
-  .dashboard-actions {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    flex-wrap: wrap;
   }
   h1 {
     margin: 16px 0 55px;

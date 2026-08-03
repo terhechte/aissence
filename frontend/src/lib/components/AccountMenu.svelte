@@ -46,7 +46,8 @@
   {#if open}
     <div class="account-dropdown" role="menu">
       {#if email}<p class="account-email" title={email}>{email}</p>{/if}
-      <a href="/account" role="menuitem" onclick={() => (open = false)}>Profile</a>
+      <a href="/account" role="menuitem" onclick={() => (open = false)}>Account</a>
+      <a href="/dashboard/profile" role="menuitem" onclick={() => (open = false)}>Creator Profile</a>
       <div role="menuitem"><ThemeToggle menu /></div>
       <form method="POST" action="/auth/signout">
         <button type="submit" role="menuitem">Sign out</button>
@@ -104,8 +105,8 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  a,
-  form button {
+  .account-menu .account-dropdown a,
+  .account-menu .account-dropdown form button {
     width: 100%;
     display: block;
     border: 0;
@@ -114,11 +115,13 @@
     color: var(--body);
     cursor: pointer;
     font: 400 11px/1.2 'JetBrains Mono', monospace;
+    letter-spacing: normal;
     text-align: left;
     text-decoration: none;
+    text-transform: none;
   }
-  a:hover,
-  form button:hover {
+  .account-menu .account-dropdown a:hover,
+  .account-menu .account-dropdown form button:hover {
     background: var(--panel2);
     color: var(--ink);
   }
