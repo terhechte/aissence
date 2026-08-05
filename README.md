@@ -20,6 +20,9 @@ cargo run -p aissence -- analyze /path/to/project
 # Summarize directly with the user's OPENROUTER_API_KEY (the default).
 cargo run -p aissence -- summarize --mode local /path/to/project
 
+# Also summarize every user prompt; uploaded prompt summaries become public.
+cargo run -p aissence -- summarize --mode local --all-prompts /path/to/project
+
 # Or use a local/third-party OpenAI-compatible endpoint. The base URL includes
 # /v1; Aissence appends /chat/completions. --api-key-env is optional.
 cargo run -p aissence -- summarize --mode local /path/to/project \

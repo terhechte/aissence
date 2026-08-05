@@ -9,6 +9,7 @@ use crate::state::AppState;
 pub const HOSTED_REQUEST_RETRIES: usize = 1;
 const HOSTED_CORE_INPUT_CHARS: usize = 8_192;
 const HOSTED_FIXED_INPUT_CHARS_PER_REQUEST: usize = 4_096;
+const HOSTED_PUBLIC_PROMPT_CHARS: usize = 32_000;
 
 struct Job {
     id: Uuid,
@@ -102,7 +103,7 @@ async fn process(state: &AppState, mut job: Job) {
         .map(|chars| chars.count().min(6_000))
         .fold(0usize, usize::saturating_add);
     let (request_ceiling, input_char_ceiling) = if job.kind == "public" {
-        hosted_usage_ceiling(1, source_input_chars.min(6_000))
+        hosted_usage_ceiling(1, HOSTED_PUBLIC_PROMPT_CHARS)
     } else {
         let planned = planned_subscriber_requests(&job.commit);
         hosted_usage_ceiling(planned, source_input_chars)
@@ -442,5 +443,12 @@ mod tests {
         let (requests, chars) = hosted_usage_ceiling(1, 100);
         assert_eq!(requests, 2);
         assert_eq!(chars, (100 + 8_192) * 2 + 2 * 4_096);
+    }
+
+    #[test]
+    fn public_usage_reservation_covers_the_full_prompt_limit() {
+        let (requests, chars) = hosted_usage_ceiling(1, HOSTED_PUBLIC_PROMPT_CHARS);
+        assert_eq!(requests, 2);
+        assert_eq!(chars, (32_000 + 8_192) * 2 + 2 * 4_096);
     }
 }

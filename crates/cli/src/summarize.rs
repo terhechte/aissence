@@ -69,18 +69,17 @@ const RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 /// User prompts at or below this length need no model call — the text itself
 /// is already concise enough for an entitled subscriber view.
 const TRIVIAL_USER_CHARS: usize = 200;
+pub const EMPTY_USER_SUMMARY: &str = "An empty user entry was recorded.";
 /// Maximum user entries combined into one batched summary request.
 const USER_BATCH_SIZE: usize = 8;
 /// Maximum combined source characters in one batched summary request.
 const USER_BATCH_CHARS: usize = 6_000;
-/// Maximum user-request evidence sent to the public-story call.
-const CORE_USER_CHARS: usize = 3_200;
-/// Maximum assistant evidence sent to the public-story call.
-const CORE_ASSISTANT_CHARS: usize = 1_200;
-/// Maximum commit/edit fingerprint sent to the public-story call.
-const CORE_IMPLEMENTATION_CHARS: usize = 1_800;
+/// Output allowance per prompt, including any model-internal reasoning tokens.
+const USER_SUMMARY_OUTPUT_TOKENS: u32 = 4_000;
+/// Maximum complete user entries selected for the public-story call.
+const CORE_USER_CHARS: usize = 32_000;
 /// Hard ceiling for the complete user message of the public-story call.
-const CORE_PROMPT_CHARS: usize = 6_000;
+const CORE_PROMPT_CHARS: usize = 32_000;
 /// Maximum changed paths included in a committed implementation fingerprint.
 const CORE_FILE_LIMIT: usize = 20;
 
@@ -328,15 +327,42 @@ impl Summarizer {
         &self,
         history: &mut CoalescedHistory,
     ) -> (Result<(), Error>, SummarizationCost) {
+        self.summarize_history_options_with_cost(history, false)
+            .await
+    }
+
+    /// Generate public stories and a summary for every user prompt. This is
+    /// used only by the explicit local `--all-prompts` flow.
+    pub async fn summarize_all_prompts_history_with_cost(
+        &self,
+        history: &mut CoalescedHistory,
+    ) -> (Result<(), Error>, SummarizationCost) {
+        self.summarize_history_options_with_cost(history, true)
+            .await
+    }
+
+    async fn summarize_history_options_with_cost(
+        &self,
+        history: &mut CoalescedHistory,
+        all_prompts: bool,
+    ) -> (Result<(), Error>, SummarizationCost) {
         let costs = CostTracker::default();
         let costs_ref = &costs;
         let jobs = history
             .groups
             .iter()
             .enumerate()
-            .filter(|(_, group)| !group.messages.is_empty() && group.summary.is_none())
+            .filter(|(_, group)| {
+                !group.messages.is_empty()
+                    && (group.summary.is_none()
+                        || (all_prompts
+                            && !group
+                                .summary
+                                .as_ref()
+                                .is_some_and(|summary| has_all_prompt_summaries(group, summary))))
+            })
             .map(|(index, group)| async move {
-                self.summarize_group_tracked(group, costs_ref)
+                self.summarize_group_options_tracked(group, all_prompts, costs_ref)
                     .await
                     .map(|summary| (index, summary))
             });
@@ -426,17 +452,48 @@ impl Summarizer {
         group: &CommitGroup,
         costs: &CostTracker,
     ) -> Result<CommitSummary, Error> {
+        self.summarize_group_options_tracked(group, false, costs)
+            .await
+    }
+
+    async fn summarize_group_options_tracked(
+        &self,
+        group: &CommitGroup,
+        all_prompts: bool,
+        costs: &CostTracker,
+    ) -> Result<CommitSummary, Error> {
         // Consecutive messages of the same kind (e.g. several "ai changed" in a
         // row) are merged locally into a single retained entry.
         let items = coalesce_consecutive(raw_items(group));
-        self.summarize_items_tracked(
-            &items,
-            group.commit.as_ref(),
-            crate::model::agents_for(group),
-            group.token_usage(),
-            costs,
-        )
-        .await
+        let mut summary = match &group.summary {
+            Some(summary) => summary.clone(),
+            None => {
+                self.summarize_items_tracked(
+                    &items,
+                    group.commit.as_ref(),
+                    crate::model::agents_for(group),
+                    group.token_usage(),
+                    costs,
+                )
+                .await?
+            }
+        };
+        if all_prompts {
+            for (item, message) in items.iter().zip(&mut summary.messages) {
+                if item.kind == MessageKind::UserWrote && item.text.trim().is_empty() {
+                    message.subscriber_summary = Some(EMPTY_USER_SUMMARY.to_string());
+                }
+            }
+        }
+        if all_prompts && !has_all_prompt_summaries(group, &summary) {
+            let prompt_summaries = self.summarize_user_entries(&items, costs).await?;
+            for (message, prompt_summary) in summary.messages.iter_mut().zip(prompt_summaries) {
+                if prompt_summary.is_some() {
+                    message.subscriber_summary = prompt_summary;
+                }
+            }
+        }
+        Ok(summary)
     }
 
     async fn summarize_items_tracked(
@@ -546,8 +603,8 @@ impl Summarizer {
         costs: &CostTracker,
     ) -> Result<Vec<String>, Error> {
         if batch.len() == 1 {
-            let summary = self
-                .complete(
+            return self
+                .complete_with_parser(
                     "You summarize one complete user prompt from a coding session. \
                      Preserve every important request, constraint, question, correction, \
                      and reported problem. Reply with a concise 2-3 sentence summary and \
@@ -556,12 +613,19 @@ impl Summarizer {
                         "Bounded user prompt evidence:\n\n{}",
                         subscriber_prompt_evidence(&items[batch[0]])
                     ),
-                    300,
+                    USER_SUMMARY_OUTPUT_TOKENS,
                     SummarizationRequestKind::UserBatch { entries: 1 },
                     costs,
+                    |text| {
+                        let summary = text.trim();
+                        if summary.is_empty() {
+                            Err("model returned an empty user summary".to_string())
+                        } else {
+                            Ok(vec![summary.to_string()])
+                        }
+                    },
                 )
-                .await?;
-            return Ok(vec![summary]);
+                .await;
         }
 
         let mut prompt = String::from("Summarize each of these user prompts:\n\n");
@@ -572,7 +636,7 @@ impl Summarizer {
                 subscriber_prompt_evidence(&items[*index])
             ));
         }
-        let max_tokens = (300 * batch.len() as u32).min(2_400);
+        let max_tokens = USER_SUMMARY_OUTPUT_TOKENS.saturating_mul(batch.len() as u32);
         self.complete_with_parser(
             "You summarize several numbered user prompts from a coding session. \
                  For each, preserve every important request, constraint, question, \
@@ -957,39 +1021,14 @@ fn selected_user_evidence(items: &[RawItem]) -> String {
     if users.len() > 1 {
         selected.push(users.len() - 1);
     }
-    let signal_words = [
-        "actually",
-        "instead",
-        "still",
-        "correction",
-        "fix",
-        "issue",
-        "error",
-        "but",
-        "however",
-        "change",
-        "wrong",
-        "doesn't",
-        "does not",
-        "failed",
-        "retry",
-    ];
     let mut intermediate = users
         .iter()
         .enumerate()
         .skip(1)
         .take(users.len().saturating_sub(2))
-        .map(|(position, (_, text))| {
-            let lower = text.to_lowercase();
-            let signals = signal_words
-                .iter()
-                .filter(|word| lower.contains(**word))
-                .count();
-            let length_score = text.chars().count().min(800) / 200;
-            (position, signals * 10 + length_score)
-        })
+        .map(|(position, (_, text))| (position, text.chars().count()))
         .collect::<Vec<_>>();
-    intermediate.sort_by_key(|(position, score)| (std::cmp::Reverse(*score), *position));
+    intermediate.sort_by_key(|(position, chars)| (std::cmp::Reverse(*chars), *position));
     selected.extend(
         intermediate
             .into_iter()
@@ -999,18 +1038,19 @@ fn selected_user_evidence(items: &[RawItem]) -> String {
     selected.sort_unstable();
     selected.dedup();
 
-    let excerpt_budget = (CORE_USER_CHARS / selected.len().max(1)).min(900);
-    selected
-        .into_iter()
-        .map(|position| {
-            let (message_index, text) = users[position];
-            format!(
-                "User message index {message_index}:\n{}",
-                truncate_middle(text, excerpt_budget)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n")
+    let mut evidence = String::new();
+    for position in selected {
+        let (message_index, text) = users[position];
+        let entry = format!("User message index {message_index}:\n{text}");
+        let separator = if evidence.is_empty() { "" } else { "\n\n" };
+        if evidence.chars().count() + separator.chars().count() + entry.chars().count()
+            <= CORE_USER_CHARS
+        {
+            evidence.push_str(separator);
+            evidence.push_str(&entry);
+        }
+    }
+    evidence
 }
 
 /// Partition user entries into summary jobs. Returns the prefilled results —
@@ -1026,9 +1066,14 @@ fn plan_user_entry_jobs(items: &[RawItem]) -> (Vec<Option<String>>, Vec<Vec<usiz
         if item.kind != MessageKind::UserWrote {
             continue;
         }
-        let chars = item.text.chars().count().min(USER_BATCH_CHARS);
+        let trimmed = item.text.trim();
+        let chars = trimmed.chars().count().min(USER_BATCH_CHARS);
         if chars <= TRIVIAL_USER_CHARS {
-            prefilled[index] = Some(item.text.trim().to_string());
+            prefilled[index] = Some(if trimmed.is_empty() {
+                EMPTY_USER_SUMMARY.to_string()
+            } else {
+                trimmed.to_string()
+            });
             continue;
         }
         if !current.is_empty()
@@ -1071,13 +1116,11 @@ fn public_story_input(
 ) -> PublicStoryInput {
     let user = selected_user_evidence(items);
     let assistant = assistant_evidence(items);
-    let has_user_prompt = !user.is_empty();
-    let request = truncate_head(&user, CORE_USER_CHARS);
-    let assistant = truncate_head(&assistant, CORE_ASSISTANT_CHARS);
-    let implementation = truncate_head(
-        &implementation_fingerprint(items, commit),
-        CORE_IMPLEMENTATION_CHARS,
-    );
+    let has_user_prompt = items
+        .iter()
+        .any(|item| item.kind == MessageKind::UserWrote && !item.text.trim().is_empty());
+    let request = user;
+    let implementation = implementation_fingerprint(items, commit);
     let prompt = format!(
         "Selected user evidence (indexes are authoritative):\n{}\n\n\
          Bounded assistant conclusion evidence:\n{}\n\n\
@@ -1095,9 +1138,7 @@ fn public_story_input(
     }
 }
 
-/// Favor the final assistant block, which coding agents normally use to recap
-/// completed work. Add small tails of earlier blocks newest-first only while
-/// the fixed evidence budget has room.
+/// The final assistant block normally contains the completed-work conclusion.
 fn assistant_evidence(items: &[RawItem]) -> String {
     let replies = items
         .iter()
@@ -1105,24 +1146,10 @@ fn assistant_evidence(items: &[RawItem]) -> String {
         .map(|item| item.text.trim())
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>();
-    let Some(final_reply) = replies.last() else {
-        return String::new();
-    };
-
-    let mut out = format!(
-        "Most recent assistant text (tail):\n{}",
-        truncate_tail(final_reply, 900)
-    );
-    for reply in replies.iter().rev().skip(1) {
-        let remaining = CORE_ASSISTANT_CHARS.saturating_sub(out.chars().count());
-        if remaining <= 80 {
-            break;
-        }
-        let excerpt_chars = remaining.saturating_sub(38).min(220);
-        out.push_str("\n\nEarlier conclusion candidate:\n");
-        out.push_str(&truncate_tail(reply, excerpt_chars));
-    }
-    truncate_head(&out, CORE_ASSISTANT_CHARS)
+    replies
+        .last()
+        .map(|reply| format!("Final assistant reply:\n{reply}"))
+        .unwrap_or_default()
 }
 
 /// Build compact implementation evidence without including code or diff
@@ -1145,7 +1172,7 @@ fn implementation_fingerprint(
             .filter(|s| !s.is_empty())
         {
             out.push_str("\nCommit body: ");
-            out.push_str(&truncate_head(body, 500));
+            out.push_str(body);
         }
         out.push_str(&format!(
             "\nStats: {} files changed, +{} lines, -{} lines",
@@ -1170,7 +1197,7 @@ fn implementation_fingerprint(
                 ));
             }
         }
-        return truncate_head(&out, CORE_IMPLEMENTATION_CHARS);
+        return out;
     }
 
     let changes = items
@@ -1196,7 +1223,19 @@ fn implementation_fingerprint(
             break;
         }
     }
-    truncate_head(&out, CORE_IMPLEMENTATION_CHARS)
+    out
+}
+
+/// Whether every retained user prompt has a generated per-prompt summary.
+pub fn has_all_prompt_summaries(group: &CommitGroup, summary: &CommitSummary) -> bool {
+    summary.messages.len() == source_messages(group).len()
+        && summary.messages.iter().all(|message| {
+            message.kind != MessageKind::UserWrote
+                || message
+                    .subscriber_summary
+                    .as_deref()
+                    .is_some_and(|text| !text.trim().is_empty())
+        })
 }
 
 fn fallback_public_story(commit: Option<&crate::model::CommitInfo>) -> PublicStory {
@@ -1333,19 +1372,6 @@ fn truncate_head(text: &str, max_chars: usize) -> String {
     }
     let keep = max_chars.saturating_sub(1);
     format!("{}…", text.chars().take(keep).collect::<String>())
-}
-
-fn truncate_tail(text: &str, max_chars: usize) -> String {
-    let count = text.chars().count();
-    if count <= max_chars {
-        return text.to_string();
-    }
-    let keep = max_chars.saturating_sub(1);
-    let tail = text
-        .chars()
-        .skip(count.saturating_sub(keep))
-        .collect::<String>();
-    format!("…{tail}")
 }
 
 fn truncate_middle(text: &str, max_chars: usize) -> String {
@@ -1959,6 +1985,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn all_prompts_fills_cached_public_summaries_without_regenerating_them() {
+        let summarizer = Summarizer::new("test-key", "test/model").unwrap();
+        let group = CommitGroup {
+            commit: None,
+            messages: vec![timed(ncs::Role::User, "short complete prompt", None)],
+            summary: Some(CommitSummary {
+                public: PublicStory {
+                    summary: "Existing public story.".into(),
+                    beats: Vec::new(),
+                },
+                messages: vec![MessageSummary {
+                    kind: MessageKind::UserWrote,
+                    subscriber_summary: None,
+                    content: Some("short complete prompt".into()),
+                    changes: Vec::new(),
+                    timestamp: None,
+                    tokens: None,
+                }],
+                agents: Vec::new(),
+                tokens: None,
+            }),
+        };
+        let mut history = CoalescedHistory {
+            folder: std::path::PathBuf::from("/test/project"),
+            groups: vec![group],
+            undated: vec![],
+            warnings: vec![],
+        };
+
+        let (outcome, cost) = summarizer
+            .summarize_all_prompts_history_with_cost(&mut history)
+            .await;
+
+        assert!(outcome.is_ok());
+        assert_eq!(cost, SummarizationCost::default());
+        let summary = history.groups[0].summary.as_ref().unwrap();
+        assert_eq!(summary.public.summary, "Existing public story.");
+        assert_eq!(
+            summary.messages[0].subscriber_summary.as_deref(),
+            Some("short complete prompt")
+        );
+        assert!(has_all_prompt_summaries(&history.groups[0], summary));
+    }
+
+    #[tokio::test]
     async fn openai_compatible_endpoint_supports_requests_without_authentication() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -2114,6 +2185,61 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn empty_single_user_summary_is_retried() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for content in ["   ", "A useful summary."] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let _request = read_http_request(&mut socket).await;
+                let body = serde_json::json!({
+                    "id": "test-completion",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "local-model",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": content},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {
+                        "prompt_tokens": 4,
+                        "completion_tokens": 2,
+                        "total_tokens": 6
+                    }
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let summarizer = Summarizer::from_config(LlmConfig {
+            api: LlmApi::OpenaiCompatible,
+            base_url: format!("http://{address}/v1"),
+            api_key: None,
+            model: "local-model".to_string(),
+            provider: None,
+        })
+        .unwrap()
+        .with_max_request_retries(1);
+        let costs = CostTracker::default();
+        let items = vec![item(MessageKind::UserWrote, &"a".repeat(300))];
+
+        let summaries = summarizer
+            .summarize_user_batch(&items, &[0], &costs)
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(summaries, ["A useful summary."]);
+        assert_eq!(costs.total().request_count, 2);
+    }
+
     async fn read_http_request(socket: &mut tokio::net::TcpStream) -> String {
         let mut bytes = Vec::new();
         let mut chunk = [0_u8; 4096];
@@ -2237,7 +2363,10 @@ mod tests {
             id: "abc".into(),
             short_id: "abc".into(),
             summary: "Fix compact summaries".into(),
-            body: Some("Use bounded evidence.".into()),
+            body: Some(format!(
+                "Use bounded evidence. {} BODY_END",
+                "b".repeat(2_000)
+            )),
             message: "Fix compact summaries\n\nUse bounded evidence.".into(),
             author_name: "tester".into(),
             author_email: "t@example.com".into(),
@@ -2258,10 +2387,33 @@ mod tests {
         assert!(input.prompt.chars().count() <= CORE_PROMPT_CHARS);
         assert!(input.prompt.contains("fix it"));
         assert!(input.prompt.contains("Final result: tests pass."));
+        assert!(input.prompt.contains("SECRET_MIDDLE"));
+        assert!(input.prompt.contains("BODY_END"));
         assert!(input.prompt.contains("M src/lib.rs"));
         assert!(!input.prompt.contains("DO_NOT_SEND_DIFF_BODY"));
-        assert!(!input.prompt.contains("SECRET_MIDDLE"));
         assert!(input.has_user_prompt);
+    }
+
+    #[test]
+    fn selected_user_evidence_keeps_whole_entries_and_favors_long_intermediates() {
+        let long = format!("long entry {} LONG_END", "l".repeat(2_000));
+        let longer = format!("longer entry {} LONGER_END", "m".repeat(3_000));
+        let items = vec![
+            item(MessageKind::UserWrote, "first request"),
+            item(MessageKind::UserWrote, "short intermediate"),
+            item(MessageKind::UserWrote, &long),
+            item(MessageKind::UserWrote, &longer),
+            item(MessageKind::UserWrote, "final request"),
+        ];
+
+        let evidence = selected_user_evidence(&items);
+        assert!(evidence.chars().count() <= CORE_USER_CHARS);
+        assert!(evidence.contains("first request"));
+        assert!(evidence.contains("LONG_END"));
+        assert!(evidence.contains("LONGER_END"));
+        assert!(evidence.contains("final request"));
+        assert!(!evidence.contains("short intermediate"));
+        assert!(!evidence.contains('…'));
     }
 
     #[test]
@@ -2370,6 +2522,16 @@ mod tests {
         assert_eq!(prefilled[0].as_deref(), Some("ok"));
         assert_eq!(prefilled[1], None);
         assert_eq!(batches, vec![vec![2, 3], vec![4]]);
+    }
+
+    #[test]
+    fn user_entry_jobs_give_empty_prompts_a_nonempty_summary() {
+        let items = vec![item(MessageKind::UserWrote, "  \n  ")];
+
+        let (prefilled, batches) = plan_user_entry_jobs(&items);
+
+        assert_eq!(prefilled[0].as_deref(), Some(EMPTY_USER_SUMMARY));
+        assert!(batches.is_empty());
     }
 
     #[test]

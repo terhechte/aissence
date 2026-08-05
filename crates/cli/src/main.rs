@@ -67,6 +67,9 @@ enum Command {
         mode: Mode,
         #[arg(long, default_value = DEFAULT_SERVER)]
         server: String,
+        /// Locally generate a summary for every user prompt as well.
+        #[arg(long)]
+        all_prompts: bool,
         #[command(flatten)]
         llm: LlmOptions,
     },
@@ -185,16 +188,21 @@ async fn run() -> Result<(), String> {
         Command::Summarize {
             folder,
             mode: Mode::Local,
+            all_prompts,
             llm,
             ..
-        } => summarize_local(&folder, llm).await,
+        } => summarize_local(&folder, llm, all_prompts).await,
         Command::Summarize {
             folder,
             mode: Mode::Server,
             server,
+            all_prompts,
             llm,
             ..
         } => {
+            if all_prompts {
+                return Err("--all-prompts can only be used with --mode local".to_string());
+            }
             if !llm.is_empty() {
                 return Err("local LLM options cannot be used with --mode server".to_string());
             }
@@ -219,7 +227,7 @@ fn analyze_to_file(folder: &Path) -> Result<(), String> {
     Ok(())
 }
 
-async fn summarize_local(folder: &Path, llm: LlmOptions) -> Result<(), String> {
+async fn summarize_local(folder: &Path, llm: LlmOptions, all_prompts: bool) -> Result<(), String> {
     let mut history = analyze(folder).map_err(|error| error.to_string())?;
     let mut store = SummaryStore::load(folder);
     for group in &mut history.groups {
@@ -240,7 +248,15 @@ async fn summarize_local(folder: &Path, llm: LlmOptions) -> Result<(), String> {
     let mut live_progress = LiveProgress::new("Aissence", summarizer.model());
     let mut tick = tokio::time::interval(Duration::from_millis(80));
     let (outcome, cost) = {
-        let summarize = summarizer.summarize_history_with_cost(&mut history);
+        let summarize = async {
+            if all_prompts {
+                summarizer
+                    .summarize_all_prompts_history_with_cost(&mut history)
+                    .await
+            } else {
+                summarizer.summarize_history_with_cost(&mut history).await
+            }
+        };
         tokio::pin!(summarize);
         loop {
             tokio::select! {
@@ -361,6 +377,16 @@ async fn upload_document(
                 .map(|commit| ManifestCommit {
                     commit_hash: commit.commit_hash.clone(),
                     source_digest: commit.source_digest.clone(),
+                    all_prompts: commit.summary.as_ref().is_some_and(|summary| {
+                        summary
+                            .messages
+                            .iter()
+                            .any(|message| message.kind == aissence::MessageKind::UserWrote)
+                            && summary.messages.iter().all(|message| {
+                                message.kind != aissence::MessageKind::UserWrote
+                                    || message.subscriber_summary.is_some()
+                            })
+                    }),
                 })
                 .collect(),
         },

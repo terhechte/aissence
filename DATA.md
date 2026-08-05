@@ -75,17 +75,24 @@ redaction upgrades explicit synchronization changes.
 
 The summary message list must have the same length and kinds as `source.messages`.
 Normal public generation makes exactly one model request per commit and leaves
-every `subscriber_summary` absent. The subscriber summaries are a separate
-on-demand tier and are never needed to publish the free ledger.
+every `subscriber_summary` absent. Subscriber summaries are normally a separate
+on-demand tier; `--all-prompts` is the explicit exception that publishes a
+complete locally generated set.
 
 ## Hosted generation lifecycle
 
 Uploading stores sanitized source and completes the import immediately. Draft
 projects do not create public summary jobs. Publishing queues one public-story
 job for each unsummarized commit. The public job receives bounded evidence: the
-first and final user prompts, at most two high-signal corrections, a bounded
-tail of assistant conclusions, and a metadata-only git fingerprint. Diff bodies
-are not sent for public summarization.
+first and final user prompts, at most two longer intermediate prompts, the full
+final assistant reply, and a metadata-only git fingerprint. Complete selected
+entries are assembled without per-entry truncation and the final prompt is
+bounded to 32,000 characters. Diff bodies are not sent for public summarization.
+
+Local generation with `--all-prompts` additionally fills every user message's
+`subscriber_summary`. When a complete set is uploaded, those summaries are
+marked public and rendered for public visitors; raw prompt sources remain
+restricted. Hosted subscriber summaries do not receive this public marker.
 
 The first active or trialing subscriber for a creator queues subscriber jobs for
 the creator's published commits. Those jobs summarize every user prompt in

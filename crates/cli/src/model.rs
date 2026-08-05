@@ -318,9 +318,9 @@ pub struct CodeChange {
 #[serde(deny_unknown_fields)]
 pub struct MessageSummary {
     pub kind: MessageKind,
-    /// Subscriber-only summary for [`MessageKind::UserWrote`]. Public ledger
-    /// payloads never expose this field. It remains absent until a creator has
-    /// an active subscriber (or explicitly requests a local paid-view build).
+    /// Summary for [`MessageKind::UserWrote`]. Hosted generation keeps it
+    /// subscriber-only; a file generated with `--all-prompts` publishes a
+    /// complete locally supplied set when uploaded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscriber_summary: Option<String>,
     /// Complete source text for user and assistant-text entries, regardless of

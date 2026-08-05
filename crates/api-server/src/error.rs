@@ -50,7 +50,7 @@ impl IntoResponse for ApiError {
             Self::Conflict(detail) => (StatusCode::CONFLICT, "conflict", Some(detail)),
             Self::Limit(detail) => (StatusCode::TOO_MANY_REQUESTS, "limit_reached", Some(detail)),
             error @ (Self::Database(_) | Self::Pool(_) | Self::Internal(_)) => {
-                tracing::error!(error = %error, "request failed");
+                tracing::error!(error = ?error, "request failed");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal_error", None)
             }
         };

@@ -78,6 +78,8 @@ pub struct ProjectState {
 pub struct ManifestCommit {
     pub commit_hash: String,
     pub source_digest: String,
+    #[serde(default)]
+    pub all_prompts: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

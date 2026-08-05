@@ -168,6 +168,13 @@
     return Array.isArray(commit.public_beats) ? commit.public_beats : [];
   }
 
+  function publicPromptSummaries(commit: any) {
+    if (!commit.public_prompt_summaries) return [];
+    return (commit.messages ?? []).filter(
+      (message: any) => message.kind === 'UserWrote' && message.subscriber_summary
+    );
+  }
+
   function formatUsd(value: number | string | null | undefined) {
     if (value === null || value === undefined || !Number.isFinite(Number(value))) return 'Unavailable';
     const amount = Number(value);
@@ -322,7 +329,15 @@
 
                 {#if !isEntitled}
                   <div class="public-story">
-                    {#if publicBeats(commit).length}
+                    {#if publicPromptSummaries(commit).length}
+                      <h4>Every prompt, summarized</h4>
+                      {#each publicPromptSummaries(commit) as message, index}
+                        <div class="public-beat">
+                          <span>Prompt {index + 1}</span>
+                          <PromptMarkdown content={message.subscriber_summary} />
+                        </div>
+                      {/each}
+                    {:else if publicBeats(commit).length}
                       <h4>Representative prompt moments</h4>
                       {#each publicBeats(commit) as beat}
                         <div class="public-beat">
@@ -332,10 +347,12 @@
                       {/each}
                     {/if}
                     <p class="public-activity">{promptCount(commit)} user {promptCount(commit) === 1 ? 'prompt' : 'prompts'}, {Number(commit.reply_count ?? 0)} agent replies, and {Number(commit.change_message_count ?? 0)} recorded change steps.</p>
-                    <div class="locked">
-                      <span>Every prompt summary and full prompt is reserved for subscribers</span>
-                      <a href={`/creators/${profile.handle}/subscribe`}>Unlock the full ledger →</a>
-                    </div>
+                    {#if !publicPromptSummaries(commit).length}
+                      <div class="locked">
+                        <span>Every prompt summary and full prompt is reserved for subscribers</span>
+                        <a href={`/creators/${profile.handle}/subscribe`}>Unlock the full ledger →</a>
+                      </div>
+                    {/if}
                   </div>
                 {:else if commit.messages.length}
                   <div class="transcript">

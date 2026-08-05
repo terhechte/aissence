@@ -568,14 +568,14 @@ async fn sync_plan(
     let revision = project_revision(&client, user.id, project_id).await?;
     let rows = client
         .query(
-            "select commit_hash, source_digest, summary_status::text \
+            "select commit_hash, source_digest, summary_status::text, public_prompt_summaries \
              from public.commits where project_id = $1",
             &[&project_id],
         )
         .await?;
-    let remote: HashMap<String, (Option<String>, Option<String>)> = rows
+    let remote: HashMap<String, (Option<String>, Option<String>, bool)> = rows
         .into_iter()
-        .map(|row| (row.get(0), (row.get(1), row.get(2))))
+        .map(|row| (row.get(0), (row.get(1), row.get(2), row.get(3))))
         .collect();
     let mut seen = HashSet::new();
     let mut upload = Vec::new();
@@ -593,7 +593,10 @@ async fn sync_plan(
                 commit_hash: commit.commit_hash.clone(),
                 reason: UploadReason::Missing,
             }),
-            Some((digest, _status)) if digest.as_deref() == Some(commit.source_digest.as_str()) => {
+            Some((digest, _status, public_prompts))
+                if digest.as_deref() == Some(commit.source_digest.as_str())
+                    && (!commit.all_prompts || *public_prompts) =>
+            {
                 unchanged_count += 1;
             }
             Some(_) => upload.push(RequestedCommit {
@@ -682,8 +685,9 @@ async fn create_import_for_user(
 fn parse_upload(config: &crate::config::Config, body: &[u8]) -> Result<AissenceDocument, ApiError> {
     let value: serde_json::Value =
         serde_json::from_slice(body).map_err(|error| ApiError::Malformed(error.to_string()))?;
-    let document: AissenceDocument =
+    let mut document: AissenceDocument =
         serde_json::from_value(value).map_err(|error| ApiError::Invalid(error.to_string()))?;
+    normalize_legacy_empty_prompt_summaries(&mut document);
     validate_document(config, &document)?;
     // Client-provided digests are verified before any database write.
     for commit in &document.commits {
@@ -701,6 +705,33 @@ fn parse_upload(config: &crate::config::Config, body: &[u8]) -> Result<AissenceD
     }
 
     Ok(document)
+}
+
+/// Older `--all-prompts` builds could copy a whitespace-only retained prompt
+/// into an empty summary. Repair only that exact shape; an empty summary for a
+/// non-empty prompt remains invalid.
+fn normalize_legacy_empty_prompt_summaries(document: &mut AissenceDocument) {
+    for commit in &mut document.commits {
+        let Some(summary) = &mut commit.summary else {
+            continue;
+        };
+        for (source, generated) in commit.source.messages.iter().zip(&mut summary.messages) {
+            if source.kind == MessageKind::UserWrote
+                && source
+                    .content
+                    .as_deref()
+                    .is_none_or(|content| content.trim().is_empty())
+                && generated.kind == MessageKind::UserWrote
+                && generated
+                    .subscriber_summary
+                    .as_deref()
+                    .is_some_and(|text| text.trim().is_empty())
+            {
+                generated.subscriber_summary =
+                    Some(aissence::summarize::EMPTY_USER_SUMMARY.to_string());
+            }
+        }
+    }
 }
 
 fn validate_document(
@@ -834,6 +865,16 @@ fn validate_summary(commit: &AissenceCommit, max_entry_chars: usize) -> Result<(
     validate_token_count(summary.tokens)?;
     for message in &summary.messages {
         validate_optional_text(message.subscriber_summary.as_deref(), max_entry_chars)?;
+        if message
+            .subscriber_summary
+            .as_deref()
+            .is_some_and(|text| text.trim().is_empty())
+        {
+            return Err(ApiError::Invalid(format!(
+                "local summary contains an empty prompt summary for {}",
+                commit.commit_hash
+            )));
+        }
         validate_token_count(message.tokens)?;
         let correct_shape = match message.kind {
             MessageKind::UserWrote => true,
@@ -1015,18 +1056,29 @@ async fn ingest_document(
             .await?
             .get(0);
     for (sort_order, commit) in document.commits.iter_mut().enumerate() {
+        let incoming_all_prompts = commit.summary.as_ref().is_some_and(|summary| {
+            summary
+                .messages
+                .iter()
+                .any(|message| message.kind == MessageKind::UserWrote)
+                && summary.messages.iter().all(|message| {
+                    message.kind != MessageKind::UserWrote || message.subscriber_summary.is_some()
+                })
+        });
         let existing = transaction
             .query_opt(
                 "select c.id, c.source_digest, c.summary_status::text, \
                  exists(select 1 from public.summary_jobs sj where sj.commit_id=c.id \
-                        and sj.status in ('queued','processing')) \
+                        and sj.status in ('queued','processing')), \
+                 c.public_prompt_summaries \
                  from public.commits c \
                  where project_id = $1 and commit_hash = $2",
                 &[&project_id, &commit.commit_hash],
             )
             .await?;
         if existing.as_ref().is_some_and(|row| {
-            row.get::<_, Option<String>>(1).as_deref() != Some(commit.source_digest.as_str())
+            (row.get::<_, Option<String>>(1).as_deref() != Some(commit.source_digest.as_str())
+                || incoming_all_prompts)
                 && row.get::<_, bool>(3)
         }) {
             return Err(ApiError::Conflict(format!(
@@ -1036,6 +1088,7 @@ async fn ingest_document(
         }
         let unchanged = existing.as_ref().is_some_and(|row| {
             row.get::<_, Option<String>>(1).as_deref() == Some(commit.source_digest.as_str())
+                && (!incoming_all_prompts || row.get::<_, bool>(4))
         });
         if unchanged {
             let commit_id: Uuid = existing.expect("checked existing").get(0);
@@ -1075,6 +1128,19 @@ async fn ingest_document(
             .iter()
             .filter(|message| message.kind == MessageKind::AiChanged)
             .count();
+        let summarized_prompts = summary
+            .map(|summary| {
+                summary
+                    .messages
+                    .iter()
+                    .filter(|message| {
+                        message.kind == MessageKind::UserWrote
+                            && message.subscriber_summary.is_some()
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        let public_prompt_summaries = prompt_count > 0 && summarized_prompts == prompt_count;
         let status = if summary.is_some() {
             "succeeded"
         } else if is_published && prompt_count > 0 {
@@ -1089,12 +1155,12 @@ async fn ingest_document(
                   lines_deleted, public_story, public_beats, token_input, token_output, \
                   token_cache_read, token_cache_create, sort_order, source_digest, \
                   sanitizer_version, summarizer_version, summary_status, summarized_at, summary_error, \
-                  prompt_count,reply_count,change_message_count) \
+                  prompt_count,reply_count,change_message_count,public_prompt_summaries) \
                  values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::bigint,$11::bigint, \
                          $12::bigint,$13::bigint,$14,$15,$16,$17, \
                          $18::text::public.summary_job_status, \
                          case when $18::text = 'succeeded' then now() end, null, \
-                         $19,$20,$21) \
+                         $19,$20,$21,$22) \
                  on conflict (project_id, commit_hash) do update set \
                   title=excluded.title, committed_at=excluded.committed_at, files_changed=excluded.files_changed, \
                   lines_added=excluded.lines_added, lines_deleted=excluded.lines_deleted, \
@@ -1105,7 +1171,8 @@ async fn ingest_document(
                   summarizer_version=excluded.summarizer_version, summary_status=excluded.summary_status, \
                   summarized_at=excluded.summarized_at, summary_error=null, \
                   prompt_count=excluded.prompt_count,reply_count=excluded.reply_count, \
-                  change_message_count=excluded.change_message_count \
+                  change_message_count=excluded.change_message_count, \
+                  public_prompt_summaries=excluded.public_prompt_summaries \
                  returning id",
                 &[
                     &project_id,
@@ -1133,6 +1200,7 @@ async fn ingest_document(
                     &(prompt_count as i32),
                     &(reply_count as i32),
                     &(change_message_count as i32),
+                    &public_prompt_summaries,
                 ],
             )
             .await?
@@ -1176,18 +1244,6 @@ async fn ingest_document(
                 .await?;
             queued += 1;
         }
-        let summarized_prompts = summary
-            .map(|summary| {
-                summary
-                    .messages
-                    .iter()
-                    .filter(|message| {
-                        message.kind == MessageKind::UserWrote
-                            && message.subscriber_summary.is_some()
-                    })
-                    .count()
-            })
-            .unwrap_or(0);
         if has_subscriber && prompt_count > summarized_prompts {
             transaction
                 .execute(
@@ -1549,6 +1605,65 @@ mod tests {
             parse_upload(&test_config(), &body),
             Err(ApiError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn upload_parser_rejects_empty_prompt_summaries_before_database_work() {
+        let mut document = sample_document();
+        document.commits[0].summary = Some(aissence::CommitSummary {
+            public: aissence::PublicStory {
+                summary: "The documentation was updated.".into(),
+                beats: Vec::new(),
+            },
+            messages: vec![aissence::MessageSummary {
+                kind: MessageKind::UserWrote,
+                subscriber_summary: Some(" \n ".into()),
+                content: Some("Please update the documentation.".into()),
+                changes: Vec::new(),
+                timestamp: None,
+                tokens: None,
+            }],
+            agents: Vec::new(),
+            tokens: None,
+        });
+        let body = serde_json::to_vec(&document).unwrap();
+
+        assert!(matches!(
+            parse_upload(&test_config(), &body),
+            Err(ApiError::Invalid(detail)) if detail.contains("empty prompt summary")
+        ));
+    }
+
+    #[test]
+    fn upload_parser_repairs_legacy_empty_summaries_for_empty_prompts() {
+        let mut document = sample_document();
+        document.commits[0].source.messages[0].content = Some(" \n ".into());
+        document.commits[0].source_digest = document.commits[0].calculate_source_digest();
+        document.commits[0].summary = Some(aissence::CommitSummary {
+            public: aissence::PublicStory {
+                summary: "An empty request entry was recorded.".into(),
+                beats: Vec::new(),
+            },
+            messages: vec![aissence::MessageSummary {
+                kind: MessageKind::UserWrote,
+                subscriber_summary: Some(String::new()),
+                content: Some(" \n ".into()),
+                changes: Vec::new(),
+                timestamp: None,
+                tokens: None,
+            }],
+            agents: Vec::new(),
+            tokens: None,
+        });
+        let body = serde_json::to_vec(&document).unwrap();
+
+        let parsed = parse_upload(&test_config(), &body).unwrap();
+        assert_eq!(
+            parsed.commits[0].summary.as_ref().unwrap().messages[0]
+                .subscriber_summary
+                .as_deref(),
+            Some(aissence::summarize::EMPTY_USER_SUMMARY)
+        );
     }
 
     #[tokio::test]
