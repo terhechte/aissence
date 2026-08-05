@@ -9,7 +9,7 @@ use aissence::remote::{
     SyncPlanResponse, UploadReason, WhoAmI,
 };
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::IntoResponse;
@@ -25,6 +25,7 @@ use crate::error::ApiError;
 use crate::state::AppState;
 
 pub fn router(state: AppState) -> Router {
+    let max_upload_bytes = state.config.max_upload_bytes;
     Router::new()
         .route("/health", routing::get(health))
         .route("/v1/config", routing::get(service_configuration))
@@ -48,11 +49,11 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/v1/projects/{project_id}/imports",
-            routing::post(create_import),
+            routing::post(create_import).layer(upload_body_limit(max_upload_bytes)),
         )
         .route(
             "/v1/projects/{project_id}/browser-imports",
-            routing::post(create_browser_import),
+            routing::post(create_browser_import).layer(upload_body_limit(max_upload_bytes)),
         )
         .route("/v1/imports/{import_id}", routing::get(import_status))
         .route(
@@ -61,6 +62,10 @@ pub fn router(state: AppState) -> Router {
         )
         .layer(axum::middleware::from_fn(no_store_auth_responses))
         .with_state(state)
+}
+
+fn upload_body_limit(max_upload_bytes: usize) -> DefaultBodyLimit {
+    DefaultBodyLimit::max(max_upload_bytes)
 }
 
 async fn no_store_auth_responses(request: axum::extract::Request, next: Next) -> Response {
@@ -1085,8 +1090,10 @@ async fn ingest_document(
                   token_cache_read, token_cache_create, sort_order, source_digest, \
                   sanitizer_version, summarizer_version, summary_status, summarized_at, summary_error, \
                   prompt_count,reply_count,change_message_count) \
-                 values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17, \
-                         $18::public.summary_job_status, case when $18 = 'succeeded' then now() end, null, \
+                 values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::bigint,$11::bigint, \
+                         $12::bigint,$13::bigint,$14,$15,$16,$17, \
+                         $18::text::public.summary_job_status, \
+                         case when $18::text = 'succeeded' then now() end, null, \
                          $19,$20,$21) \
                  on conflict (project_id, commit_hash) do update set \
                   title=excluded.title, committed_at=excluded.committed_at, files_changed=excluded.files_changed, \
@@ -1202,7 +1209,7 @@ async fn ingest_document(
     };
     transaction
         .execute(
-            "update public.imports set status=$2::public.import_status, skipped_commit_count=$3, \
+            "update public.imports set status=$2::text::public.import_status, skipped_commit_count=$3, \
              summarized_commit_count=$4, completed_at=now() \
              where id=$1",
             &[
@@ -1271,7 +1278,8 @@ async fn insert_source_rows(
                 "insert into public.messages \
                  (commit_id,kind,occurred_at,token_input,token_output,token_cache_read, \
                   token_cache_create,sort_order,changed_file_count) \
-                 values ($1,$2::public.message_kind,$3,$4,$5,$6,$7,$8,$9) returning id",
+                 values ($1,$2::text::public.message_kind,$3,$4::bigint,$5::bigint, \
+                         $6::bigint,$7::bigint,$8,$9) returning id",
                 &[
                     &commit_id,
                     &kind,
@@ -1440,6 +1448,9 @@ async fn project_revision(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
 
     fn test_config() -> crate::config::Config {
         crate::config::Config {
@@ -1538,5 +1549,35 @@ mod tests {
             parse_upload(&test_config(), &body),
             Err(ApiError::Invalid(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn upload_limit_replaces_axums_two_megabyte_default() {
+        const CONFIGURED_LIMIT: usize = 3 * 1024 * 1024;
+        const ABOVE_AXUM_DEFAULT: usize = 2 * 1024 * 1024 + 1;
+        let app = Router::new()
+            .route("/", routing::post(|_body: Bytes| async {}))
+            .layer(upload_body_limit(CONFIGURED_LIMIT));
+
+        let accepted = app
+            .clone()
+            .oneshot(
+                Request::post("/")
+                    .body(Body::from(vec![0; ABOVE_AXUM_DEFAULT]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+
+        let rejected = app
+            .oneshot(
+                Request::post("/")
+                    .body(Body::from(vec![0; CONFIGURED_LIMIT + 1]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

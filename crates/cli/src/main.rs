@@ -15,9 +15,16 @@ use aissence::{
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
+use tokio::sync::mpsc;
+
+#[path = "progress.rs"]
+mod progress;
+
+use progress::LiveProgress;
 
 const DEFAULT_SERVER: &str = "http://127.0.0.1:8787";
 const KEYRING_SERVICE: &str = "aissence";
+const NOT_LOGGED_IN_ERROR: &str = "not logged in; run `aissence login` first";
 
 #[derive(Parser)]
 #[command(
@@ -226,7 +233,34 @@ async fn summarize_local(folder: &Path, llm: LlmOptions) -> Result<(), String> {
     let config = LlmConfig::load(folder, config_path.as_deref(), llm.overrides())
         .map_err(|error| error.to_string())?;
     let summarizer = Summarizer::from_config(config).map_err(|error| error.to_string())?;
-    let (outcome, cost) = summarizer.summarize_history_with_cost(&mut history).await;
+    let (progress_sender, mut progress_receiver) = mpsc::unbounded_channel();
+    let summarizer = summarizer.with_progress(move |event| {
+        let _ = progress_sender.send(event);
+    });
+    let mut live_progress = LiveProgress::new("Aissence", summarizer.model());
+    let mut tick = tokio::time::interval(Duration::from_millis(80));
+    let (outcome, cost) = {
+        let summarize = summarizer.summarize_history_with_cost(&mut history);
+        tokio::pin!(summarize);
+        loop {
+            tokio::select! {
+                result = &mut summarize => {
+                    while let Ok(event) = progress_receiver.try_recv() {
+                        live_progress.handle(event);
+                    }
+                    live_progress.render();
+                    break result;
+                }
+                event = progress_receiver.recv() => {
+                    if let Some(event) = event {
+                        live_progress.handle(event);
+                    }
+                }
+                _ = tick.tick() => live_progress.render(),
+            }
+        }
+    };
+    live_progress.finish(outcome.is_ok());
     outcome.map_err(|error| error.to_string())?;
     store
         .replace_from_groups(&history.groups)
@@ -412,7 +446,7 @@ fn print_ledger_link(outcome: &UploadOutcome) {
 async fn load_or_login(client: &reqwest::Client, server: &str) -> Result<StoredTokens, String> {
     let mut tokens = match load_tokens(server) {
         Ok(tokens) => tokens,
-        Err(_) if io::stdin().is_terminal() => {
+        Err(error) if error == NOT_LOGGED_IN_ERROR && io::stdin().is_terminal() => {
             println!("You are not logged in to {server}.");
             if !prompt_confirmation("Log in now?", true)? {
                 return Err("login is required to create or sync a ledger".into());
@@ -574,6 +608,13 @@ async fn login(server: &str) -> Result<(), String> {
             + response.expires_in.ok_or("login response omitted expiry")?,
     };
     save_tokens(server, &tokens)?;
+    let persisted = load_tokens(server)?;
+    if persisted.access_token != tokens.access_token
+        || persisted.refresh_token != tokens.refresh_token
+        || persisted.expires_at != tokens.expires_at
+    {
+        return Err("OS credential store returned different credentials after saving".into());
+    }
     println!("Login complete; credentials are stored in the OS credential store.");
     Ok(())
 }
@@ -665,13 +706,21 @@ fn validate_server_url(value: &str) -> Result<(), String> {
 fn save_tokens(server: &str, tokens: &StoredTokens) -> Result<(), String> {
     credential_entry(server)?
         .set_password(&serde_json::to_string(tokens).map_err(|error| error.to_string())?)
-        .map_err(|error| error.to_string())
+        .map_err(|error| format!("cannot save credentials in the OS credential store: {error}"))
 }
 
 fn load_tokens(server: &str) -> Result<StoredTokens, String> {
-    let value = credential_entry(server)?
-        .get_password()
-        .map_err(|_| "not logged in; run `aissence login` first".to_string())?;
+    let value = match credential_entry(server)?.get_password() {
+        Ok(value) => value,
+        Err(keyring::Error::NoEntry) => {
+            return Err(NOT_LOGGED_IN_ERROR.into());
+        }
+        Err(error) => {
+            return Err(format!(
+                "cannot read credentials from the OS credential store: {error}"
+            ));
+        }
+    };
     serde_json::from_str(&value).map_err(|error| format!("stored credentials are invalid: {error}"))
 }
 

@@ -826,12 +826,23 @@ impl Summarizer {
                         retryable: is_retryable_status(status.as_u16()),
                     });
                 }
-                response
-                    .json::<CompletionsResponse>()
-                    .await
+                let body = response.text().await.map_err(|error| CompletionError {
+                    message: error.to_string(),
+                    retryable: error.is_timeout() || error.is_connect(),
+                })?;
+                // Some OpenAI-compatible providers emit malformed JSON with
+                // duplicate object keys (e.g. `"cost"` twice in `usage`), which
+                // serde_json's derived struct deserializer rejects outright.
+                // Round-trip through `Value` first so duplicates collapse to
+                // their last occurrence, matching how browsers/JS parse JSON.
+                serde_json::from_str::<serde_json::Value>(&body)
+                    .and_then(serde_json::from_value::<CompletionsResponse>)
                     .map(completion_response)
                     .map_err(|error| CompletionError {
-                        message: format!("invalid chat completion response: {error}"),
+                        message: format!(
+                            "invalid chat completion response: {error}; body: {}",
+                            truncate_for_error(&body)
+                        ),
                         retryable: false,
                     })
             }
@@ -880,6 +891,15 @@ impl CompletionError {
 impl std::fmt::Display for CompletionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.message)
+    }
+}
+
+fn truncate_for_error(body: &str) -> String {
+    const MAX_LEN: usize = 2000;
+    if body.len() <= MAX_LEN {
+        body.to_string()
+    } else {
+        format!("{}... [truncated]", &body[..MAX_LEN])
     }
 }
 
@@ -1234,9 +1254,10 @@ fn validate_public_story(
     story
 }
 
-/// Detect a likely verbatim prompt disclosure in a public story. Exact short
-/// prompts and any ten-word span from a longer prompt are treated as private.
-/// This is a deterministic backstop in addition to the model instruction.
+/// Detect a likely verbatim prompt disclosure in a public story. A complete
+/// very-short prompt, a six-word span from a prompt of at most fifteen words,
+/// or a twelve-word span from a longer prompt is treated as private. This is a
+/// deterministic backstop in addition to the model instruction.
 pub fn public_story_has_verbatim_prompt(story: &PublicStory, messages: &[MessageSummary]) -> bool {
     let items = messages
         .iter()
@@ -1273,7 +1294,11 @@ fn raw_public_text_leaks_prompt(public_text: &str, items: &[RawItem]) -> bool {
             if public_words == prompt_words {
                 return true;
             }
-            let window = if prompt_words.len() <= 15 { 4 } else { 10 };
+            let window = match prompt_words.len() {
+                1..=5 => prompt_words.len(),
+                6..=15 => 6,
+                _ => 12,
+            };
             prompt_words.len() >= window
                 && prompt_words.windows(window).any(|words| {
                     public_words
@@ -2269,6 +2294,58 @@ mod tests {
             beats: vec![],
         };
         assert!(!public_story_has_verbatim_prompt(&paraphrased, &short));
+    }
+
+    #[test]
+    fn public_story_leak_guard_allows_four_word_overlap_in_a_paraphrase() {
+        let messages = vec![MessageSummary {
+            kind: MessageKind::UserWrote,
+            subscriber_summary: None,
+            content: Some("Add retry support to the network client now".into()),
+            changes: vec![],
+            timestamp: None,
+            tokens: None,
+        }];
+        let story = PublicStory {
+            summary: "The request was to add retry support to networking.".into(),
+            beats: vec![],
+        };
+
+        assert!(!public_story_has_verbatim_prompt(&story, &messages));
+    }
+
+    #[test]
+    fn public_story_leak_guard_rejects_six_word_and_complete_short_prompt_overlap() {
+        let six_word_overlap = vec![MessageSummary {
+            kind: MessageKind::UserWrote,
+            subscriber_summary: None,
+            content: Some("Add retry support to the network client now".into()),
+            changes: vec![],
+            timestamp: None,
+            tokens: None,
+        }];
+        let leaked_span = PublicStory {
+            summary: "The request was to add retry support to the network stack.".into(),
+            beats: vec![],
+        };
+        assert!(public_story_has_verbatim_prompt(
+            &leaked_span,
+            &six_word_overlap
+        ));
+
+        let short = vec![MessageSummary {
+            kind: MessageKind::UserWrote,
+            subscriber_summary: None,
+            content: Some("Use dark mode".into()),
+            changes: vec![],
+            timestamp: None,
+            tokens: None,
+        }];
+        let embedded = PublicStory {
+            summary: "The interface was updated to use dark mode throughout.".into(),
+            beats: vec![],
+        };
+        assert!(public_story_has_verbatim_prompt(&embedded, &short));
     }
 
     #[test]

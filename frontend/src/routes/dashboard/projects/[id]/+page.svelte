@@ -24,6 +24,9 @@
       {:else}
         <form method="POST" action="?/publish" use:enhance><button class="button">Publish</button></form>
       {/if}
+      <form method="POST" action="?/deleteProject" onsubmit={(event) => { if (!confirm('Permanently delete this project?')) event.preventDefault(); }}>
+        <button class="button danger">Delete project</button>
+      </form>
     </div>
   </header>
   {#if form?.error}<p class="error">{form.error}</p>{/if}
@@ -103,12 +106,6 @@
     <ScreenshotUploader projectId={data.project.id} startOrder={data.screenshots.length} />
   </section>
 
-  <section class="danger-zone">
-    <div><h2>Delete this project</h2><p>Removes the ledger, imported source, and screenshots.</p></div>
-    <form method="POST" action="?/deleteProject" onsubmit={(event) => { if (!confirm('Permanently delete this project?')) event.preventDefault(); }}>
-      <button class="button danger">Delete project</button>
-    </form>
-  </section>
 </div>
 
 <style>
@@ -148,13 +145,11 @@
     color: var(--accent);
     font: 500 11px/1 'JetBrains Mono', monospace;
   }
-  .section-head h2,
-  .danger-zone h2 {
+  .section-head h2 {
     margin: 0;
     font: 400 35px/1 'Instrument Serif', Georgia, serif;
   }
-  .section-head p,
-  .danger-zone p {
+  .section-head p {
     margin: 8px 0 0;
     color: var(--muted);
   }
@@ -231,16 +226,8 @@
     color: var(--danger);
     text-decoration: underline;
   }
-  .danger-zone {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 25px;
-    border-color: var(--danger);
-  }
   @media (max-width: 760px) {
-    header,
-    .danger-zone {
+    header {
       align-items: flex-start;
       flex-direction: column;
     }

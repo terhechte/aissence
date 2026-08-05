@@ -295,7 +295,8 @@ async fn succeed_public_job(
     transaction
         .execute(
             "update public.commits set public_story=$2,public_beats=$3, \
-             token_input=$4,token_output=$5,token_cache_read=$6,token_cache_create=$7, \
+             token_input=$4::bigint,token_output=$5::bigint, \
+             token_cache_read=$6::bigint,token_cache_create=$7::bigint, \
              summarizer_version=1,summary_status='succeeded',summarized_at=now(),summary_error=null \
              where id=$1",
             &[

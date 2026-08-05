@@ -322,16 +322,14 @@
 
                 {#if !isEntitled}
                   <div class="public-story">
-                    <h4>Representative prompt moments</h4>
                     {#if publicBeats(commit).length}
+                      <h4>Representative prompt moments</h4>
                       {#each publicBeats(commit) as beat}
                         <div class="public-beat">
                           <span>{beat.label}</span>
                           <PromptMarkdown content={beat.text} />
                         </div>
                       {/each}
-                    {:else}
-                      <p class="source-unavailable">No prompt wording is exposed. A privacy-safe story will appear here once prepared.</p>
                     {/if}
                     <p class="public-activity">{promptCount(commit)} user {promptCount(commit) === 1 ? 'prompt' : 'prompts'}, {Number(commit.reply_count ?? 0)} agent replies, and {Number(commit.change_message_count ?? 0)} recorded change steps.</p>
                     <div class="locked">
