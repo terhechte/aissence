@@ -80,6 +80,10 @@ pub struct ManifestCommit {
     pub source_digest: String,
     #[serde(default)]
     pub all_prompts: bool,
+    #[serde(default)]
+    pub has_subline: bool,
+    #[serde(default)]
+    pub summarizer_version: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

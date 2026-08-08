@@ -39,6 +39,7 @@
   commits={data.commits}
   screenshots={data.screenshots}
   isEntitled={hasSubscriberAccess}
+  isOwner={data.isOwner}
 />
 
 <style>

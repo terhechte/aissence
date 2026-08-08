@@ -144,6 +144,7 @@ impl SummaryStore {
                     && stored.source_digest == current.source_digest
             })
             .and_then(|stored| stored.summary.as_ref())
+            .filter(|summary| summary.summarizer_version == crate::SUMMARIZER_VERSION)
     }
 
     /// Refresh every committed source entry while preserving summaries whose
@@ -158,6 +159,9 @@ impl SummaryStore {
                 && let Some(existing) = self.document.commits.iter().find(|existing| {
                     existing.commit_hash == current.commit_hash
                         && existing.source_digest == current.source_digest
+                        && existing.summary.as_ref().is_some_and(|summary| {
+                            summary.summarizer_version == crate::SUMMARIZER_VERSION
+                        })
                 })
             {
                 current.summary = existing.summary.clone();
@@ -257,8 +261,10 @@ mod tests {
             messages: Vec::new(),
             summary: Some(CommitSummary {
                 public: crate::model::PublicStory {
+                    subline: String::new(),
                     summary: "Done".into(),
                     beats: Vec::new(),
+                    origin: crate::model::SummaryOrigin::Model,
                 },
                 ..Default::default()
             }),
@@ -285,6 +291,22 @@ mod tests {
         store.replace_from_groups(&[group()]).unwrap();
         let other = AissenceDocument::empty(AissenceProject::new(None));
         assert!(store.merge_summary_delta(&other).is_err());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn ignores_cached_summaries_from_an_old_policy_version() {
+        let dir = directory("old-summary-policy");
+        let mut old_group = group();
+        old_group.summary.as_mut().unwrap().summarizer_version = crate::SUMMARIZER_VERSION - 1;
+        let mut store = SummaryStore::load(&dir);
+        store.replace_from_groups(&[old_group.clone()]).unwrap();
+
+        assert!(store.get_for_group(&old_group).is_none());
+
+        old_group.summary.as_mut().unwrap().summarizer_version = crate::SUMMARIZER_VERSION;
+        store.replace_from_groups(&[old_group.clone()]).unwrap();
+        assert!(store.get_for_group(&old_group).is_some());
         std::fs::remove_dir_all(dir).ok();
     }
 }

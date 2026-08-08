@@ -24,6 +24,7 @@
         project.name,
         project.tagline,
         project.description,
+        project.summary_overview,
         project.repository_label,
         project.profiles?.display_name,
         project.profiles?.handle
@@ -141,7 +142,7 @@
                 {#if project.product_url}<span>Product</span>{/if}
               </div>
               <h3>{project.name}</h3>
-              {#if project.tagline}<p>{project.tagline}</p>{/if}
+              {#if project.tagline || project.summary_overview}<p>{project.tagline || project.summary_overview}</p>{/if}
             </div>
             <div class="card-meta">
               <span>{project.profiles.display_name}</span>

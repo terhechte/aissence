@@ -37,14 +37,15 @@ export const load: PageServerLoad = async ({ locals, params, setHeaders }) => {
 
   const publicCommitFields = [
     'id', 'commit_hash', 'title', 'committed_at', 'files_changed', 'lines_added',
-    'lines_deleted', 'public_story', 'public_beats', 'prompt_count', 'reply_count',
+    'lines_deleted', 'public_story', 'public_subline', 'public_beats', 'prompt_count', 'reply_count',
     'change_message_count', 'token_input', 'token_output', 'token_cache_read',
     'token_cache_create', 'sort_order', 'potential_cost_usd', 'input_cost_usd',
     'output_cost_usd', 'pricing_model_ids', 'pricing_calculated_at', 'summary_status',
-    'public_prompt_summaries', 'commit_agents(*)'
+    'summary_origin', 'summarizer_version', 'public_prompt_summaries', 'commit_agents(*)'
   ].join(',');
   const publicPromptFields = `${publicCommitFields},messages(id,kind,sort_order,message_summaries(summary))`;
   const entitledCommitFields = `${publicCommitFields},messages(id,kind,occurred_at,token_input,token_output,token_cache_read,token_cache_create,sort_order,changed_file_count,message_summaries(summary),message_sources(content),changes(tool,file_path,diff,sort_order))`;
+  const ownerCommitFields = `${entitledCommitFields},summary_error`;
   const [{ data: screenshots }, { data: commits }] = await Promise.all([
     locals.supabase
       .from('project_screenshots')
@@ -53,7 +54,7 @@ export const load: PageServerLoad = async ({ locals, params, setHeaders }) => {
       .order('sort_order'),
     locals.supabase
       .from('commits')
-      .select(isEntitled ? entitledCommitFields : publicPromptFields)
+      .select(isOwner ? ownerCommitFields : isEntitled ? entitledCommitFields : publicPromptFields)
       .eq('project_id', project.id)
       .order('sort_order')
   ]);

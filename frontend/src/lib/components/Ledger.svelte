@@ -8,13 +8,15 @@
     project,
     commits,
     screenshots,
-    isEntitled = false
+    isEntitled = false,
+    isOwner = false
   } = $props<{
     profile: any;
     project: any;
     commits: any[];
     screenshots: any[];
     isEntitled?: boolean;
+    isOwner?: boolean;
   }>();
 
   let openCommit = $state<string | null>(null);
@@ -73,6 +75,26 @@
       1,
       ...commits.flatMap((commit: any) => keys.map((key) => Number(commit[key] ?? 0)))
     );
+  });
+
+  const projectMilestones = $derived.by(() => {
+    const ready = commits.filter((commit: any) =>
+      String(commit.public_subline || commit.public_story || '').trim()
+    );
+    if (ready.length <= 4) return ready;
+    const first = ready[0];
+    const last = ready.at(-1);
+    const middle = ready.slice(1, -1);
+    const impact = [...middle]
+      .sort((left: any, right: any) =>
+        Number(right.files_changed ?? 0) + Number(right.lines_added ?? 0) + Number(right.lines_deleted ?? 0) -
+        (Number(left.files_changed ?? 0) + Number(left.lines_added ?? 0) + Number(left.lines_deleted ?? 0))
+      )[0];
+    const midpoint = middle[Math.floor(middle.length / 2)];
+    return [first, impact, midpoint, last]
+      .filter(Boolean)
+      .filter((commit, index, selected) => selected.findIndex((item) => item.id === commit.id) === index)
+      .sort((left, right) => Number(left.sort_order ?? 0) - Number(right.sort_order ?? 0));
   });
 
   function chartRatio(value: number, maximum: number) {
@@ -139,11 +161,33 @@
 
   function promptBlurb(commit: any) {
     const count = promptCount(commit);
+    const subline = String(commit.public_subline ?? '').trim();
+    if (subline) return subline;
     const story = String(commit.public_story ?? '').trim();
     if (story) return story;
+    if (commit.summary_status === 'failed') return 'Public story generation failed; the creator can retry it.';
+    if (commit.summary_status === 'skipped' && count) return 'Public story has not been generated yet.';
     return count
       ? `${count} ${count === 1 ? 'prompt' : 'prompts'} · public story is being prepared`
       : 'No user prompt was associated with this commit.';
+  }
+
+  function summaryOriginLabel(commit: any) {
+    if (commit.summary_status === 'failed') return 'failed';
+    if (['queued', 'processing'].includes(commit.summary_status) && !commit.public_story) {
+      return commit.summary_status;
+    }
+    switch (commit.summary_origin) {
+      case 'metadata_fallback': return 'metadata fallback';
+      case 'parse_fallback': return 'format fallback';
+      case 'privacy_fallback': return 'privacy fallback';
+      case 'model': return 'model summary';
+      default: return commit.public_story ? 'summary' : 'pending';
+    }
+  }
+
+  function sameText(left: unknown, right: unknown) {
+    return String(left ?? '').trim() === String(right ?? '').trim();
   }
 
   function changedSummary(commit: any) {
@@ -214,6 +258,19 @@
         {#if project.repository_url}<a href={project.repository_url} target="_blank" rel="noreferrer">Repository ↗</a>{/if}
         {#if totals.first && totals.last}<span>{formatDate(totals.first)} – {formatDate(totals.last)}</span>{/if}
       </div>
+      {#if projectMilestones.length}
+        <div class="project-arc">
+          <p class="label">Project arc from the commit record</p>
+          <ol>
+            {#each projectMilestones as milestone}
+              <li>
+                <span>{formatDate(milestone.committed_at, { month: 'short', day: 'numeric', year: undefined })}</span>
+                <div><strong>{milestone.title}</strong><p>{milestone.public_subline || milestone.public_story}</p></div>
+              </li>
+            {/each}
+          </ol>
+        </div>
+      {/if}
     </div>
 
     <div class="gallery">
@@ -323,7 +380,14 @@
               <div class="commit-meta"><span>{formatDate(commit.committed_at)}</span><span>{commit.commit_hash.slice(0, 10)}</span></div>
               <div>
                 <div class="summary-grid">
-                  <div><span>How this commit came to be</span><PromptMarkdown content={commit.public_story || 'This public story is being prepared.'} /></div>
+                  <div>
+                    <span>How this commit came to be · {summaryOriginLabel(commit)}</span>
+                    <PromptMarkdown content={commit.public_story || promptBlurb(commit)} />
+                    {#if isOwner && commit.summary_error}<p class="summary-error">{commit.summary_error}</p>{/if}
+                    {#if isOwner && commit.summary_status === 'succeeded' && !publicPromptSummaries(commit).length && !publicBeats(commit).length}
+                      <p class="summary-note">No representative prompt moments were returned or passed the privacy checks.</p>
+                    {/if}
+                  </div>
                   <div><span>Changed</span><p>{changedSummary(commit)}</p></div>
                 </div>
 
@@ -364,14 +428,18 @@
                           <span>asked</span>
                           <time>{messageTime(turn.asked)}</time>
                           <div>
-                            <PromptMarkdown content={turn.asked.subscriber_summary || 'This prompt summary is being prepared.'} />
-                            {#if content}
-                              <details class="full-prompt">
-                                <summary>Read full prompt</summary>
-                                <PromptMarkdown content={content} />
-                              </details>
+                            {#if content && sameText(turn.asked.subscriber_summary, content)}
+                              <PromptMarkdown content={content} />
                             {:else}
-                              <p class="source-unavailable">Full prompt unavailable in this source file.</p>
+                              <PromptMarkdown content={turn.asked.subscriber_summary || 'This prompt summary is being prepared.'} />
+                              {#if content}
+                                <details class="full-prompt">
+                                  <summary>Read full prompt</summary>
+                                  <PromptMarkdown content={content} />
+                                </details>
+                              {:else}
+                                <p class="source-unavailable">Full prompt unavailable in this source file.</p>
+                              {/if}
                             {/if}
                           </div>
                         </div>
@@ -416,7 +484,7 @@
   </section>
 
   <footer>
-    <p>Every line above came out of a conversation. Aissence keeps the two together, so a repository can still explain itself a year from now.</p>
+    <p>Conversation entries are associated with the first following commit by timestamp, so rebases or overlapping work can affect attribution. Summaries describe that retained record.</p>
     <a href={`/creators/${profile.handle}`}>More from {profile.display_name} →</a>
   </footer>
 </div>
@@ -483,6 +551,29 @@
     color: var(--muted);
     font: 400 10px/1 'JetBrains Mono', monospace;
   }
+  .project-arc {
+    margin-top: 38px;
+    border-top: 1px solid var(--rule2);
+    padding-top: 14px;
+  }
+  .project-arc ol {
+    list-style: none;
+    margin: 10px 0 0;
+    padding: 0;
+  }
+  .project-arc li {
+    display: grid;
+    grid-template-columns: 62px 1fr;
+    gap: 14px;
+    padding: 12px 0;
+    border-top: 1px solid var(--rule);
+  }
+  .project-arc li > span {
+    color: var(--muted);
+    font: 400 9px/1.4 'JetBrains Mono', monospace;
+  }
+  .project-arc strong { font-weight: 500; }
+  .project-arc p { margin: 4px 0 0; color: var(--soft); line-height: 1.4; }
   .gallery {
     border-top: 1px solid var(--ink);
     padding-top: 13px;
@@ -883,6 +974,15 @@
   .summary-grid p {
     color: var(--body);
     line-height: 1.55;
+  }
+  .summary-grid .summary-error {
+    color: var(--danger);
+    font: 400 11px/1.45 'JetBrains Mono', monospace;
+    overflow-wrap: anywhere;
+  }
+  .summary-grid .summary-note {
+    color: var(--muted);
+    font: 400 10px/1.45 'JetBrains Mono', monospace;
   }
   .transcript {
     margin-top: 28px;

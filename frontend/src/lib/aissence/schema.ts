@@ -65,9 +65,12 @@ export const publicBeatSchema = z.object({
 });
 
 export const commitSummarySchema = z.object({
+  summarizer_version: unsignedInteger.default(1),
   public: z.object({
+    subline: z.string().trim().max(1000).default(''),
     summary: z.string().trim().min(1),
-    beats: z.array(publicBeatSchema).max(3)
+    beats: z.array(publicBeatSchema).max(3),
+    origin: z.enum(['model', 'metadata_fallback', 'parse_fallback', 'privacy_fallback']).default('model')
   }),
   messages: z.array(messageSchema),
   agents: z.array(agentSchema).default([]),
@@ -161,7 +164,7 @@ export function parseAissence(input: string): ParsedAissenceFile {
     .filter((commit) => !ignored.has(commit.commit_hash))
     .sort((left, right) => Date.parse(left.date) - Date.parse(right.date) || left.commit_hash.localeCompare(right.commit_hash));
   const warnings = commits.flatMap((commit) =>
-    commit.sanitizer_version !== 1
+    commit.sanitizer_version !== 2
       ? [`${commit.commit_hash.slice(0, 10)} uses an unsupported sanitizer version.`]
       : []
   );

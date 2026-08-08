@@ -1,4 +1,5 @@
 import { error } from '@sveltejs/kit';
+import { attachProjectOverviews } from '$lib/server/project-overviews';
 import type { PageServerLoad } from './$types';
 
 export const load: PageServerLoad = async ({ locals, params }) => {
@@ -30,7 +31,7 @@ export const load: PageServerLoad = async ({ locals, params }) => {
         ? locals.supabase.storage.from('profile-images').getPublicUrl(profile.avatar_path).data.publicUrl
         : null
     },
-    projects: projects ?? [],
+    projects: await attachProjectOverviews(locals.supabase, projects ?? []),
     plans: plans ?? []
   };
 };

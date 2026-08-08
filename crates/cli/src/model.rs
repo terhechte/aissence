@@ -6,6 +6,9 @@ use chrono::{DateTime, Utc};
 use normalize_chat_sessions as ncs;
 use serde::{Deserialize, Serialize};
 
+/// Current version of the summary prompts, evidence policy, and validators.
+pub const SUMMARIZER_VERSION: u32 = 2;
+
 /// Authoritative statistics for the tree change introduced by a git commit.
 ///
 /// Counts are calculated from the committed trees (against the first parent,
@@ -350,16 +353,37 @@ pub struct PublicBeat {
     pub text: String,
 }
 
-/// The only narrative generated for the free/public ledger.
+/// How the public narrative was produced.
+///
+/// This is persisted so creators can distinguish genuine model output from a
+/// deterministic fallback without retaining rejected model text.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SummaryOrigin {
+    #[default]
+    Model,
+    MetadataFallback,
+    ParseFallback,
+    PrivacyFallback,
+}
+
+/// The narratives generated for the free/public ledger.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PublicStory {
+    /// Compelling, compact synthesis shown directly beneath the commit title.
+    /// Generated with the story and beats in the single public request.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub subline: String,
     /// Concise account of why the change was requested, how it was approached,
     /// and what the commit actually produced.
     pub summary: String,
     /// At most three representative prompt moments generated in the same call.
     #[serde(default)]
     pub beats: Vec<PublicBeat>,
+    /// Provenance for creator review and fallback-aware rendering.
+    #[serde(default)]
+    pub origin: SummaryOrigin,
 }
 
 /// Generated data for what went into a commit.
@@ -367,9 +391,13 @@ pub struct PublicStory {
 /// Public generation produces exactly one [`PublicStory`] and copies the
 /// model-independent message shape. Subscriber prompt summaries remain empty
 /// until a separate, entitlement-triggered job fills them.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommitSummary {
+    /// Version of the prompts, evidence policy, and validators that produced
+    /// this summary. It is deliberately separate from the source sanitizer.
+    #[serde(default = "legacy_summarizer_version")]
+    pub summarizer_version: u32,
     pub public: PublicStory,
     /// Conversation entries in chronological order.
     pub messages: Vec<MessageSummary>,
@@ -382,6 +410,22 @@ pub struct CommitSummary {
     /// usage for this commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens: Option<TokenCount>,
+}
+
+const fn legacy_summarizer_version() -> u32 {
+    1
+}
+
+impl Default for CommitSummary {
+    fn default() -> Self {
+        Self {
+            summarizer_version: SUMMARIZER_VERSION,
+            public: PublicStory::default(),
+            messages: Vec::new(),
+            agents: Vec::new(),
+            tokens: None,
+        }
+    }
 }
 
 /// A commit together with the chat messages that led up to it.

@@ -23,6 +23,7 @@ export interface Database {
         Returns: string;
       };
       enqueue_public_summary_jobs: { Args: { p_project_id: string }; Returns: number };
+      publish_ready_project: { Args: { p_project_id: string }; Returns: undefined };
       move_project_screenshot: {
         Args: { p_screenshot_id: string; p_direction: number };
         Returns: undefined;

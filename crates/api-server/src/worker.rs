@@ -66,15 +66,15 @@ async fn claim(state: &AppState) -> Result<Option<Job>, Box<dyn std::error::Erro
             &[],
         )
         .await?;
-    if let Some(row) = &row {
-        if row.get::<_, String>(4) == "public" {
-            transaction
-                .execute(
-                    "update public.commits set summary_status='processing' where id=$1",
-                    &[&row.get::<_, Uuid>(2)],
-                )
-                .await?;
-        }
+    if let Some(row) = &row
+        && row.get::<_, String>(4) == "public"
+    {
+        transaction
+            .execute(
+                "update public.commits set summary_status='processing' where id=$1",
+                &[&row.get::<_, Uuid>(2)],
+            )
+            .await?;
     }
     transaction.commit().await?;
     let Some(row) = row else { return Ok(None) };
@@ -295,15 +295,18 @@ async fn succeed_public_job(
     let token_cache_create = checked_token(tokens.and_then(|tokens| tokens.cache_create))?;
     transaction
         .execute(
-            "update public.commits set public_story=$2,public_beats=$3, \
-             token_input=$4::bigint,token_output=$5::bigint, \
-             token_cache_read=$6::bigint,token_cache_create=$7::bigint, \
-             summarizer_version=1,summary_status='succeeded',summarized_at=now(),summary_error=null \
+            "update public.commits set public_story=$2,public_subline=$3,public_beats=$4, \
+             token_input=$7::bigint,token_output=$8::bigint, \
+             token_cache_read=$9::bigint,token_cache_create=$10::bigint, \
+             summary_origin=$5,summarizer_version=$6,summary_status='succeeded',summarized_at=now(),summary_error=null \
              where id=$1",
             &[
                 &job.commit_id,
                 &summary.public.summary,
+                &summary.public.subline,
                 &serde_json::to_value(&summary.public.beats)?,
+                &summary_origin(summary.public.origin),
+                &(aissence::SUMMARIZER_VERSION as i32),
                 &token_input,
                 &token_output,
                 &token_cache_read,
@@ -343,11 +346,16 @@ async fn succeed_subscriber_job(
         transaction
             .execute(
                 "insert into public.message_summaries (message_id,summary,summarizer_version) \
-                 select id,$3,1 from public.messages \
+                 select id,$3,$4 from public.messages \
                  where commit_id=$1 and sort_order=$2 and kind='UserWrote' \
                  on conflict (message_id) do update set summary=excluded.summary, \
                  summarizer_version=excluded.summarizer_version, generated_at=now()",
-                &[&job.commit_id, &sort_order, summary],
+                &[
+                    &job.commit_id,
+                    &sort_order,
+                    summary,
+                    &(aissence::SUMMARIZER_VERSION as i32),
+                ],
             )
             .await?;
     }
@@ -432,6 +440,15 @@ fn checked_token(
     value: Option<u64>,
 ) -> Result<Option<i64>, Box<dyn std::error::Error + Send + Sync>> {
     value.map(i64::try_from).transpose().map_err(Into::into)
+}
+
+fn summary_origin(origin: aissence::SummaryOrigin) -> &'static str {
+    match origin {
+        aissence::SummaryOrigin::Model => "model",
+        aissence::SummaryOrigin::MetadataFallback => "metadata_fallback",
+        aissence::SummaryOrigin::ParseFallback => "parse_fallback",
+        aissence::SummaryOrigin::PrivacyFallback => "privacy_fallback",
+    }
 }
 
 #[cfg(test)]

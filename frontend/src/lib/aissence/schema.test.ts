@@ -20,7 +20,7 @@ function validFile(overrides: Record<string, unknown> = {}) {
     commits: [{
       commit_hash: hash,
       source_digest: `sha256:${'0'.repeat(64)}`,
-      sanitizer_version: 1,
+      sanitizer_version: 2,
       title: 'Add retry support',
       date: '2026-06-20T09:18:03Z',
       stats: { files_changed: 3, lines_added: 21, lines_deleted: 4 },
@@ -31,7 +31,9 @@ function validFile(overrides: Record<string, unknown> = {}) {
         tokens: { input: 100, output: 20 }
       },
       summary: {
+        summarizer_version: 2,
         public: {
+          origin: 'model',
           summary: 'Retry support was requested and implemented with backoff.',
           beats: [{ message_index: 0, label: 'Initial request', text: 'The creator asked for resilient retries.' }]
         },

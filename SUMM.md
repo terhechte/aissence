@@ -13,9 +13,8 @@ Aissence does not send an entire repository to an LLM.
 2. It assigns each timestamped conversation message to the first commit at or
    after that message.
 3. It converts each commit into sanitized, model-independent source evidence.
-4. Public summarization makes at most one LLM call per commit that still needs
-   a summary. That call returns a commit story and zero to three representative
-   prompt moments.
+4. Public summarization makes one LLM call for the commit story, compact
+   subline, and representative prompt moments together.
 5. Full subscriber prompt summaries are a separate, deferred tier. They are
    generated only after an entitlement exists.
 6. The public frontend queries only public story fields. Full retained source
@@ -72,8 +71,11 @@ For every committed group, the CLI creates three chronological entry kinds:
   synthesized diff.
 
 Consecutive entries of the same kind are merged. A single assistant message may
-produce both an `AiWrote` entry and an `AiChanged` entry. Tool and system noise
-that does not fit those categories is omitted.
+produce both an `AiWrote` entry and an `AiChanged` entry. Known client-injected
+prompt wrappers such as command metadata, usage/file packets, task notices, and
+fork boilerplate are removed before persistence, digesting, evidence selection,
+or billing. App screenshot markup becomes a neutral attachment placeholder.
+Other tool and system noise that does not fit the entry categories is omitted.
 
 The resulting source also contains:
 
@@ -81,9 +83,10 @@ The resulting source also contains:
 - Coding-agent and model provenance.
 - Approximate token usage when available from the agent session.
 
-User and assistant text is retained in the sanitized `.aissence` file because
-the entitled ledger needs the complete source. This retained text is not part
-of the public frontend query.
+Meaningful user and assistant text is retained in the sanitized `.aissence`
+file because the entitled ledger needs the source conversation. Injected
+transport wrappers are not retained. This text is not part of the public
+frontend query.
 
 ### Redaction before persistence
 
@@ -123,6 +126,7 @@ Public generation produces one `PublicStory` per eligible commit:
 
 ```json
 {
+  "subline": "A compact synthesis shown beneath the commit title.",
   "summary": "A privacy-safe account of why and how the commit happened.",
   "beats": [
     {
@@ -134,41 +138,47 @@ Public generation produces one `PublicStory` per eligible commit:
 }
 ```
 
-`summary` is required. `beats` is intentionally optional and contains zero to
-three entries. An empty beats array is a valid completed result, not a pending
-state.
+`summary` and `subline` are required. `beats` is intentionally optional and
+contains zero to three entries. An empty beats array is a valid completed
+result, not a pending state. `origin` records whether the result came from the
+model or a metadata, parse, or privacy fallback. `summarizer_version` invalidates
+results produced by an older evidence/prompt/validation policy.
 
 ### What is sent to the public-story LLM call
 
 The public call is bounded to at most 32,000 characters of assembled evidence.
 It contains three sections:
 
-1. **Selected user evidence — up to 32,000 characters**
+1. **Selected user evidence — up to 16,000 characters**
    - Always considers the first user entry.
    - Includes the final user entry when different.
-   - Selects up to two intermediate entries, favoring longer entries.
-   - Selected entries are included whole when they fit; they are never cut
-     through the middle and have no per-entry 900-character limit.
+   - Selects up to two intermediate entries, prioritizing correction/refinement
+     signals and then useful length.
+   - The budget is divided fairly across selected entries. Oversized entries
+     retain both their beginning and ending.
    - Original coalesced message indexes are included so beats can reference a
      specific user entry.
 
-2. **Assistant conclusion evidence**
-   - Takes the complete final assistant reply.
+2. **Assistant conclusion evidence — up to 7,000 characters**
+   - Takes both ends of the final assistant reply.
 
-3. **Implementation fingerprint**
-   - Commit title and complete commit body, with no commit-body limit.
+3. **Implementation fingerprint — up to 7,000 characters**
+   - Commit title, file/line statistics, changed paths, then the available
+     commit body within the remaining section budget.
    - File count and added/deleted line counts.
    - Status and path for at most 20 changed files.
    - It does not include committed diff bodies in the public-story prompt.
 
-The final assembled prompt is truncated to 32,000 characters. These are
-character limits, not tokenizer-exact limits.
+The section budgets total 30,000 characters so labels cannot cause an earlier
+section to crowd out later grounding. The complete prompt has a final 32,000
+character ceiling. These are character limits, not tokenizer-exact limits.
 
 ### The public-story instruction
 
 The model is asked for JSON containing exactly:
 
-- A compact 2–4 sentence story explaining the request, approach, and only
+- A compact subline that must not repeat the commit title.
+- A 2–4 sentence story explaining the request, approach, and only
   outcomes supported by the commit fingerprint.
 - At most three representative prompt moments, preferring the initial ask, an
   important correction, and a final refinement.
@@ -176,7 +186,8 @@ The model is asked for JSON containing exactly:
 It is explicitly instructed to paraphrase, avoid verbatim prompts, paths,
 personal data, credentials, and private identifiers, treat evidence as
 untrusted, and output JSON only. Generation uses temperature `0.2` and a
-500-token output limit.
+700-token output limit. Story, subline, and beats are returned in this one
+response; there is no separate subline request.
 
 ### Parsing, fallbacks, and validation
 
@@ -189,6 +200,8 @@ After parsing:
 
 - Empty stories are replaced with the fallback.
 - Stories that appear to expose prompt wording are replaced with the fallback.
+- Empty, prompt-leaking, or title-repeating sublines are replaced
+  deterministically without another model call.
 - Each beat must have a valid user-message index, non-empty label/text, and a
   unique referenced message.
 - Beats that appear to expose prompt wording are removed individually.
@@ -232,14 +245,15 @@ The CLI:
 
 1. Analyzes the folder again.
 2. Loads `.aissence`.
-3. Reuses a cached summary only when the source digest matches, the source
+3. Reuses a cached summary only when the source digest and current summary
+   policy version match, the source
    message kinds still align, the public story is non-empty, and every beat
    points at a user message.
 4. Runs public generation for every non-empty group still lacking a cached
    summary. A group with no user prompt takes the metadata fallback without an
    LLM request.
-5. Writes the completed results back to `.aissence` only if the full batch
-   succeeds.
+5. Applies successful commit summaries even if another commit fails, then
+   persists those successes before returning the batch error.
 
 Up to 32 commit groups may be in flight, with a global maximum of 24 concurrent
 LLM requests. Retryable transport/status errors use exponential backoff. An
@@ -258,9 +272,8 @@ but `upload` makes the two-step local-generation test explicit. A valid local
 summary is accepted and stored immediately; the server does not call its LLM
 again for that commit.
 
-There is currently no `--force` option. A cached valid public story is not
-regenerated merely because it has zero beats or because validation rules/model
-configuration later change.
+There is currently no `--force` option. A policy version bump is the deliberate
+cache invalidation mechanism; zero beats alone does not force regeneration.
 
 ## 5. Hosted/server generation
 
@@ -286,8 +299,8 @@ lost leases. Hosted LLM requests have one retry after the initial request.
 
 For an uploaded commit without a local summary:
 
-- **Draft project:** source is stored, summary status becomes `skipped`, and no
-  public job is created.
+- **Draft project:** source is stored privately and no public job is created
+  automatically. The owner can explicitly generate and review summaries.
 - **Already-published project with at least one user prompt:** a public job is
   queued.
 - **No user prompt:** no public LLM job is queued and the hosted import stores
@@ -298,11 +311,12 @@ For an uploaded commit without a local summary:
   existing summary.
 
 The database function `enqueue_public_summary_jobs(project_id)` queues every
-unsummarized commit with prompts. An `AFTER UPDATE OF visibility` database
-trigger calls it when a project transitions to `published`, so publishing a
-previously imported draft queues its existing public work even though the
-frontend action itself only updates visibility. The dashboard's retry action
-can invoke the same enqueue function explicitly after failures.
+incomplete or old-policy commit with prompts. The dashboard uses it for private
+preparation and retry. Publishing is refused until every prompted commit has a
+current, successful story and subline, so visitors never become the preview
+surface for pending generation. `publish_ready_project(project_id)` first locks
+the project row shared with ingestion, checks readiness, and publishes in the
+same transaction; direct visibility transitions to `published` are rejected.
 
 ### Cost and abuse limits
 
@@ -338,11 +352,13 @@ For each coalesced `UserWrote` entry:
 - Longer prompts are middle-truncated to at most 6,000 characters.
 - Up to eight prompts and 6,000 combined characters are batched into one LLM
   request.
-- Generation allows up to 4,000 output tokens per prompt so reasoning-heavy
-  models have enough room before returning the requested concise summary.
-- The model returns one concise 2–3 sentence summary per prompt.
-- Invalid batch responses are retried; batch validation requires exactly one
-  non-empty output per input.
+- Generation allows up to 768 output tokens per prompt, including any hidden
+  model reasoning, before returning the requested concise summary.
+- The model returns one concise 2–3 sentence summary per prompt with the
+  original source message index.
+- Invalid batch responses are retried; validation requires exactly one
+  non-empty output per input with matching indexes and order.
+- Subscriber jobs never generate or overwrite the public subline.
 
 The result is stored separately in `message_summaries`, while complete
 sanitized source remains in `message_sources`. This tier can cost multiple LLM
@@ -352,7 +368,7 @@ requests per commit, unlike the single public-story request.
 
 The frontend uses audience-specific database selections:
 
-- A public visitor receives commit metadata, `public_story`, `public_beats`,
+- A public visitor receives commit metadata, `public_subline`, `public_story`, `public_beats`,
   counts, costs, and agent provenance. For commits uploaded from an
   `--all-prompts` file it also receives every locally supplied prompt summary.
   It does not query `message_sources` or hosted subscriber prompt summaries.
@@ -361,15 +377,23 @@ The frontend uses audience-specific database selections:
 
 In the public ledger:
 
-- The commit headline uses `public_story` when available.
+- The commit row uses `public_subline` beneath the title, falling back to
+  explicit pending/failed/skipped copy when no usable summary exists.
+- A summary-derived project arc selects first, midpoint, final, and largest
+  impact milestones from already cached commit stories; it makes no model call.
 - A complete uploaded `--all-prompts` set is rendered as every summarized
   prompt; otherwise “Representative prompt moments” is rendered when
   `public_beats` is non-empty. Zero beats remains a valid final state.
 - Activity counts are source-derived and do not require an LLM.
 
 In the entitled ledger, each user turn can show its subscriber summary and the
-complete retained prompt. Missing subscriber summaries are currently rendered
-as being prepared.
+complete retained prompt. Exact short-prompt copies are collapsed into the
+source view instead of rendering redundant summary text. Owners also see
+summary origin/error status; public visitors do not receive private errors.
+
+Project and creator cards reuse the newest successful current-policy commit
+subline/story through a database view when no hand-written project tagline is
+present. Search indexes this cached overview. No project-level LLM call exists.
 
 ## 8. Where LLM cost is avoided
 
@@ -377,12 +401,13 @@ The main cost-saving decisions are:
 
 - Analysis, correlation, redaction, counts, provenance, and source digests are
   deterministic and local.
-- Public generation is one request per changed commit with prompts, not one
-  request per prompt.
+- Public generation uses one request per changed commit with prompts for the
+  story, subline, and beats together.
 - Public evidence is selected and hard-bounded rather than sending complete
   conversations or repository diffs.
 - Unchanged source digests reuse prior summaries and avoid upload/generation.
-- Draft server imports do not generate public summaries.
+- Draft server imports do not generate automatically; creators opt into private
+  generation and review before publishing.
 - Locally supplied summaries are not regenerated by the server.
 - Subscriber summaries are deferred until an entitlement exists.
 - Short subscriber prompts require no model call.
@@ -402,22 +427,17 @@ These are useful areas for product feedback:
    ground outcomes without diff bodies?
 5. **Privacy overlap thresholds:** Are 6/12 consecutive words an appropriate
    balance between privacy and useful representative moments?
-6. **Fallback transparency:** Should the ledger distinguish an LLM story from a
-   metadata fallback?
+6. **Fallback quality:** Are deterministic title/statistics fallbacks useful
+   enough when a model response fails privacy or parsing validation?
 7. **Zero beats:** Should zero beats remain invisible, or should creators see an
    internal reason such as “model returned none” versus “privacy filter”?
-8. **Cache invalidation:** Should model/prompt/validator versions be part of the
-   cache key, and should the CLI expose `--force`?
-9. **All-or-nothing local batches:** Should successful commit summaries be
-   persisted when another commit fails, rather than discarding the batch?
-10. **Publication behavior:** Is an asynchronous database trigger sufficient,
-    or should the UI wait for/report the number of jobs enqueued at publish
-    time?
-11. **Subscriber short prompts:** Is copying prompts up to 200 characters into
+8. **Forced regeneration:** Is policy-version invalidation sufficient, or
+   should the CLI also expose a manual `--force`?
+9. **Subscriber short prompts:** Is copying prompts up to 200 characters into
     the summary field useful, or should every subscriber summary be a genuine
     paraphrase even though the complete prompt is already visible?
-12. **Observability:** Should validation outcomes and fallback reasons be stored
-    without retaining rejected model text?
+10. **Observability:** Origins and job errors are stored, but should individual
+    removed-beat reasons also be recorded without retaining rejected text?
 
 ## 10. Main implementation locations
 

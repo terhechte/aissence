@@ -1,11 +1,30 @@
 <script lang="ts">
   import { enhance } from '$app/forms';
+  import { invalidateAll } from '$app/navigation';
   import ImportUploader from '$lib/components/ImportUploader.svelte';
   import ScreenshotUploader from '$lib/components/ScreenshotUploader.svelte';
   import { formatDate } from '$lib/utils';
+  import { onMount } from 'svelte';
 
   let { data, form } = $props();
   const previewUrl = $derived(`/creators/${data.project.profiles.handle}/${data.project.slug}`);
+  const hasActiveSummaryJobs = $derived(
+    data.summaryJobs.some((job: any) => ['queued', 'processing'].includes(job.status))
+  );
+
+  onMount(() => {
+    let refreshing = false;
+    const timer = window.setInterval(async () => {
+      if (!hasActiveSummaryJobs || refreshing || document.visibilityState !== 'visible') return;
+      refreshing = true;
+      try {
+        await invalidateAll();
+      } finally {
+        refreshing = false;
+      }
+    }, 2_000);
+    return () => window.clearInterval(timer);
+  });
 </script>
 
 <svelte:head><title>{data.project.name} — dashboard</title></svelte:head>
@@ -22,7 +41,13 @@
       {#if data.project.visibility === 'published'}
         <form method="POST" action="?/unpublish" use:enhance><button class="button secondary">Unpublish</button></form>
       {:else}
-        <form method="POST" action="?/publish" use:enhance><button class="button">Publish</button></form>
+        <form method="POST" action="?/publish" use:enhance>
+          <button
+            class="button"
+            disabled={data.summaryReadiness.ready < data.summaryReadiness.prompted}
+            title={data.summaryReadiness.ready < data.summaryReadiness.prompted ? 'Generate and review summaries first' : 'Publish ledger'}
+          >Publish</button>
+        </form>
       {/if}
       <form method="POST" action="?/deleteProject" onsubmit={(event) => { if (!confirm('Permanently delete this project?')) event.preventDefault(); }}>
         <button class="button danger">Delete project</button>
@@ -31,6 +56,7 @@
   </header>
   {#if form?.error}<p class="error">{form.error}</p>{/if}
   {#if form?.saved}<p class="notice">Project details saved.</p>{/if}
+  {#if form?.summariesQueued !== undefined}<p class="notice">Queued {form.summariesQueued} private summary {form.summariesQueued === 1 ? 'job' : 'jobs'}.</p>{/if}
 
   <section>
     <div class="section-head"><span>01</span><div><h2>Project details</h2><p>The public framing around the imported history.</p></div></div>
@@ -55,7 +81,7 @@
   </section>
 
   <section>
-    <div class="section-head"><span>02</span><div><h2>Project history</h2><p>Uploads store new or changed source immediately. Public stories are generated only after publishing.</p></div></div>
+    <div class="section-head"><span>02</span><div><h2>Project history</h2><p>Uploads store source privately. Generate and review every public story before publishing.</p></div></div>
     <ImportUploader projectId={data.project.id} />
     {#if data.imports.length}
       <div class="import-log">
@@ -64,12 +90,33 @@
         {/each}
       </div>
     {/if}
+    <div class="summary-job-note">
+      <strong>Public-story readiness</strong>
+      <span>{data.summaryReadiness.ready} / {data.summaryReadiness.prompted} ready</span>
+      <span>{data.summaryReadiness.pending} pending</span>
+      <span>{data.summaryReadiness.failed} failed</span>
+      {#if data.summaryReadiness.fallbacks}<span>{data.summaryReadiness.fallbacks} fallback</span>{/if}
+      {#if data.summaryReadiness.ready < data.summaryReadiness.prompted && data.summaryReadiness.pending === 0}
+        <form method="POST" action="?/prepareSummaries" use:enhance><button>Generate private summaries</button></form>
+      {/if}
+      {#if data.summaryReadiness.ready === data.summaryReadiness.prompted && data.summaryReadiness.prompted > 0}
+        <a href={previewUrl}>Review summaries →</a>
+      {/if}
+    </div>
+    {#if data.summaryJobs.some((job: any) => job.status === 'failed')}
+      <details class="summary-errors">
+        <summary>Summary errors</summary>
+        <ul>
+          {#each data.summaryJobs.filter((job: any) => job.status === 'failed') as job}
+            <li><strong>{job.kind}</strong>: {job.error_detail || 'Unknown worker failure'}</li>
+          {/each}
+        </ul>
+      </details>
+    {/if}
     {#if data.summaryJobs.length}
-      <div class="summary-job-note">
-        <strong>Summary work</strong>
-        <span>{data.summaryJobs.filter((job: any) => ['queued', 'processing'].includes(job.status)).length} pending</span>
+      <div class="summary-job-note secondary-status">
+        <span>{data.summaryJobs.filter((job: any) => ['queued', 'processing'].includes(job.status)).length} worker jobs pending</span>
         <span>{data.summaryJobs.filter((job: any) => job.status === 'succeeded').length} complete</span>
-        <span>{data.summaryJobs.filter((job: any) => job.status === 'failed').length} failed</span>
         {#if data.summaryJobs.some((job: any) => job.kind === 'public' && job.status === 'failed')}
           <form method="POST" action="?/retrySummaries" use:enhance><button>Retry failed public stories</button></form>
         {/if}
@@ -179,7 +226,11 @@
     font: 400 10px/1.4 'JetBrains Mono', monospace;
   }
   .summary-job-note strong { color: var(--body); }
-  .summary-job-note button { color: var(--accent); text-decoration: underline; }
+  .summary-job-note button,
+  .summary-job-note a { color: var(--accent); text-decoration: underline; }
+  .secondary-status { margin-top: 8px; }
+  .summary-errors { margin-top: 12px; color: var(--danger); font-size: 13px; }
+  .summary-errors ul { margin-bottom: 0; }
   .shots {
     display: grid;
     grid-template-columns: repeat(2, 1fr);

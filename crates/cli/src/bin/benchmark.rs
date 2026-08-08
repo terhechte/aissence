@@ -238,9 +238,76 @@ fn stats_markdown(
     writeln!(markdown, "- Summarized groups: {summarized_groups}").unwrap();
     writeln!(markdown, "- User prompts: {}", history.prompt_count()).unwrap();
 
+    let summaries = history
+        .groups
+        .iter()
+        .filter_map(|group| group.summary.as_ref().map(|summary| (group, summary)))
+        .collect::<Vec<_>>();
+    let fallback_count = summaries
+        .iter()
+        .filter(|(_, summary)| summary.public.origin != aissence::SummaryOrigin::Model)
+        .count();
+    let zero_beat_count = summaries
+        .iter()
+        .filter(|(_, summary)| summary.public.beats.is_empty())
+        .count();
+    let title_overlap_count = summaries
+        .iter()
+        .filter(|(group, summary)| {
+            group.commit.as_ref().is_some_and(|commit| {
+                normalized_words(&commit.summary) == normalized_words(&summary.public.subline)
+            })
+        })
+        .count();
+    writeln!(markdown, "\n## Quality signals").unwrap();
+    writeln!(
+        markdown,
+        "\n- Metadata/privacy/parse fallbacks: {fallback_count}"
+    )
+    .unwrap();
+    writeln!(
+        markdown,
+        "- Stories with zero representative beats: {zero_beat_count}"
+    )
+    .unwrap();
+    writeln!(
+        markdown,
+        "- Sublines identical to commit titles: {title_overlap_count}"
+    )
+    .unwrap();
+    writeln!(
+        markdown,
+        "- Summary policy version: {}",
+        aissence::SUMMARIZER_VERSION
+    )
+    .unwrap();
+
     append_sample(&mut markdown, "First", find_prompt_sample(history, false));
     append_sample(&mut markdown, "Last", find_prompt_sample(history, true));
+    writeln!(markdown, "\n## Complete summary review").unwrap();
+    for (group, summary) in summaries {
+        let label = group
+            .commit
+            .as_ref()
+            .map(|commit| format!("{} — {}", commit.short_id, commit.summary))
+            .unwrap_or_else(|| "uncommitted work in progress".to_string());
+        writeln!(markdown, "\n### `{}`", escape_inline_code(&label)).unwrap();
+        writeln!(markdown, "\n- Origin: `{:?}`", summary.public.origin).unwrap();
+        writeln!(markdown, "- Subline: {}", summary.public.subline).unwrap();
+        append_quote(&mut markdown, &summary.public.summary);
+        for beat in &summary.public.beats {
+            writeln!(markdown, "\n- **{}:** {}", beat.label, beat.text).unwrap();
+        }
+    }
     markdown
+}
+
+fn normalized_words(text: &str) -> String {
+    text.split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 struct PromptSample<'a> {
@@ -391,12 +458,14 @@ mod tests {
     fn stats_include_public_story_and_beats() {
         let summary = CommitSummary {
             public: aissence::PublicStory {
+                subline: "A compelling compact overview.".into(),
                 summary: "Complete public overview".into(),
                 beats: vec![aissence::PublicBeat {
                     message_index: 0,
                     label: "Initial request".into(),
                     text: "A privacy-safe request paraphrase.".into(),
                 }],
+                origin: aissence::SummaryOrigin::Model,
             },
             ..Default::default()
         };

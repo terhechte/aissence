@@ -18,7 +18,7 @@ use crate::model::{
 };
 
 pub const DOCUMENT_VERSION: u32 = 2;
-pub const SANITIZER_VERSION: u32 = 1;
+pub const SANITIZER_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

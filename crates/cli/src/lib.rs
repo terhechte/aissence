@@ -55,7 +55,7 @@ pub use llm::{LlmApi, LlmConfig, LlmConfigOverrides};
 pub use model::{
     AgentUsage, CoalescedHistory, CodeChange, CommitFileChange, CommitFileStatus, CommitGroup,
     CommitInfo, CommitStats, CommitSummary, MessageKind, MessageSummary, PublicBeat, PublicStory,
-    TimedMessage, TokenCount, agents_for, friendly_agent,
+    SUMMARIZER_VERSION, SummaryOrigin, TimedMessage, TokenCount, agents_for, friendly_agent,
 };
 pub use persist::SummaryStore;
 pub use redact::Redactor;

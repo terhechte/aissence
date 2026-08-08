@@ -5,7 +5,14 @@ import type { Actions, PageServerLoad } from './$types';
 export const load: PageServerLoad = async ({ locals, params, parent }) => {
   const { claims } = await parent();
   const supabase = locals.supabase!;
-  const [{ data: project }, { data: screenshots }, { data: imports }, { count: commitCount }, { data: summaryJobs }] =
+  const [
+    { data: project },
+    { data: screenshots },
+    { data: imports },
+    { count: commitCount },
+    { data: summaryJobs },
+    { data: summaryCommits }
+  ] =
     await Promise.all([
       supabase
         .from('projects')
@@ -29,7 +36,11 @@ export const load: PageServerLoad = async ({ locals, params, parent }) => {
         .from('summary_jobs')
         .select('id,kind,status,error_detail,created_at,commits!inner(project_id)')
         .eq('commits.project_id', params.id)
-        .order('created_at', { ascending: false })
+        .order('created_at', { ascending: false }),
+      supabase
+        .from('commits')
+        .select('id,prompt_count,summary_status,summary_origin,public_story,public_subline,summarizer_version')
+        .eq('project_id', params.id)
     ]);
   if (!project) redirect(303, '/dashboard');
 
@@ -41,6 +52,17 @@ export const load: PageServerLoad = async ({ locals, params, parent }) => {
     signed = result.data ?? [];
   }
 
+  const promptedCommits = ((summaryCommits ?? []) as any[]).filter(
+    (commit) => Number(commit.prompt_count ?? 0) > 0
+  );
+  const readyCommits = promptedCommits.filter(
+    (commit) =>
+      commit.summary_status === 'succeeded' &&
+      Number(commit.summarizer_version ?? 0) >= 2 &&
+      String(commit.public_story ?? '').trim() &&
+      String(commit.public_subline ?? '').trim()
+  );
+
   return {
     project: {
       ...project,
@@ -48,6 +70,15 @@ export const load: PageServerLoad = async ({ locals, params, parent }) => {
     },
     imports: imports ?? [],
     summaryJobs: summaryJobs ?? [],
+    summaryReadiness: {
+      prompted: promptedCommits.length,
+      ready: readyCommits.length,
+      pending: promptedCommits.filter((commit) =>
+        ['queued', 'processing'].includes(commit.summary_status)
+      ).length,
+      failed: promptedCommits.filter((commit) => commit.summary_status === 'failed').length,
+      fallbacks: readyCommits.filter((commit) => commit.summary_origin !== 'model').length
+    },
     commitCount: commitCount ?? 0,
     screenshots: (screenshots ?? []).map((shot, index) => ({
       ...shot,
@@ -73,21 +104,17 @@ export const actions: Actions = {
     }
     return { saved: true };
   },
+  prepareSummaries: async ({ locals, params }) => {
+    const { data, error } = await locals.supabase!.rpc('enqueue_public_summary_jobs', {
+      p_project_id: params.id
+    });
+    if (error) return fail(400, { error: error.message });
+    return { summariesQueued: Number(data ?? 0) };
+  },
   publish: async ({ locals, params }) => {
-    const { data: imported } = await locals.supabase!
-      .from('imports')
-      .select('id')
-      .eq('project_id', params.id)
-      .in('status', ['succeeded', 'noop'])
-      .limit(1)
-      .maybeSingle();
-    if (!imported) {
-      return fail(400, { error: 'A successful import is required.' });
-    }
-    const { error } = await locals.supabase!
-      .from('projects')
-      .update({ visibility: 'published', published_at: new Date().toISOString() })
-      .eq('id', params.id);
+    const { error } = await locals.supabase!.rpc('publish_ready_project', {
+      p_project_id: params.id
+    });
     if (error) return fail(400, { error: error.message });
     return { published: true };
   },

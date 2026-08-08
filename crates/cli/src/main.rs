@@ -277,10 +277,15 @@ async fn summarize_local(folder: &Path, llm: LlmOptions, all_prompts: bool) -> R
         }
     };
     live_progress.finish(outcome.is_ok());
-    outcome.map_err(|error| error.to_string())?;
     store
-        .replace_from_groups(&history.groups)
+        .sync_groups(&history.groups)
         .map_err(|error| error.to_string())?;
+    outcome.map_err(|error| {
+        format!(
+            "{error}; successful summaries were preserved in {}",
+            store.path().display()
+        )
+    })?;
     let unpriced = if cost.unpriced_request_count == 0 {
         String::new()
     } else {
@@ -387,6 +392,15 @@ async fn upload_document(
                                     || message.subscriber_summary.is_some()
                             })
                     }),
+                    has_subline: commit
+                        .summary
+                        .as_ref()
+                        .is_some_and(|summary| !summary.public.subline.trim().is_empty()),
+                    summarizer_version: commit
+                        .summary
+                        .as_ref()
+                        .map(|summary| summary.summarizer_version)
+                        .unwrap_or(0),
                 })
                 .collect(),
         },

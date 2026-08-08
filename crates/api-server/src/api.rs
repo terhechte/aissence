@@ -568,14 +568,21 @@ async fn sync_plan(
     let revision = project_revision(&client, user.id, project_id).await?;
     let rows = client
         .query(
-            "select commit_hash, source_digest, summary_status::text, public_prompt_summaries \
+            "select commit_hash, source_digest, summary_status::text, public_prompt_summaries, \
+                    btrim(public_subline) <> '', coalesce(summarizer_version,0) \
              from public.commits where project_id = $1",
             &[&project_id],
         )
         .await?;
-    let remote: HashMap<String, (Option<String>, Option<String>, bool)> = rows
+    type RemoteCommitState = (Option<String>, Option<String>, bool, bool, i32);
+    let remote: HashMap<String, RemoteCommitState> = rows
         .into_iter()
-        .map(|row| (row.get(0), (row.get(1), row.get(2), row.get(3))))
+        .map(|row| {
+            (
+                row.get(0),
+                (row.get(1), row.get(2), row.get(3), row.get(4), row.get(5)),
+            )
+        })
         .collect();
     let mut seen = HashSet::new();
     let mut upload = Vec::new();
@@ -593,9 +600,16 @@ async fn sync_plan(
                 commit_hash: commit.commit_hash.clone(),
                 reason: UploadReason::Missing,
             }),
-            Some((digest, _status, public_prompts))
-                if digest.as_deref() == Some(commit.source_digest.as_str())
-                    && (!commit.all_prompts || *public_prompts) =>
+            Some((digest, _status, public_prompts, has_subline, summary_version))
+                if stored_commit_satisfies_upload(
+                    digest.as_deref() == Some(commit.source_digest.as_str()),
+                    commit.all_prompts,
+                    *public_prompts,
+                    commit.has_subline,
+                    *has_subline,
+                    commit.summarizer_version,
+                    *summary_version,
+                ) =>
             {
                 unchanged_count += 1;
             }
@@ -632,6 +646,25 @@ fn validate_manifest_commit(commit: &ManifestCommit) -> Result<(), ApiError> {
         )));
     }
     Ok(())
+}
+
+/// Whether the server already has everything represented by an incoming
+/// manifest entry. A source-only manifest deliberately has summary version 0:
+/// its source can be unchanged even while a draft has not generated summaries.
+fn stored_commit_satisfies_upload(
+    digest_matches: bool,
+    incoming_all_prompts: bool,
+    stored_public_prompts: bool,
+    incoming_has_subline: bool,
+    stored_has_subline: bool,
+    incoming_summary_version: u32,
+    stored_summary_version: i32,
+) -> bool {
+    digest_matches
+        && (!incoming_all_prompts || stored_public_prompts)
+        && (!incoming_has_subline || stored_has_subline)
+        && (incoming_summary_version == 0
+            || i64::from(stored_summary_version) >= i64::from(incoming_summary_version))
 }
 
 async fn create_import(
@@ -856,7 +889,11 @@ fn validate_summary(commit: &AissenceCommit, max_entry_chars: usize) -> Result<(
             .iter()
             .map(|beat| beat.label.chars().count() + beat.text.chars().count())
             .sum::<usize>();
-    if total_chars > 32_000 || summary.messages.len() != commit.source.messages.len() {
+    if summary.summarizer_version != aissence::SUMMARIZER_VERSION
+        || total_chars > 32_000
+        || summary.public.subline.chars().count() > 1_000
+        || summary.messages.len() != commit.source.messages.len()
+    {
         return Err(ApiError::Invalid(format!(
             "invalid local summary for {}",
             commit.commit_hash
@@ -903,7 +940,14 @@ fn validate_summary(commit: &AissenceCommit, max_entry_chars: usize) -> Result<(
             commit.commit_hash
         )));
     }
+    let mut seen_beats = std::collections::HashSet::new();
     if summary.public.summary.trim().is_empty()
+        || summary.public.subline.trim().is_empty()
+        || summary
+            .public
+            .subline
+            .trim()
+            .eq_ignore_ascii_case(commit.title.trim())
         || summary.public.beats.len() > 3
         || aissence::summarize::public_story_has_verbatim_prompt(
             &summary.public,
@@ -914,6 +958,7 @@ fn validate_summary(commit: &AissenceCommit, max_entry_chars: usize) -> Result<(
                 || commit.source.messages[beat.message_index].kind != MessageKind::UserWrote
                 || beat.label.trim().is_empty()
                 || beat.text.trim().is_empty()
+                || !seen_beats.insert(beat.message_index)
         })
     {
         return Err(ApiError::Invalid(format!(
@@ -921,7 +966,49 @@ fn validate_summary(commit: &AissenceCommit, max_entry_chars: usize) -> Result<(
             commit.commit_hash
         )));
     }
+    let all_prompt_summaries = summary
+        .messages
+        .iter()
+        .any(|message| message.kind == MessageKind::UserWrote)
+        && summary.messages.iter().all(|message| {
+            message.kind != MessageKind::UserWrote || message.subscriber_summary.is_some()
+        });
+    if all_prompt_summaries
+        && summary
+            .messages
+            .iter()
+            .zip(&commit.source.messages)
+            .any(|(generated, source)| {
+                generated.kind == MessageKind::UserWrote
+                    && generated.subscriber_summary.as_deref().is_some_and(|text| {
+                        let public = aissence::PublicStory {
+                            subline: text.to_string(),
+                            summary: "Safe placeholder.".into(),
+                            beats: Vec::new(),
+                            origin: aissence::SummaryOrigin::Model,
+                        };
+                        aissence::summarize::public_story_has_verbatim_prompt(
+                            &public,
+                            std::slice::from_ref(source),
+                        )
+                    })
+            })
+    {
+        return Err(ApiError::Invalid(format!(
+            "public prompt summary is too close to its source for {}",
+            commit.commit_hash
+        )));
+    }
     Ok(())
+}
+
+fn summary_origin_name(origin: aissence::SummaryOrigin) -> &'static str {
+    match origin {
+        aissence::SummaryOrigin::Model => "model",
+        aissence::SummaryOrigin::MetadataFallback => "metadata_fallback",
+        aissence::SummaryOrigin::ParseFallback => "parse_fallback",
+        aissence::SummaryOrigin::PrivacyFallback => "privacy_fallback",
+    }
 }
 
 fn validate_text(value: &str, max_chars: usize) -> Result<(), ApiError> {
@@ -1065,12 +1152,22 @@ async fn ingest_document(
                     message.kind != MessageKind::UserWrote || message.subscriber_summary.is_some()
                 })
         });
+        let incoming_subline = commit
+            .summary
+            .as_ref()
+            .is_some_and(|summary| !summary.public.subline.trim().is_empty());
+        let incoming_summary_version = commit
+            .summary
+            .as_ref()
+            .map(|summary| summary.summarizer_version)
+            .unwrap_or(0);
         let existing = transaction
             .query_opt(
                 "select c.id, c.source_digest, c.summary_status::text, \
                  exists(select 1 from public.summary_jobs sj where sj.commit_id=c.id \
                         and sj.status in ('queued','processing')), \
-                 c.public_prompt_summaries \
+                 c.public_prompt_summaries, btrim(c.public_subline) <> '', \
+                 coalesce(c.summarizer_version,0) \
                  from public.commits c \
                  where project_id = $1 and commit_hash = $2",
                 &[&project_id, &commit.commit_hash],
@@ -1078,7 +1175,8 @@ async fn ingest_document(
             .await?;
         if existing.as_ref().is_some_and(|row| {
             (row.get::<_, Option<String>>(1).as_deref() != Some(commit.source_digest.as_str())
-                || incoming_all_prompts)
+                || incoming_all_prompts
+                || incoming_subline)
                 && row.get::<_, bool>(3)
         }) {
             return Err(ApiError::Conflict(format!(
@@ -1087,8 +1185,15 @@ async fn ingest_document(
             )));
         }
         let unchanged = existing.as_ref().is_some_and(|row| {
-            row.get::<_, Option<String>>(1).as_deref() == Some(commit.source_digest.as_str())
-                && (!incoming_all_prompts || row.get::<_, bool>(4))
+            stored_commit_satisfies_upload(
+                row.get::<_, Option<String>>(1).as_deref() == Some(commit.source_digest.as_str()),
+                incoming_all_prompts,
+                row.get::<_, bool>(4),
+                incoming_subline,
+                row.get::<_, bool>(5),
+                incoming_summary_version,
+                row.get::<_, i32>(6),
+            )
         });
         if unchanged {
             let commit_id: Uuid = existing.expect("checked existing").get(0);
@@ -1114,7 +1219,13 @@ async fn ingest_document(
             .source
             .messages
             .iter()
-            .filter(|message| message.kind == MessageKind::UserWrote)
+            .filter(|message| {
+                message.kind == MessageKind::UserWrote
+                    && message
+                        .content
+                        .as_deref()
+                        .is_some_and(|content| !content.trim().is_empty())
+            })
             .count();
         let reply_count = commit
             .source
@@ -1152,19 +1263,21 @@ async fn ingest_document(
             .query_one(
                 "insert into public.commits \
                  (project_id, commit_hash, title, committed_at, files_changed, lines_added, \
-                  lines_deleted, public_story, public_beats, token_input, token_output, \
+                  lines_deleted, public_story, public_subline, public_beats, summary_origin, token_input, token_output, \
                   token_cache_read, token_cache_create, sort_order, source_digest, \
                   sanitizer_version, summarizer_version, summary_status, summarized_at, summary_error, \
                   prompt_count,reply_count,change_message_count,public_prompt_summaries) \
-                 values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::bigint,$11::bigint, \
-                         $12::bigint,$13::bigint,$14,$15,$16,$17, \
-                         $18::text::public.summary_job_status, \
-                         case when $18::text = 'succeeded' then now() end, null, \
-                         $19,$20,$21,$22) \
+                 values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::bigint,$13::bigint, \
+                         $14::bigint,$15::bigint,$16,$17,$18,$19, \
+                         $20::text::public.summary_job_status, \
+                         case when $20::text = 'succeeded' then now() end, null, \
+                         $21,$22,$23,$24) \
                  on conflict (project_id, commit_hash) do update set \
                   title=excluded.title, committed_at=excluded.committed_at, files_changed=excluded.files_changed, \
                   lines_added=excluded.lines_added, lines_deleted=excluded.lines_deleted, \
-                  public_story=excluded.public_story, public_beats=excluded.public_beats, token_input=excluded.token_input, \
+                  public_story=excluded.public_story, public_subline=excluded.public_subline, \
+                  summary_origin=excluded.summary_origin, \
+                  public_beats=excluded.public_beats, token_input=excluded.token_input, \
                   token_output=excluded.token_output, token_cache_read=excluded.token_cache_read, \
                   token_cache_create=excluded.token_cache_create, sort_order=excluded.sort_order, \
                   source_digest=excluded.source_digest, sanitizer_version=excluded.sanitizer_version, \
@@ -1183,11 +1296,15 @@ async fn ingest_document(
                     &u64_to_i64(commit.stats.lines_added)?,
                     &u64_to_i64(commit.stats.lines_deleted)?,
                     &summary.map(|s| s.public.summary.as_str()).unwrap_or(""),
+                    &summary.map(|s| s.public.subline.as_str()).unwrap_or(""),
                     &summary
                         .map(|s| serde_json::to_value(&s.public.beats))
                         .transpose()
                         .map_err(|error| ApiError::Internal(error.to_string()))?
                         .unwrap_or_else(|| serde_json::json!([])),
+                    &summary
+                        .map(|summary| summary_origin_name(summary.public.origin))
+                        .unwrap_or("pending"),
                     &optional_token(summary.and_then(|s| s.tokens), commit.source.tokens, |t| t.input)?,
                     &optional_token(summary.and_then(|s| s.tokens), commit.source.tokens, |t| t.output)?,
                     &optional_optional_token(summary.and_then(|s| s.tokens), commit.source.tokens, |t| t.cache_read)?,
@@ -1195,7 +1312,7 @@ async fn ingest_document(
                     &(sort_order as i32),
                     &commit.source_digest,
                     &(commit.sanitizer_version as i32),
-                    &summary.map(|_| 1i32),
+                    &summary.map(|summary| summary.summarizer_version as i32),
                     &status,
                     &(prompt_count as i32),
                     &(reply_count as i32),
@@ -1356,8 +1473,12 @@ async fn insert_source_rows(
             transaction
                 .execute(
                     "insert into public.message_summaries \
-                     (message_id,summary,summarizer_version) values ($1,$2,1)",
-                    &[&message_id, &subscriber_summary],
+                     (message_id,summary,summarizer_version) values ($1,$2,$3)",
+                    &[
+                        &message_id,
+                        &subscriber_summary,
+                        &(aissence::SUMMARIZER_VERSION as i32),
+                    ],
                 )
                 .await?;
         }
@@ -1577,6 +1698,31 @@ mod tests {
     }
 
     #[test]
+    fn source_only_sync_does_not_require_a_remote_summary() {
+        assert!(stored_commit_satisfies_upload(
+            true, false, false, false, false, 0, 0,
+        ));
+        assert!(!stored_commit_satisfies_upload(
+            true,
+            false,
+            false,
+            true,
+            false,
+            aissence::SUMMARIZER_VERSION,
+            0,
+        ));
+        assert!(stored_commit_satisfies_upload(
+            true,
+            false,
+            false,
+            true,
+            true,
+            aissence::SUMMARIZER_VERSION,
+            aissence::SUMMARIZER_VERSION as i32,
+        ));
+    }
+
+    #[test]
     fn slug_is_normalized() {
         assert_eq!(normalized_name(Some("  Demo  ")), "Demo");
     }
@@ -1611,9 +1757,12 @@ mod tests {
     fn upload_parser_rejects_empty_prompt_summaries_before_database_work() {
         let mut document = sample_document();
         document.commits[0].summary = Some(aissence::CommitSummary {
+            summarizer_version: aissence::SUMMARIZER_VERSION,
             public: aissence::PublicStory {
+                subline: "Documentation behavior was clarified.".into(),
                 summary: "The documentation was updated.".into(),
                 beats: Vec::new(),
+                origin: aissence::SummaryOrigin::Model,
             },
             messages: vec![aissence::MessageSummary {
                 kind: MessageKind::UserWrote,
@@ -1640,9 +1789,12 @@ mod tests {
         document.commits[0].source.messages[0].content = Some(" \n ".into());
         document.commits[0].source_digest = document.commits[0].calculate_source_digest();
         document.commits[0].summary = Some(aissence::CommitSummary {
+            summarizer_version: aissence::SUMMARIZER_VERSION,
             public: aissence::PublicStory {
+                subline: "An empty request was recorded.".into(),
                 summary: "An empty request entry was recorded.".into(),
                 beats: Vec::new(),
+                origin: aissence::SummaryOrigin::Model,
             },
             messages: vec![aissence::MessageSummary {
                 kind: MessageKind::UserWrote,
@@ -1664,6 +1816,31 @@ mod tests {
                 .as_deref(),
             Some(aissence::summarize::EMPTY_USER_SUMMARY)
         );
+    }
+
+    #[test]
+    fn upload_parser_rejects_empty_or_title_repeating_sublines() {
+        for subline in ["", "Test commit"] {
+            let mut document = sample_document();
+            document.commits[0].summary = Some(aissence::CommitSummary {
+                summarizer_version: aissence::SUMMARIZER_VERSION,
+                public: aissence::PublicStory {
+                    subline: subline.into(),
+                    summary: "The requested documentation behavior was clarified.".into(),
+                    beats: Vec::new(),
+                    origin: aissence::SummaryOrigin::Model,
+                },
+                messages: document.commits[0].source.messages.clone(),
+                agents: Vec::new(),
+                tokens: None,
+            });
+
+            let body = serde_json::to_vec(&document).unwrap();
+            assert!(matches!(
+                parse_upload(&test_config(), &body),
+                Err(ApiError::Invalid(detail)) if detail.contains("invalid public story")
+            ));
+        }
     }
 
     #[tokio::test]

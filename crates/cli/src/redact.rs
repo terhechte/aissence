@@ -49,6 +49,7 @@ impl Redactor {
     }
 
     pub fn redact_summary(&self, summary: &mut CommitSummary) {
+        summary.public.subline = self.redact_text(&summary.public.subline);
         summary.public.summary = self.redact_text(&summary.public.summary);
         for beat in &mut summary.public.beats {
             beat.label = self.redact_text(&beat.label);

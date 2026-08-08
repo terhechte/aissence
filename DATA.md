@@ -17,7 +17,7 @@ manually without another model call.
     {
       "commit_hash": "40 lowercase hexadecimal characters",
       "source_digest": "sha256:...",
-      "sanitizer_version": 1,
+      "sanitizer_version": 2,
       "title": "Add server sync",
       "body": null,
       "date": "2026-08-01T12:00:00Z",
@@ -68,26 +68,31 @@ redaction upgrades explicit synchronization changes.
 `summary` is absent or `null` until generated. When present it contains:
 
 - `public.summary`: the single privacy-safe commit narrative
+- `public.subline`: the compact summary shown beneath the commit title
 - `public.beats`: zero to three representative, paraphrased prompt moments
+- `public.origin`: `model` or the explicit metadata/parse/privacy fallback used
+- `summarizer_version`: the prompt, evidence, and validation policy version
 - chronological `messages`; `subscriber_summary` is optional and only valid on
   `UserWrote` entries
 - `agents` and `tokens`
 
 The summary message list must have the same length and kinds as `source.messages`.
-Normal public generation makes exactly one model request per commit and leaves
-every `subscriber_summary` absent. Subscriber summaries are normally a separate
+Normal public generation makes one request per commit for the story, subline,
+and beats together, and leaves every `subscriber_summary` absent. Subscriber summaries are normally a separate
 on-demand tier; `--all-prompts` is the explicit exception that publishes a
 complete locally generated set.
 
 ## Hosted generation lifecycle
 
 Uploading stores sanitized source and completes the import immediately. Draft
-projects do not create public summary jobs. Publishing queues one public-story
-job for each unsummarized commit. The public job receives bounded evidence: the
-first and final user prompts, at most two longer intermediate prompts, the full
-final assistant reply, and a metadata-only git fingerprint. Complete selected
-entries are assembled without per-entry truncation and the final prompt is
-bounded to 32,000 characters. Diff bodies are not sent for public summarization.
+projects do not create public summary jobs automatically. A creator explicitly
+generates and reviews private summaries before publishing; publication is
+blocked while prompted commits are pending, failed, incomplete, or outdated.
+The public job receives separately bounded evidence: first/final user prompts,
+up to two correction-like intermediate prompts, the bounded final assistant
+reply, and a metadata-only git fingerprint. The sections reserve 16,000,
+7,000, and 7,000 characters respectively inside a 32,000-character ceiling.
+Oversized entries retain both ends. Diff bodies are not sent.
 
 Local generation with `--all-prompts` additionally fills every user message's
 `subscriber_summary`. When a complete set is uploaded, those summaries are
@@ -98,7 +103,9 @@ The first active or trialing subscriber for a creator queues subscriber jobs for
 the creator's published commits. Those jobs summarize every user prompt in
 batches of at most eight/6,000 characters; prompts of 200 characters or fewer
 are copied without a model request because the entitled reader may already read
-the complete source. Later imports queue both tiers only when the creator still
+the complete source. Batch responses carry the original message indexes and
+are rejected if their order/shape cannot be matched. Subscriber work never
+rewrites public copy. Later imports queue both tiers only when the creator still
 has an active subscriber.
 
 ## Redaction

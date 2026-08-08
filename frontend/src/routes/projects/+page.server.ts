@@ -1,4 +1,5 @@
 import type { PageServerLoad } from './$types';
+import { attachProjectOverviews } from '$lib/server/project-overviews';
 
 export const load: PageServerLoad = async ({ locals }) => {
   if (!locals.supabase) return { projects: [], configured: false };
@@ -12,11 +13,12 @@ export const load: PageServerLoad = async ({ locals }) => {
     .order('published_at', { ascending: false })
     .limit(100);
 
-  return {
-    projects: (data ?? []).map((project) => ({
+  const projects = (data ?? []).map((project) => ({
       ...project,
       profiles: Array.isArray(project.profiles) ? project.profiles[0] : project.profiles
-    })),
+    }));
+  return {
+    projects: await attachProjectOverviews(locals.supabase, projects),
     configured: true
   };
 };
