@@ -1,4 +1,5 @@
-//! Discovering and loading AI-agent session logs for a folder.
+//! Discovering and loading AI-agent session logs for one or more project
+//! folders.
 //!
 //! Session logs do not live inside the project folder; each agent stores them
 //! in its own external location (e.g. Claude Code under `~/.claude/projects/…`).
@@ -20,6 +21,7 @@
 //! sessions are matched best-effort (only when they reference the path in their
 //! contents).
 
+use std::collections::HashSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -94,6 +96,59 @@ fn collect_session_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// Because scoping happens *before* parsing, unrelated logs from other projects
 /// neither pollute the result nor generate warning noise.
 pub fn load_sessions(folder: &Path) -> LoadedSessions {
+    let folders = [folder.to_path_buf()];
+    load_sessions_for_folders(&folders)
+}
+
+/// Load and merge sessions for several corresponding project folders, such as
+/// the main checkout and its linked Git worktrees.
+///
+/// Some agents store sessions globally and are therefore scanned once per
+/// folder. Results are deduplicated by source path, format, and session ID
+/// before being returned; this preserves distinct sessions stored in one
+/// SQLite database.
+pub fn load_sessions_for_folders(folders: &[PathBuf]) -> LoadedSessions {
+    let mut sessions = Vec::new();
+    let mut session_keys = HashSet::new();
+    let mut warnings = Vec::new();
+    let mut warning_set = HashSet::new();
+
+    for folder in folders {
+        let loaded = load_sessions_for_folder(folder);
+        for session in loaded.sessions {
+            if session_keys.insert(session_key(&session)) {
+                sessions.push(session);
+            }
+        }
+        for warning in loaded.warnings {
+            if warning_set.insert(warning.clone()) {
+                warnings.push(warning);
+            }
+        }
+    }
+
+    sessions.sort_by(|a, b| {
+        a.metadata
+            .timestamp
+            .cmp(&b.metadata.timestamp)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+
+    LoadedSessions { sessions, warnings }
+}
+
+fn session_key(session: &ncs::Session) -> (PathBuf, String, Option<String>) {
+    (
+        session
+            .path
+            .canonicalize()
+            .unwrap_or_else(|_| session.path.clone()),
+        session.format.clone(),
+        session.metadata.session_id.clone(),
+    )
+}
+
+fn load_sessions_for_folder(folder: &Path) -> LoadedSessions {
     let needles = folder_path_needles(folder);
 
     let mut sessions = Vec::new();
@@ -150,13 +205,6 @@ pub fn load_sessions(folder: &Path) -> LoadedSessions {
     sessions.extend(loaded_vscode.sessions);
     warnings.extend(loaded_vscode.warnings);
 
-    sessions.sort_by(|a, b| {
-        a.metadata
-            .timestamp
-            .cmp(&b.metadata.timestamp)
-            .then_with(|| a.path.cmp(&b.path))
-    });
-
     LoadedSessions { sessions, warnings }
 }
 
@@ -195,4 +243,64 @@ fn file_references_folder(path: &Path, needles: &[String]) -> bool {
     needles
         .iter()
         .any(|needle| haystack.contains(needle.as_str()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("aissence-sessions-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn loads_sessions_from_linked_scopes_and_deduplicates_repeated_scopes() {
+        let main = tmp_dir("worktree");
+        let linked = main.join("linked");
+        std::fs::create_dir_all(linked.join(".normalize/agent/logs")).unwrap();
+        let linked = linked.canonicalize().unwrap();
+        let log = linked.join(".normalize/agent/logs/session.jsonl");
+        let log_text = format!(
+            "{{\"event\":\"session_start\",\"session_id\":\"s1\",\
+             \"timestamp\":\"2026-01-01T00:00:00Z\",\"moss_root\":{}}}\n\
+             {{\"event\":\"task\",\"user_prompt\":\"prompt from worktree\"}}\n",
+            serde_json::to_string(&linked.to_string_lossy()).unwrap()
+        );
+        std::fs::write(&log, log_text).unwrap();
+
+        assert!(discover_session_files(&linked).contains(&log));
+        let raw_log = std::fs::read_to_string(&log).unwrap();
+        assert!(raw_log.contains(linked.to_string_lossy().as_ref()));
+        assert!(raw_log.contains(&format!("{}\"", linked.display())));
+        assert!(file_references_folder(&log, &folder_path_needles(&linked)));
+
+        let folders = [main.clone(), linked.clone(), linked.clone()];
+        let loaded = load_sessions_for_folders(&folders);
+
+        assert!(loaded.warnings.is_empty());
+        assert_eq!(loaded.sessions.len(), 1);
+        assert_eq!(loaded.sessions[0].format, "normalize");
+        assert_eq!(
+            loaded.sessions[0].metadata.session_id.as_deref(),
+            Some("s1")
+        );
+        assert_eq!(loaded.sessions[0].path, log.canonicalize().unwrap());
+
+        std::fs::remove_dir_all(&main).ok();
+    }
+
+    #[test]
+    fn session_key_keeps_shared_store_sessions_distinct() {
+        let path = PathBuf::from("/tmp/shared-sessions.db");
+        let mut first = ncs::Session::new(path.clone(), "opencode");
+        first.metadata.session_id = Some("first".into());
+        let mut second = ncs::Session::new(path, "opencode");
+        second.metadata.session_id = Some("second".into());
+
+        assert_ne!(session_key(&first), session_key(&second));
+    }
 }

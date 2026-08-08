@@ -37,6 +37,9 @@ There are two places where the same public summarizer can run:
 - Discovers supported coding-agent session files associated with the project.
   Current parsers include Claude Code, Codex, OpenCode, Kimi CLI, Gemini/Pi-like
   formats, Amp, Crush, Antigravity, and VS Code Copilot.
+- For a Git repository, session discovery covers the main checkout and linked
+  worktrees at the corresponding relative path. Commit history remains the
+  reachable history of the analyzed checkout's `HEAD`.
 - Normalizes those different formats into timestamped roles, text, tool calls,
   agent/model provenance, and token usage when the source reports it.
 

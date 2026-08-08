@@ -1,7 +1,7 @@
 //! Reading a folder's commit history via [`gix`].
 
-use std::collections::HashSet;
-use std::path::Path;
+use std::collections::{BTreeSet, HashSet};
+use std::path::{Path, PathBuf};
 
 use chrono::DateTime;
 use serde::{Deserialize, Serialize};
@@ -38,6 +38,67 @@ pub fn project_metadata(folder: &Path) -> Option<ProjectMetadata> {
     let repository = remote_repository(&repo);
 
     (name.is_some() || repository.is_some()).then_some(ProjectMetadata { name, repository })
+}
+
+/// Return the corresponding analysis path in every checkout of the repository
+/// containing `folder`.
+///
+/// The main worktree and all linked worktrees are included. If `folder` is a
+/// subdirectory of a worktree, the same relative subdirectory is returned for
+/// every checkout. This lets session loaders use the actual path recorded by
+/// an agent while keeping `analyze()` scoped to the caller's original folder.
+///
+/// Missing or inaccessible linked worktrees are ignored. If the repository
+/// cannot be discovered, the canonicalized input folder is returned so callers
+/// retain the normal single-folder behavior.
+pub fn worktree_scopes(folder: &Path) -> Vec<PathBuf> {
+    let input = folder
+        .canonicalize()
+        .unwrap_or_else(|_| folder.to_path_buf());
+    let Ok(repo) = gix::discover(folder) else {
+        return vec![input];
+    };
+
+    let current_root = repo
+        .workdir()
+        .map(|path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
+    let relative = current_root
+        .as_deref()
+        .and_then(|root| input.strip_prefix(root).ok())
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+
+    let mut roots = Vec::new();
+    if let Some(workdir) = repo.workdir() {
+        roots.push(workdir.to_path_buf());
+    }
+    if let Ok(main_repo) = repo.main_repo()
+        && let Some(workdir) = main_repo.workdir()
+    {
+        roots.push(workdir.to_path_buf());
+    }
+    if let Ok(worktrees) = repo.worktrees() {
+        for worktree in worktrees {
+            if let Ok(workdir) = worktree.base() {
+                roots.push(workdir);
+            }
+        }
+    }
+
+    let scopes = roots
+        .into_iter()
+        .map(|root| root.canonicalize().unwrap_or(root))
+        .map(|root| root.join(&relative))
+        .filter(|path| path.is_dir())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    if scopes.is_empty() {
+        vec![input]
+    } else {
+        scopes
+    }
 }
 
 fn remote_repository(repo: &gix::Repository) -> Option<String> {
@@ -418,6 +479,51 @@ mod tests {
             Some("git.example.test/team/aissence".into())
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn worktree_scopes_include_main_linked_and_corresponding_subdirectories() {
+        let dir = tmp_dir("worktree-scopes");
+        let linked = dir.with_file_name(format!(
+            "{}-linked",
+            dir.file_name().unwrap().to_string_lossy()
+        ));
+        let _ = std::fs::remove_dir_all(&linked);
+
+        git(&dir, &["init", "-q"]);
+        git(&dir, &["config", "user.name", "Tester"]);
+        git(&dir, &["config", "user.email", "tester@example.com"]);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "Initial source"]);
+        git(
+            &dir,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                linked.to_str().unwrap(),
+            ],
+        );
+
+        let main = dir.canonicalize().unwrap();
+        let linked = linked.canonicalize().unwrap();
+        let scopes = worktree_scopes(&dir);
+        assert!(scopes.contains(&main));
+        assert!(scopes.contains(&linked));
+
+        let nested_scopes = worktree_scopes(&dir.join("src"));
+        assert!(nested_scopes.contains(&main.join("src")));
+        assert!(nested_scopes.contains(&linked.join("src")));
+
+        git(
+            &dir,
+            &["worktree", "remove", "--force", linked.to_str().unwrap()],
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -39,6 +39,11 @@ cargo run -p aissence -- summarize --mode server /path/to/project
 cargo run -p aissence -- upload /path/to/project/.aissence
 ```
 
+When analyzing a Git repository, Aissence also scans the corresponding folders
+in its main and linked worktrees for agent sessions. Commit history remains
+anchored to the `HEAD` of the folder being analyzed, so merged and rebased
+worktree changes appear in the normal project history.
+
 Credentials from browser login are stored in the operating system credential
 store. Login uses a one-time device authorization page on the frontend origin,
 so an existing dashboard session can approve the CLI without another sign-in.

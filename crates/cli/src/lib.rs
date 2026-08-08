@@ -74,7 +74,8 @@ pub use normalize_chat_sessions as ncs;
 /// correlate the two into a [`CoalescedHistory`].
 ///
 /// `folder` may be the repository root or any path inside it; the enclosing git
-/// repository is discovered automatically.
+/// repository is discovered automatically. Session discovery also covers the
+/// corresponding path in the repository's main and linked worktrees.
 pub fn analyze(folder: impl AsRef<Path>) -> Result<CoalescedHistory, Error> {
     let folder = folder.as_ref();
     if !folder.exists() {
@@ -82,7 +83,8 @@ pub fn analyze(folder: impl AsRef<Path>) -> Result<CoalescedHistory, Error> {
     }
 
     let commits = git::commit_log(folder)?;
-    let loaded = sessions::load_sessions(folder);
+    let scopes = git::worktree_scopes(folder);
+    let loaded = sessions::load_sessions_for_folders(&scopes);
     Ok(coalesce::coalesce(
         folder.to_path_buf(),
         commits,
