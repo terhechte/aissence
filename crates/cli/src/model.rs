@@ -386,6 +386,18 @@ pub struct PublicStory {
     pub origin: SummaryOrigin,
 }
 
+/// One prompt summary that remained unresolved after batch and individual
+/// retries. Successful sibling prompts stay cached; a future local run can
+/// retry this exact message with a different model.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PromptSummaryFailure {
+    pub message_index: usize,
+    pub model: String,
+    pub error: String,
+    pub attempted_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Generated data for what went into a commit.
 ///
 /// Public generation produces exactly one [`PublicStory`] and copies the
@@ -410,6 +422,9 @@ pub struct CommitSummary {
     /// usage for this commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens: Option<TokenCount>,
+    /// Unresolved per-prompt work from an `--all-prompts` or subscriber run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prompt_failures: Vec<PromptSummaryFailure>,
 }
 
 const fn legacy_summarizer_version() -> u32 {
@@ -424,6 +439,7 @@ impl Default for CommitSummary {
             messages: Vec::new(),
             agents: Vec::new(),
             tokens: None,
+            prompt_failures: Vec::new(),
         }
     }
 }

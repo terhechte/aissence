@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, IsTerminal, Write};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use aissence::{SummarizationProgress, SummarizationRequestKind};
 use terminal_size::{Width, terminal_size};
@@ -35,6 +35,15 @@ struct RequestState {
     status: RequestStatus,
     tokens: usize,
     started: Instant,
+    finished: Option<Instant>,
+}
+
+impl RequestState {
+    fn elapsed(&self) -> Duration {
+        self.finished
+            .unwrap_or_else(Instant::now)
+            .saturating_duration_since(self.started)
+    }
 }
 
 /// An animated dashboard for the requests emitted by the summarizer.
@@ -81,12 +90,14 @@ impl LiveProgress {
                     .and_modify(|state| {
                         state.status = RequestStatus::InFlight;
                         state.kind = kind;
+                        state.finished = None;
                     })
                     .or_insert(RequestState {
                         kind,
                         status: RequestStatus::InFlight,
                         tokens: 0,
                         started: Instant::now(),
+                        finished: None,
                     });
             }
             SummarizationProgress::TokensReceived { id, tokens } => {
@@ -106,12 +117,14 @@ impl LiveProgress {
                     .and_modify(|state| {
                         state.status = RequestStatus::Retrying(attempt);
                         state.kind = kind;
+                        state.finished = None;
                     })
                     .or_insert(RequestState {
                         kind,
                         status: RequestStatus::Retrying(attempt),
                         tokens: 0,
                         started: Instant::now(),
+                        finished: None,
                     });
             }
             SummarizationProgress::Completed { id, kind, usage } => {
@@ -121,9 +134,11 @@ impl LiveProgress {
                     status: RequestStatus::Completed,
                     tokens: 0,
                     started: Instant::now(),
+                    finished: None,
                 });
                 state.kind = kind;
                 state.status = RequestStatus::Completed;
+                state.finished = Some(Instant::now());
                 if let Some(usage) = usage {
                     state.tokens = usage.completion_tokens as usize;
                 }
@@ -135,9 +150,11 @@ impl LiveProgress {
                     status: RequestStatus::Failed,
                     tokens: 0,
                     started: Instant::now(),
+                    finished: None,
                 });
                 state.kind = kind;
                 state.status = RequestStatus::Failed;
+                state.finished = Some(Instant::now());
                 self.recent_failures.push_front((id, error));
                 self.recent_failures.truncate(3);
             }
@@ -244,8 +261,16 @@ impl LiveProgress {
             Some(false) => ('■', "Stopped", RED),
             None => (spinner, "Working…", GREEN),
         };
+        let (tokens_per_second, average_latency) = self.performance_metrics();
+        let tokens_per_second = tokens_per_second
+            .map(|value| format!("{value:.1}"))
+            .unwrap_or_else(|| "—".to_string());
+        let average_latency = average_latency
+            .map(|value| format!("{value:.1}s"))
+            .unwrap_or_else(|| "—".to_string());
+        let performance = format!(" · {tokens_per_second} tok/s · {average_latency} avg latency");
         let metrics = format!(
-            "{active} active · {completed} done · {failed} errors · {} tok",
+            "{active} active · {completed} done · {failed} errors · {} tok{performance}",
             format_count(total_tokens)
         );
         let left = format!(" {status_icon} {status_label} ");
@@ -265,7 +290,7 @@ impl LiveProgress {
     }
 
     fn request_cell(&self, id: usize, state: &RequestState, width: usize) -> String {
-        let elapsed = state.started.elapsed().as_secs_f64();
+        let elapsed = state.elapsed().as_secs_f64();
         let bar_width = match width {
             0..=31 => 4,
             32..=43 => 6,
@@ -326,6 +351,46 @@ impl LiveProgress {
 
     fn total_tokens(&self) -> usize {
         self.requests.values().map(|state| state.tokens).sum()
+    }
+
+    /// Return current aggregate output throughput and mean completed-request
+    /// latency. Active streaming estimates participate in throughput so it
+    /// updates before the first request finishes. Summing request durations
+    /// keeps concurrency from inflating the per-request generation rate.
+    fn performance_metrics(&self) -> (Option<f64>, Option<f64>) {
+        let measured = self
+            .requests
+            .values()
+            .filter(|state| state.status != RequestStatus::Failed)
+            .collect::<Vec<_>>();
+        let measured_seconds = measured
+            .iter()
+            .map(|state| state.elapsed().as_secs_f64())
+            .sum::<f64>();
+        let measured_tokens = measured.iter().map(|state| state.tokens).sum::<usize>();
+        let tokens_per_second = if measured.is_empty() || measured_seconds <= 0.0 {
+            None
+        } else {
+            Some(measured_tokens as f64 / measured_seconds)
+        };
+
+        let completed = measured
+            .iter()
+            .filter(|state| state.status == RequestStatus::Completed)
+            .copied()
+            .collect::<Vec<_>>();
+        let average_latency = if completed.is_empty() {
+            None
+        } else {
+            Some(
+                completed
+                    .iter()
+                    .map(|state| state.elapsed().as_secs_f64())
+                    .sum::<f64>()
+                    / completed.len() as f64,
+            )
+        };
+        (tokens_per_second, average_latency)
     }
 
     fn assign_slot(&mut self, id: usize) {
@@ -588,6 +653,35 @@ mod tests {
         assert_eq!(live.slots, vec![Some(3), Some(2)]);
         let grid = &live.dashboard_lines(100)[1];
         assert!(grid.find("003").unwrap() < grid.find("002").unwrap());
+    }
+
+    #[test]
+    fn dashboard_reports_average_token_rate_and_latency_for_completed_requests() {
+        let mut live = test_live_progress();
+        for (id, tokens, elapsed) in [(1, 100, 2.0), (2, 200, 4.0)] {
+            live.handle(SummarizationProgress::Started {
+                id,
+                kind: SummarizationRequestKind::PublicStory,
+            });
+            live.handle(SummarizationProgress::Completed {
+                id,
+                kind: SummarizationRequestKind::PublicStory,
+                usage: Some(SummarizationRequestUsage {
+                    prompt_tokens: 10,
+                    completion_tokens: tokens,
+                    total_tokens: tokens + 10,
+                    cost: None,
+                }),
+            });
+            let state = live.requests.get_mut(&id).unwrap();
+            let started = Instant::now();
+            state.started = started;
+            state.finished = Some(started + Duration::from_secs_f64(elapsed));
+        }
+
+        let footer = live.dashboard_lines(140).pop().unwrap();
+        assert!(footer.contains("50.0 tok/s"));
+        assert!(footer.contains("3.0s avg latency"));
     }
 
     #[test]

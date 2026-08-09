@@ -74,7 +74,13 @@ export const commitSummarySchema = z.object({
   }),
   messages: z.array(messageSchema),
   agents: z.array(agentSchema).default([]),
-  tokens: tokenCountSchema.optional()
+  tokens: tokenCountSchema.optional(),
+  prompt_failures: z.array(z.object({
+    message_index: unsignedInteger,
+    model: z.string().trim().min(1),
+    error: z.string().trim().min(1),
+    attempted_at: rfc3339
+  }).strict()).default([])
 });
 
 export const commitEntrySchema = z.object({

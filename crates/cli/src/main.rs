@@ -70,6 +70,9 @@ enum Command {
         /// Locally generate a summary for every user prompt as well.
         #[arg(long)]
         all_prompts: bool,
+        /// Write every outbound LLM request to /tmp as Markdown.
+        #[arg(long)]
+        debug: bool,
         #[command(flatten)]
         llm: LlmOptions,
     },
@@ -189,14 +192,16 @@ async fn run() -> Result<(), String> {
             folder,
             mode: Mode::Local,
             all_prompts,
+            debug,
             llm,
             ..
-        } => summarize_local(&folder, llm, all_prompts).await,
+        } => summarize_local(&folder, llm, all_prompts, debug).await,
         Command::Summarize {
             folder,
             mode: Mode::Server,
             server,
             all_prompts,
+            debug,
             llm,
             ..
         } => {
@@ -205,6 +210,9 @@ async fn run() -> Result<(), String> {
             }
             if !llm.is_empty() {
                 return Err("local LLM options cannot be used with --mode server".to_string());
+            }
+            if debug {
+                return Err("--debug can only be used with --mode local".to_string());
             }
             sync_folder(&folder, &server).await
         }
@@ -227,7 +235,12 @@ fn analyze_to_file(folder: &Path) -> Result<(), String> {
     Ok(())
 }
 
-async fn summarize_local(folder: &Path, llm: LlmOptions, all_prompts: bool) -> Result<(), String> {
+async fn summarize_local(
+    folder: &Path,
+    llm: LlmOptions,
+    all_prompts: bool,
+    debug: bool,
+) -> Result<(), String> {
     let mut history = analyze(folder).map_err(|error| error.to_string())?;
     let mut store = SummaryStore::load(folder);
     for group in &mut history.groups {
@@ -240,7 +253,11 @@ async fn summarize_local(folder: &Path, llm: LlmOptions, all_prompts: bool) -> R
     let config_path = llm.llm_config.clone();
     let config = LlmConfig::load(folder, config_path.as_deref(), llm.overrides())
         .map_err(|error| error.to_string())?;
-    let summarizer = Summarizer::from_config(config).map_err(|error| error.to_string())?;
+    let mut summarizer = Summarizer::from_config(config).map_err(|error| error.to_string())?;
+    if debug {
+        summarizer = summarizer.with_debug_requests();
+        eprintln!("Debug request logging enabled: /tmp/aissence-req-[timestamp]-[uuid].md");
+    }
     let (progress_sender, mut progress_receiver) = mpsc::unbounded_channel();
     let summarizer = summarizer.with_progress(move |event| {
         let _ = progress_sender.send(event);

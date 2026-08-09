@@ -184,13 +184,43 @@ impl AissenceDocument {
     pub fn merge_summaries(&mut self, delta: &Self) -> usize {
         let mut merged = 0;
         for incoming in &delta.commits {
-            let Some(summary) = incoming.summary.clone() else {
+            let Some(mut summary) = incoming.summary.clone() else {
                 continue;
             };
             if let Some(local) = self.commits.iter_mut().find(|local| {
                 local.commit_hash == incoming.commit_hash
                     && local.source_digest == incoming.source_digest
             }) {
+                if let Some(existing) = &local.summary
+                    && existing.messages.len() == summary.messages.len()
+                {
+                    for (incoming, existing) in summary.messages.iter_mut().zip(&existing.messages)
+                    {
+                        if incoming.subscriber_summary.is_none() {
+                            incoming.subscriber_summary = existing.subscriber_summary.clone();
+                        }
+                    }
+                    let mut failures = summary.prompt_failures.clone();
+                    for failure in &existing.prompt_failures {
+                        if summary
+                            .messages
+                            .get(failure.message_index)
+                            .is_some_and(|message| message.subscriber_summary.is_none())
+                            && !failures
+                                .iter()
+                                .any(|incoming| incoming.message_index == failure.message_index)
+                        {
+                            failures.push(failure.clone());
+                        }
+                    }
+                    summary.prompt_failures = failures;
+                }
+                summary.prompt_failures.retain(|failure| {
+                    summary
+                        .messages
+                        .get(failure.message_index)
+                        .is_some_and(|message| message.subscriber_summary.is_none())
+                });
                 local.summary = Some(summary);
                 merged += 1;
             }
@@ -249,5 +279,82 @@ mod tests {
             "ignored": []
         });
         assert!(serde_json::from_value::<AissenceDocument>(value).is_err());
+    }
+
+    #[test]
+    fn summary_delta_preserves_partial_local_prompt_work_until_remote_completion() {
+        let project = AissenceProject::new(None);
+        let message = MessageSummary {
+            kind: crate::model::MessageKind::UserWrote,
+            subscriber_summary: None,
+            content: Some("A prompt".into()),
+            changes: Vec::new(),
+            timestamp: None,
+            tokens: None,
+        };
+        let mut commit = AissenceCommit {
+            commit_hash: "a".repeat(40),
+            source_digest: String::new(),
+            sanitizer_version: SANITIZER_VERSION,
+            title: "test".into(),
+            body: None,
+            date: DateTime::UNIX_EPOCH,
+            stats: CommitStats::default(),
+            files: Vec::new(),
+            source: CommitSource {
+                messages: vec![message.clone()],
+                agents: Vec::new(),
+                tokens: None,
+            },
+            summary: Some(CommitSummary {
+                messages: vec![message.clone()],
+                prompt_failures: vec![crate::model::PromptSummaryFailure {
+                    message_index: 0,
+                    model: "small/model".into(),
+                    error: "empty response".into(),
+                    attempted_at: DateTime::UNIX_EPOCH,
+                }],
+                ..CommitSummary::default()
+            }),
+        };
+        commit.source_digest = commit.calculate_source_digest();
+        let mut local = AissenceDocument {
+            version: DOCUMENT_VERSION,
+            project: project.clone(),
+            commits: vec![commit.clone()],
+            ignored: BTreeSet::new(),
+        };
+        let mut incoming = commit;
+        incoming.summary = Some(CommitSummary {
+            messages: vec![message],
+            ..CommitSummary::default()
+        });
+        let mut delta = AissenceDocument {
+            version: DOCUMENT_VERSION,
+            project,
+            commits: vec![incoming],
+            ignored: BTreeSet::new(),
+        };
+
+        assert_eq!(local.merge_summaries(&delta), 1);
+        assert_eq!(
+            local.commits[0]
+                .summary
+                .as_ref()
+                .unwrap()
+                .prompt_failures
+                .len(),
+            1
+        );
+
+        delta.commits[0].summary.as_mut().unwrap().messages[0].subscriber_summary =
+            Some("A completed summary.".into());
+        assert_eq!(local.merge_summaries(&delta), 1);
+        let summary = local.commits[0].summary.as_ref().unwrap();
+        assert_eq!(
+            summary.messages[0].subscriber_summary.as_deref(),
+            Some("A completed summary.")
+        );
+        assert!(summary.prompt_failures.is_empty());
     }
 }

@@ -275,11 +275,32 @@ mod tests {
     fn writes_version_two_and_omits_author_identity() {
         let dir = directory("write");
         let mut store = SummaryStore::load(&dir);
-        store.replace_from_groups(&[group()]).unwrap();
+        let mut group = group();
+        group
+            .summary
+            .as_mut()
+            .unwrap()
+            .prompt_failures
+            .push(crate::model::PromptSummaryFailure {
+                message_index: 0,
+                model: "example/model".into(),
+                error: "JSON shape mismatch".into(),
+                attempted_at: Utc.timestamp_opt(1_700_000_001, 0).unwrap(),
+            });
+        store.replace_from_groups(&[group]).unwrap();
         let text = std::fs::read_to_string(dir.join(CACHE_FILE)).unwrap();
         let document: AissenceDocument = serde_json::from_str(&text).unwrap();
         assert_eq!(document.version, crate::document::DOCUMENT_VERSION);
         assert_eq!(document.commits.len(), 1);
+        assert_eq!(
+            document.commits[0]
+                .summary
+                .as_ref()
+                .unwrap()
+                .prompt_failures[0]
+                .model,
+            "example/model"
+        );
         assert!(!text.contains("secret@example.test"));
         std::fs::remove_dir_all(dir).ok();
     }

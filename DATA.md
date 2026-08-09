@@ -74,6 +74,8 @@ redaction upgrades explicit synchronization changes.
 - `summarizer_version`: the prompt, evidence, and validation policy version
 - chronological `messages`; `subscriber_summary` is optional and only valid on
   `UserWrote` entries
+- `prompt_failures`: unresolved message indexes with the attempted model,
+  validation/upstream error, and attempt timestamp
 - `agents` and `tokens`
 
 The summary message list must have the same length and kinds as `source.messages`.
@@ -104,9 +106,12 @@ the creator's published commits. Those jobs summarize every user prompt in
 batches of at most eight/6,000 characters; prompts of 200 characters or fewer
 are copied without a model request because the entitled reader may already read
 the complete source. Batch responses carry the original message indexes and
-are rejected if their order/shape cannot be matched. Subscriber work never
-rewrites public copy. Later imports queue both tiers only when the creator still
-has an active subscriber.
+use a strict JSON schema on OpenRouter. Shape, count, index, empty-output, and
+privacy-overlap failures are reported separately. A failed multi-prompt batch
+falls back to individual requests; successful siblings are stored even when
+another prompt remains unresolved. Subscriber work never rewrites public copy.
+Later imports queue both tiers only when the creator still has an active
+subscriber.
 
 ## Redaction
 

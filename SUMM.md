@@ -241,6 +241,12 @@ and provider can be selected with `OPENROUTER_MODEL` and
 `OPENROUTER_PROVIDER`. CLI flags or `[llm]` in `.aissence.toml` can instead
 select an OpenAI-compatible endpoint.
 
+Every OpenRouter request asks for unified reasoning effort `none`. If the
+selected model requires reasoning and rejects that value, the request is
+retried at `minimal`; if the model rejects reasoning controls altogether, the
+parameter is omitted. Generic OpenAI-compatible endpoints receive no
+OpenRouter-specific reasoning parameter.
+
 The CLI:
 
 1. Analyzes the folder again.
@@ -255,11 +261,29 @@ The CLI:
 5. Applies successful commit summaries even if another commit fails, then
    persists those successes before returning the batch error.
 
+Per-prompt batch calls through OpenRouter use a strict JSON schema with one
+indexed summary per requested entry. Validation distinguishes JSON shape,
+entry count, index/order, empty summaries, and privacy overlap. If a batch
+still fails after its bounded retries, each prompt is retried independently.
+Successful batches and individual results are applied immediately to the
+commit summary; unresolved entries are recorded in `prompt_failures` with
+their message index, model, error, and timestamp. A future `--all-prompts` run
+targets only those missing entries, so selecting a stronger model does not
+regenerate successful work. Hosted subscriber jobs likewise persist partial
+message summaries while leaving the job failed and retryable.
+
 Up to 32 commit groups may be in flight, with a global maximum of 24 concurrent
 LLM requests. Retryable transport/status errors use exponential backoff. An
 invalid subscriber batch response is also retryable; malformed public-story
 JSON currently takes the metadata fallback without retrying. Local
 configuration currently allows seven retries after the initial attempt.
+The interactive CLI dashboard reports current aggregate output tokens per
+second and mean end-to-end latency across completed requests. Active streaming
+token estimates contribute to throughput before the first request completes.
+With `--debug`, every outbound local LLM attempt—including retries—is written
+as `/tmp/aissence-req-[timestamp]-[uuid].md`. These owner-only files contain
+complete prompt bodies for diagnosis, but no authentication headers or API
+keys. Server-mode generation never enables this local debug output.
 
 Upload the already-summarized document with:
 

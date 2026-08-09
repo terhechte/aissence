@@ -106,7 +106,9 @@ async fn process(state: &AppState, mut job: Job) {
         hosted_usage_ceiling(1, HOSTED_PUBLIC_PROMPT_CHARS)
     } else {
         let planned = planned_subscriber_requests(&job.commit);
-        hosted_usage_ceiling(planned, source_input_chars)
+        // Reserve for the initial batches plus worst-case individual fallback,
+        // which can send the bounded prompt evidence a second time.
+        hosted_usage_ceiling(planned, source_input_chars.saturating_mul(2))
     };
     match reserve_budget(state, &job, request_ceiling, input_char_ceiling).await {
         Ok(Some(attempt_id)) => job.attempt_id = Some(attempt_id),
@@ -154,8 +156,8 @@ async fn process(state: &AppState, mut job: Job) {
             .summarize_subscriber_prompts_with_cost(&job.commit)
             .await;
         match result {
-            Ok(summaries) => {
-                if let Err(error) = succeed_subscriber_job(state, &job, &summaries, cost).await {
+            Ok(outcome) => {
+                if let Err(error) = finish_subscriber_job(state, &job, &outcome, cost).await {
                     tracing::error!(error = %error, job_id = %job.id, "cannot persist subscriber summaries");
                 }
             }
@@ -178,6 +180,7 @@ fn hosted_usage_ceiling(planned_requests: usize, source_input_chars: usize) -> (
 
 fn planned_subscriber_requests(commit: &AissenceCommit) -> usize {
     let mut requests = 0usize;
+    let mut individual_fallbacks = 0usize;
     let mut batch_entries = 0usize;
     let mut batch_chars = 0usize;
     for message in commit
@@ -196,6 +199,7 @@ fn planned_subscriber_requests(commit: &AissenceCommit) -> usize {
         if chars <= 200 {
             continue;
         }
+        individual_fallbacks += 1;
         if batch_entries > 0 && (batch_entries >= 8 || batch_chars + chars > 6_000) {
             requests += 1;
             batch_entries = 0;
@@ -209,7 +213,7 @@ fn planned_subscriber_requests(commit: &AissenceCommit) -> usize {
             batch_chars = 0;
         }
     }
-    requests + usize::from(batch_entries > 0)
+    requests + usize::from(batch_entries > 0) + individual_fallbacks
 }
 
 async fn reserve_budget(
@@ -333,15 +337,31 @@ async fn succeed_public_job(
     Ok(())
 }
 
-async fn succeed_subscriber_job(
+async fn finish_subscriber_job(
     state: &AppState,
     job: &Job,
-    summaries: &[(usize, String)],
+    outcome: &aissence::PromptSummarizationOutcome,
     cost: SummarizationCost,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut retry_commit = job.commit.clone();
+    let summary = retry_commit
+        .summary
+        .get_or_insert_with(aissence::CommitSummary::default);
+    if summary.messages.len() != retry_commit.source.messages.len() {
+        summary.messages = retry_commit.source.messages.clone();
+    }
+    for (message_index, generated) in &outcome.summaries {
+        if let Some(message) = summary.messages.get_mut(*message_index) {
+            message.subscriber_summary = Some(generated.clone());
+        }
+    }
+    summary.prompt_failures = outcome.failures.clone();
+    aissence::Redactor::global().redact_summary(summary);
+    let retry_payload = serde_json::to_value(&retry_commit)?;
+
     let mut client = state.pool.get().await?;
     let transaction = client.transaction().await?;
-    for (sort_order, summary) in summaries {
+    for (sort_order, summary) in &outcome.summaries {
         let sort_order = i32::try_from(*sort_order)?;
         transaction
             .execute(
@@ -359,14 +379,28 @@ async fn succeed_subscriber_job(
             )
             .await?;
     }
+    let failure_detail = (!outcome.failures.is_empty()).then(|| {
+        let first = &outcome.failures[0];
+        format!(
+            "{} prompt summary failure(s) remain; first unresolved message {}: {}",
+            outcome.failures.len(),
+            first.message_index,
+            first.error
+        )
+    });
+    let status = if failure_detail.is_some() {
+        "failed"
+    } else {
+        "succeeded"
+    };
     transaction
         .execute(
-            "update public.summary_jobs set status='succeeded',error_detail=null, \
-             lease_expires_at=null,completed_at=now() where id=$1",
-            &[&job.id],
+            "update public.summary_jobs set status=$2::public.summary_job_status,error_detail=$3, \
+             payload=$4,lease_expires_at=null,completed_at=now() where id=$1",
+            &[&job.id, &status, &failure_detail, &retry_payload],
         )
         .await?;
-    record_attempt(&transaction, job, "succeeded", None, cost).await?;
+    record_attempt(&transaction, job, status, failure_detail.as_deref(), cost).await?;
     transaction.commit().await?;
     Ok(())
 }

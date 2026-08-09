@@ -25,18 +25,24 @@
 //! # Ok(()) }
 //! ```
 
+use std::collections::BTreeSet;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use futures::stream::{self, StreamExt, TryStreamExt};
+use futures::stream::{self, StreamExt};
 use openrouter_rs::OpenRouterClient;
 use openrouter_rs::api::chat::{ChatCompletionRequest, Message, StreamOptions};
 use openrouter_rs::error::OpenRouterError;
 use openrouter_rs::types::completion::{CompletionsResponse, ResponseUsage};
-use openrouter_rs::types::{DataCollectionPolicy, ProviderPreferences, Role as OrRole};
+use openrouter_rs::types::{
+    DataCollectionPolicy, Effort, ProviderPreferences, ResponseFormat, Role as OrRole,
+};
 use regex::Regex;
 use tokio::sync::Semaphore;
 
@@ -48,7 +54,7 @@ pub use crate::llm::{
 use crate::llm::{LlmApi, LlmConfig};
 use crate::model::{
     CoalescedHistory, CodeChange, CommitGroup, CommitSummary, MessageKind, MessageSummary,
-    PublicStory, SUMMARIZER_VERSION, SummaryOrigin, TimedMessage, TokenCount,
+    PromptSummaryFailure, PublicStory, SUMMARIZER_VERSION, SummaryOrigin, TimedMessage, TokenCount,
 };
 use crate::ncs;
 
@@ -78,6 +84,7 @@ const USER_BATCH_SIZE: usize = 8;
 const USER_BATCH_CHARS: usize = 6_000;
 /// Output allowance per prompt, including any model-internal reasoning tokens.
 const USER_SUMMARY_OUTPUT_TOKENS: u32 = 768;
+const FAILURE_DETAIL_CHARS: usize = 2_000;
 const COMMIT_SUBLINE_CHARS: usize = 1_000;
 /// Section budgets reserve grounding evidence instead of allowing an early
 /// user/assistant block to push later sections out of the request.
@@ -99,6 +106,14 @@ pub struct SummarizationCost {
     pub usd: f64,
     pub request_count: usize,
     pub unpriced_request_count: usize,
+}
+
+/// Partial result of per-prompt generation. Successful summaries are always
+/// returned even when sibling prompts remain unresolved.
+#[derive(Debug, Clone, Default)]
+pub struct PromptSummarizationOutcome {
+    pub summaries: Vec<(usize, String)>,
+    pub failures: Vec<PromptSummaryFailure>,
 }
 
 /// The kind of model request currently being executed.
@@ -197,6 +212,7 @@ pub struct Summarizer {
     model: String,
     provider: Option<String>,
     hosted_policy: bool,
+    debug_requests: bool,
     max_request_retries: usize,
     request_limit: Arc<Semaphore>,
     progress: Option<Arc<dyn Fn(SummarizationProgress) + Send + Sync>>,
@@ -246,6 +262,7 @@ impl Summarizer {
             model: config.model,
             provider: config.provider,
             hosted_policy: false,
+            debug_requests: false,
             max_request_retries: DEFAULT_MAX_REQUEST_RETRIES,
             request_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
             progress: None,
@@ -302,6 +319,14 @@ impl Summarizer {
     /// provider. Local summarization keeps the user's OpenRouter defaults.
     pub fn with_hosted_policy(mut self) -> Self {
         self.hosted_policy = true;
+        self
+    }
+
+    /// Write the body of every outbound LLM attempt to a private Markdown file
+    /// in `/tmp`. Authentication headers and API keys are not part of the
+    /// serialized request and are therefore never written.
+    pub fn with_debug_requests(mut self) -> Self {
+        self.debug_requests = true;
         self
     }
 
@@ -388,7 +413,23 @@ impl Summarizer {
         let mut first_error = None;
         for outcome in outcomes {
             match outcome {
-                Ok((index, summary)) => history.groups[index].summary = Some(summary),
+                Ok((index, summary)) => {
+                    if all_prompts && !summary.prompt_failures.is_empty() && first_error.is_none() {
+                        let commit = history.groups[index]
+                            .commit
+                            .as_ref()
+                            .map(|commit| commit.short_id.as_str())
+                            .unwrap_or("uncommitted");
+                        let first = &summary.prompt_failures[0];
+                        first_error = Some(Error::Llm(format!(
+                            "{} prompt summary failure(s) remain for commit {commit}; first unresolved message {}: {}",
+                            summary.prompt_failures.len(),
+                            first.message_index,
+                            first.error
+                        )));
+                    }
+                    history.groups[index].summary = Some(summary);
+                }
                 Err(error) if first_error.is_none() => first_error = Some(error),
                 Err(_) => {}
             }
@@ -454,20 +495,32 @@ impl Summarizer {
     pub async fn summarize_subscriber_prompts_with_cost(
         &self,
         commit: &crate::document::AissenceCommit,
-    ) -> (Result<Vec<(usize, String)>, Error>, SummarizationCost) {
+    ) -> (Result<PromptSummarizationOutcome, Error>, SummarizationCost) {
         let costs = CostTracker::default();
         let items = raw_items_from_source(&commit.source.messages);
-        let outcome = self
-            .summarize_user_entries(&items, &costs, ShortPromptPolicy::CopyForSubscriber)
-            .await
-            .map(|summaries| {
-                summaries
-                    .into_iter()
+        let target_indices = commit.summary.as_ref().and_then(|summary| {
+            (summary.messages.len() == items.len()).then(|| {
+                summary
+                    .messages
+                    .iter()
                     .enumerate()
-                    .filter_map(|(index, summary)| summary.map(|summary| (index, summary)))
-                    .collect()
-            });
-        (outcome, costs.total())
+                    .filter(|(_, message)| {
+                        message.kind == MessageKind::UserWrote
+                            && message.subscriber_summary.is_none()
+                    })
+                    .map(|(index, _)| index)
+                    .collect::<BTreeSet<_>>()
+            })
+        });
+        let result = self
+            .summarize_user_entries_resilient(
+                &items,
+                &costs,
+                ShortPromptPolicy::CopyForSubscriber,
+                target_indices.as_ref(),
+            )
+            .await;
+        (Ok(result), costs.total())
     }
 
     async fn summarize_group_tracked(
@@ -519,14 +572,29 @@ impl Summarizer {
             }
         }
         if all_prompts && !has_all_prompt_summaries(group, &summary) {
-            let prompt_summaries = self
-                .summarize_user_entries(&items, costs, ShortPromptPolicy::ParaphraseForPublic)
-                .await?;
-            for (message, prompt_summary) in summary.messages.iter_mut().zip(prompt_summaries) {
-                if prompt_summary.is_some() {
-                    message.subscriber_summary = prompt_summary;
-                }
+            let missing = summary
+                .messages
+                .iter()
+                .enumerate()
+                .filter(|(_, message)| {
+                    message.kind == MessageKind::UserWrote && message.subscriber_summary.is_none()
+                })
+                .map(|(index, _)| index)
+                .collect::<BTreeSet<_>>();
+            let outcome = self
+                .summarize_user_entries_resilient(
+                    &items,
+                    costs,
+                    ShortPromptPolicy::ParaphraseForPublic,
+                    Some(&missing),
+                )
+                .await;
+            for (index, prompt_summary) in outcome.summaries {
+                summary.messages[index].subscriber_summary = Some(prompt_summary);
             }
+            summary.prompt_failures = outcome.failures;
+        } else if all_prompts {
+            summary.prompt_failures.clear();
         }
         ensure_public_subline_for_commit(&mut summary.public, group.commit.as_ref());
         Ok(summary)
@@ -560,6 +628,7 @@ impl Summarizer {
             messages,
             agents,
             tokens,
+            prompt_failures: Vec::new(),
         })
     }
 
@@ -612,34 +681,76 @@ impl Summarizer {
     /// remaining entries are summarized in batched requests (one indexed JSON
     /// array per batch) to cut round trips and request pressure. Invalid output
     /// is retried under the normal bounded request policy.
-    async fn summarize_user_entries(
+    async fn summarize_user_entries_resilient(
         &self,
         items: &[RawItem],
         costs: &CostTracker,
         short_prompt_policy: ShortPromptPolicy,
-    ) -> Result<Vec<Option<String>>, Error> {
-        let (mut results, batches) = plan_user_entry_jobs(items, short_prompt_policy);
+        target_indices: Option<&BTreeSet<usize>>,
+    ) -> PromptSummarizationOutcome {
+        let (mut results, batches) =
+            plan_user_entry_jobs(items, short_prompt_policy, target_indices);
+        let public_safe = short_prompt_policy == ShortPromptPolicy::ParaphraseForPublic;
         let jobs = batches.into_iter().map(|batch| async move {
-            let summaries = self
-                .summarize_user_batch(
-                    items,
-                    &batch,
-                    costs,
-                    short_prompt_policy == ShortPromptPolicy::ParaphraseForPublic,
-                )
-                .await?;
-            Ok::<_, Error>((batch, summaries))
+            let outcome = self
+                .summarize_user_batch(items, &batch, costs, public_safe)
+                .await;
+            (batch, outcome)
         });
-        let outcomes: Vec<(Vec<usize>, Vec<String>)> = stream::iter(jobs)
+        let outcomes: Vec<(Vec<usize>, Result<Vec<String>, Error>)> = stream::iter(jobs)
             .buffered(MAX_CONCURRENT_REQUESTS)
-            .try_collect()
-            .await?;
-        for (indices, summaries) in outcomes {
-            for (index, summary) in indices.into_iter().zip(summaries) {
-                results[index] = Some(summary);
+            .collect()
+            .await;
+        let mut individual_retries = Vec::new();
+        for (indices, outcome) in outcomes {
+            match outcome {
+                Ok(summaries) => {
+                    for (index, summary) in indices.into_iter().zip(summaries) {
+                        results[index] = Some(summary);
+                    }
+                }
+                Err(error) if indices.len() == 1 => {
+                    individual_retries.push((indices[0], error));
+                }
+                Err(_) => {
+                    // A malformed or privacy-invalid batch should not discard
+                    // valid siblings. Retry each source prompt independently.
+                    let retries = stream::iter(indices.into_iter().map(|index| async move {
+                        let batch = [index];
+                        let outcome = self
+                            .summarize_user_batch(items, &batch, costs, public_safe)
+                            .await;
+                        (index, outcome)
+                    }))
+                    .buffered(MAX_CONCURRENT_REQUESTS)
+                    .collect::<Vec<_>>()
+                    .await;
+                    for (index, outcome) in retries {
+                        match outcome {
+                            Ok(mut summaries) => results[index] = summaries.pop(),
+                            Err(error) => individual_retries.push((index, error)),
+                        }
+                    }
+                }
             }
         }
-        Ok(results)
+        let attempted_at = chrono::Utc::now();
+        PromptSummarizationOutcome {
+            summaries: results
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, summary)| summary.map(|summary| (index, summary)))
+                .collect(),
+            failures: individual_retries
+                .into_iter()
+                .map(|(message_index, error)| PromptSummaryFailure {
+                    message_index,
+                    model: self.model.clone(),
+                    error: truncate_head(&error.to_string(), FAILURE_DETAIL_CHARS),
+                    attempted_at,
+                })
+                .collect(),
+        }
     }
 
     /// Summarize one batch of user entries. Single-entry batches use the plain
@@ -674,17 +785,29 @@ impl Summarizer {
                     costs,
                     |text| {
                         let summary = text.trim();
-                        if summary.is_empty()
-                            || (public_safe
-                                && raw_public_text_leaks_prompt(
-                                    summary,
-                                    std::slice::from_ref(&items[batch[0]]),
-                                ))
-                        {
-                            Err("model returned an empty user summary".to_string())
-                        } else {
-                            Ok(vec![summary.to_string()])
+                        if summary.is_empty() {
+                            return Err(format!(
+                                "user-summary validation failed for message {}: empty response",
+                                batch[0]
+                            ));
                         }
+                        if public_safe
+                            && raw_public_text_leaks_prompt(
+                                summary,
+                                std::slice::from_ref(&items[batch[0]]),
+                            )
+                        {
+                            write_privacy_overlap_debug_file(
+                                batch[0],
+                                &items[batch[0]].text,
+                                summary,
+                            );
+                            return Err(format!(
+                                "user-summary validation failed for message {}: privacy overlap with source prompt",
+                                batch[0]
+                            ));
+                        }
+                        Ok(vec![summary.to_string()])
                     },
                 )
                 .await;
@@ -699,19 +822,21 @@ impl Summarizer {
             ));
         }
         let max_tokens = USER_SUMMARY_OUTPUT_TOKENS.saturating_mul(batch.len() as u32);
-        self.complete_with_parser(
+        self.complete_with_parser_format(
             if public_safe {
                 "Create privacy-safe public paraphrases for several numbered user prompts from a coding session. \
                  Preserve important requests and constraints, but never reproduce prompt wording, paths, personal \
-                 data, credentials, or private identifiers. Return a JSON array of objects with exactly these keys: \
+                 data, credentials, or private identifiers. Return a JSON object with exactly one key, `summaries`, \
+                 whose value is an array of objects with exactly these keys: \
                  message_index (the supplied integer) and summary (a concise 1-2 sentence paraphrase). Return exactly \
-                 one object per supplied prompt in the same order. Output JSON only."
+                 one array entry per supplied prompt in the same order. Output JSON only."
             } else {
                 "You summarize several numbered user prompts from a coding session. \
                  For each, preserve every important request, constraint, question, \
-                 correction, and reported problem. Return a JSON array of objects with \
+                 correction, and reported problem. Return a JSON object with exactly one key, `summaries`, whose value \
+                 is an array of objects with \
                  exactly these keys: message_index (the supplied integer) and summary \
-                 (a concise 2-3 sentence summary). Return exactly one object per supplied \
+                 (a concise 2-3 sentence summary). Return exactly one array entry per supplied \
                  prompt in the same order. Output JSON only."
             },
             prompt,
@@ -720,29 +845,14 @@ impl Summarizer {
                 entries: batch.len(),
             },
             costs,
+            Some(user_summary_batch_response_format(batch.len())),
             |text| {
-                parse_indexed_user_summaries(text)
-                    .filter(|summaries| {
-                        summaries.len() == batch.len()
-                            && summaries.iter().zip(batch).all(|(summary, index)| {
-                                summary.message_index == *index
-                                    && !summary.summary.trim().is_empty()
-                            })
-                            && (!public_safe
-                                || summaries.iter().zip(batch).all(|(summary, index)| {
-                                    !raw_public_text_leaks_prompt(
-                                        &summary.summary,
-                                        std::slice::from_ref(&items[*index]),
-                                    )
-                                }))
-                    })
-                    .map(|summaries| {
-                        summaries
-                            .into_iter()
-                            .map(|summary| summary.summary.trim().to_string())
-                            .collect()
-                    })
-                    .ok_or_else(|| "model returned an invalid user-summary batch".to_string())
+                validate_indexed_user_summaries(text, batch, items, public_safe).map(|summaries| {
+                    summaries
+                        .into_iter()
+                        .map(|summary| summary.summary.trim().to_string())
+                        .collect()
+                })
             },
         )
         .await
@@ -778,35 +888,51 @@ impl Summarizer {
     where
         F: Fn(&str) -> Result<T, String>,
     {
+        self.complete_with_parser_format(system, user, max_tokens, kind, costs, None, parser)
+            .await
+    }
+
+    async fn complete_with_parser_format<T, F>(
+        &self,
+        system: &'static str,
+        user: String,
+        max_tokens: u32,
+        kind: SummarizationRequestKind,
+        costs: &CostTracker,
+        response_format: Option<ResponseFormat>,
+        parser: F,
+    ) -> Result<T, Error>
+    where
+        F: Fn(&str) -> Result<T, String>,
+    {
         if self.hosted_policy && self.api != LlmApi::OpenRouter {
             return Err(Error::Llm(
                 "the hosted privacy policy requires the OpenRouter API".to_string(),
             ));
         }
-        let mut request = ChatCompletionRequest::builder();
-        request
-            .model(self.model.as_str())
-            .messages(vec![
-                Message::new(OrRole::System, system),
-                Message::new(OrRole::User, user),
-            ])
-            .temperature(0.2)
-            .max_tokens(max_tokens);
-        if let Some(preferences) = self.provider_preferences() {
-            request.provider(preferences);
-        }
-        if self.progress.is_some() && self.api == LlmApi::OpenRouter {
-            let mut stream_options = StreamOptions::default();
-            stream_options.include_usage = Some(true);
-            request.stream_options(stream_options);
-        }
-        let request = request
-            .build()
-            .map_err(|e| Error::Llm(format!("request build: {e}")))?;
+        let retry_invalid_output = self.api != LlmApi::OpenRouter || response_format.is_none();
+        // Ask OpenRouter to disable reasoning. Models where reasoning is
+        // mandatory reject `none`, so retain progressively more compatible
+        // requests: first minimal effort, then no reasoning parameter at all.
+        // Generic OpenAI-compatible endpoints receive their previous payload.
+        let reasoning_efforts = if self.api == LlmApi::OpenRouter {
+            vec![Some(Effort::None), Some(Effort::Minimal), None]
+        } else {
+            vec![None]
+        };
+        let requests = reasoning_efforts
+            .into_iter()
+            .map(|effort| {
+                self.completion_request(system, &user, max_tokens, effort, response_format.clone())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
         let mut retry = 0;
+        let mut request_index = 0;
+        let mut attempts = 0;
         loop {
+            attempts += 1;
             let result = {
                 let _permit =
                     self.request_limit.acquire().await.map_err(|_| {
@@ -816,7 +942,10 @@ impl Summarizer {
                     id: request_id,
                     kind,
                 });
-                match self.send_completion(&request, request_id).await {
+                match self
+                    .send_completion(&requests[request_index], request_id)
+                    .await
+                {
                     Ok(response) => {
                         let CompletionResponse { text, usage } = response;
                         costs.record(usage.as_ref().and_then(|usage| usage.cost));
@@ -824,7 +953,8 @@ impl Summarizer {
                             .map(|parsed| (parsed, usage))
                             .map_err(|message| CompletionError {
                                 message,
-                                retryable: true,
+                                retryable: retry_invalid_output,
+                                unsupported_reasoning: false,
                             })
                     }
                     Err(error) => Err(error),
@@ -839,18 +969,28 @@ impl Summarizer {
                     });
                     return Ok(parsed);
                 }
+                Err(error) if error.unsupported_reasoning && request_index + 1 < requests.len() => {
+                    request_index += 1;
+                    self.emit_progress(SummarizationProgress::Retrying {
+                        id: request_id,
+                        kind,
+                        attempt: attempts + 1,
+                        error: format!(
+                            "{error}; retrying with a more compatible reasoning setting"
+                        ),
+                    });
+                }
                 Err(error) if error.retryable && retry < self.max_request_retries => {
                     self.emit_progress(SummarizationProgress::Retrying {
                         id: request_id,
                         kind,
-                        attempt: retry + 2,
+                        attempt: attempts + 1,
                         error: error.to_string(),
                     });
                     tokio::time::sleep(retry_delay(retry)).await;
                     retry += 1;
                 }
                 Err(error) => {
-                    let attempts = retry + 1;
                     let suffix = if attempts > 1 {
                         format!(" after {attempts} attempts")
                     } else {
@@ -865,6 +1005,44 @@ impl Summarizer {
                 }
             }
         }
+    }
+
+    fn completion_request(
+        &self,
+        system: &'static str,
+        user: &str,
+        max_tokens: u32,
+        reasoning_effort: Option<Effort>,
+        response_format: Option<ResponseFormat>,
+    ) -> Result<ChatCompletionRequest, Error> {
+        let mut request = ChatCompletionRequest::builder();
+        request
+            .model(self.model.as_str())
+            .messages(vec![
+                Message::new(OrRole::System, system),
+                Message::new(OrRole::User, user),
+            ])
+            .temperature(0.2)
+            .max_tokens(max_tokens);
+        if let Some(effort) = reasoning_effort {
+            request.reasoning_effort(effort);
+        }
+        if self.api == LlmApi::OpenRouter
+            && let Some(response_format) = response_format
+        {
+            request.response_format(response_format);
+        }
+        if let Some(preferences) = self.provider_preferences() {
+            request.provider(preferences);
+        }
+        if self.progress.is_some() && self.api == LlmApi::OpenRouter {
+            let mut stream_options = StreamOptions::default();
+            stream_options.include_usage = Some(true);
+            request.stream_options(stream_options);
+        }
+        request
+            .build()
+            .map_err(|e| Error::Llm(format!("request build: {e}")))
     }
 
     fn provider_preferences(&self) -> Option<ProviderPreferences> {
@@ -936,6 +1114,9 @@ impl Summarizer {
         request: &ChatCompletionRequest,
         request_id: usize,
     ) -> Result<CompletionResponse, CompletionError> {
+        if self.debug_requests {
+            write_debug_request(request, self.api, request_id)?;
+        }
         match &self.client {
             CompletionClient::OpenRouter(client) if self.progress.is_some() => {
                 self.stream_completion(client, request, request_id).await
@@ -961,6 +1142,7 @@ impl Summarizer {
                     .map_err(|error| CompletionError {
                         message: error.to_string(),
                         retryable: error.is_timeout() || error.is_connect(),
+                        unsupported_reasoning: false,
                     })?;
                 let status = response.status();
                 if !status.is_success() {
@@ -969,11 +1151,13 @@ impl Summarizer {
                     return Err(CompletionError {
                         message: format!("upstream returned {status}: {detail}"),
                         retryable: is_retryable_status(status.as_u16()),
+                        unsupported_reasoning: false,
                     });
                 }
                 let body = response.text().await.map_err(|error| CompletionError {
                     message: error.to_string(),
                     retryable: error.is_timeout() || error.is_connect(),
+                    unsupported_reasoning: false,
                 })?;
                 // Some OpenAI-compatible providers emit malformed JSON with
                 // duplicate object keys (e.g. `"cost"` twice in `usage`), which
@@ -989,6 +1173,7 @@ impl Summarizer {
                             truncate_for_error(&body)
                         ),
                         retryable: false,
+                        unsupported_reasoning: false,
                     })
             }
         }
@@ -999,6 +1184,72 @@ impl Summarizer {
             callback(progress);
         }
     }
+}
+
+fn write_debug_request(
+    request: &ChatCompletionRequest,
+    api: LlmApi,
+    request_id: usize,
+) -> Result<PathBuf, CompletionError> {
+    let now = chrono::Utc::now();
+    let timestamp = now.format("%Y%m%dT%H%M%S%.3fZ").to_string();
+    let path = debug_request_path(&timestamp, uuid::Uuid::new_v4());
+    let markdown =
+        debug_request_markdown(request, api, request_id, &now.to_rfc3339()).map_err(|error| {
+            CompletionError::debug(format!("cannot serialize debug request: {error}"))
+        })?;
+
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path).map_err(|error| {
+        CompletionError::debug(format!(
+            "cannot create debug request file {}: {error}",
+            path.display()
+        ))
+    })?;
+    file.write_all(markdown.as_bytes()).map_err(|error| {
+        CompletionError::debug(format!(
+            "cannot write debug request file {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(path)
+}
+
+fn debug_request_path(timestamp: &str, id: uuid::Uuid) -> PathBuf {
+    PathBuf::from(format!("/tmp/aissence-req-{timestamp}-{id}.md"))
+}
+
+fn debug_request_markdown(
+    request: &ChatCompletionRequest,
+    api: LlmApi,
+    request_id: usize,
+    recorded_at: &str,
+) -> Result<String, serde_json::Error> {
+    let json = serde_json::to_string_pretty(request)?;
+    let longest_backtick_run = json
+        .split(|character| character != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    let fence = "`".repeat(longest_backtick_run.saturating_add(1).max(3));
+    let api = match api {
+        LlmApi::OpenRouter => "openrouter",
+        LlmApi::OpenaiCompatible => "openai-compatible",
+    };
+    Ok(format!(
+        "# Aissence LLM request\n\n\
+         - Recorded at: `{recorded_at}`\n\
+         - Request ID: `{request_id:03}`\n\
+         - API: `{api}`\n\n\
+         ## Request body\n\n\
+         {fence}json\n{json}\n{fence}\n"
+    ))
 }
 
 struct CompletionResponse {
@@ -1022,13 +1273,29 @@ fn completion_response(response: CompletionsResponse) -> CompletionResponse {
 struct CompletionError {
     message: String,
     retryable: bool,
+    unsupported_reasoning: bool,
 }
 
 impl CompletionError {
+    fn debug(message: String) -> Self {
+        Self {
+            message,
+            retryable: false,
+            unsupported_reasoning: false,
+        }
+    }
+
     fn openrouter(error: OpenRouterError) -> Self {
+        let unsupported_reasoning = match &error {
+            OpenRouterError::Api(context) => {
+                is_unsupported_reasoning_error(context.status.as_u16(), &context.message)
+            }
+            _ => false,
+        };
         Self {
             retryable: is_retryable_request_error(&error),
             message: error.to_string(),
+            unsupported_reasoning,
         }
     }
 }
@@ -1189,12 +1456,16 @@ fn correction_signal_score(text: &str) -> usize {
 fn plan_user_entry_jobs(
     items: &[RawItem],
     short_prompt_policy: ShortPromptPolicy,
+    target_indices: Option<&BTreeSet<usize>>,
 ) -> (Vec<Option<String>>, Vec<Vec<usize>>) {
     let mut prefilled: Vec<Option<String>> = (0..items.len()).map(|_| None).collect();
     let mut batches: Vec<Vec<usize>> = Vec::new();
     let mut current: Vec<usize> = Vec::new();
     let mut current_chars = 0_usize;
     for (index, item) in items.iter().enumerate() {
+        if target_indices.is_some_and(|indices| !indices.contains(&index)) {
+            continue;
+        }
         if item.kind != MessageKind::UserWrote {
             continue;
         }
@@ -1233,10 +1504,45 @@ fn subscriber_prompt_evidence(item: &RawItem) -> String {
     truncate_middle(item.text.trim(), USER_BATCH_CHARS)
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct IndexedUserSummary {
     message_index: usize,
     summary: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IndexedUserSummaryEnvelope {
+    summaries: Vec<IndexedUserSummary>,
+}
+
+fn user_summary_batch_response_format(entries: usize) -> ResponseFormat {
+    ResponseFormat::json_schema(
+        "aissence_user_summary_batch",
+        true,
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["summaries"],
+            "properties": {
+                "summaries": {
+                    "type": "array",
+                    "minItems": entries,
+                    "maxItems": entries,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["message_index", "summary"],
+                        "properties": {
+                            "message_index": { "type": "integer", "minimum": 0 },
+                            "summary": { "type": "string", "minLength": 1 }
+                        }
+                    }
+                }
+            }
+        }),
+    )
 }
 
 /// Parse indexed user summaries from a model response, tolerating surrounding
@@ -1244,11 +1550,71 @@ struct IndexedUserSummary {
 /// incomplete batch fail closed instead of attaching copy to the wrong prompt.
 fn parse_indexed_user_summaries(text: &str) -> Option<Vec<IndexedUserSummary>> {
     let trimmed = text.trim();
-    let start = trimmed.find('[')?;
-    let end = trimmed.rfind(']')?;
+    if let Ok(envelope) = serde_json::from_str::<IndexedUserSummaryEnvelope>(trimmed) {
+        return Some(envelope.summaries);
+    }
+    if let Ok(summaries) = serde_json::from_str::<Vec<IndexedUserSummary>>(trimmed) {
+        return Some(summaries);
+    }
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}'))
+        && start <= end
+        && let Ok(envelope) =
+            serde_json::from_str::<IndexedUserSummaryEnvelope>(&trimmed[start..=end])
+    {
+        return Some(envelope.summaries);
+    }
+    let (start, end) = (trimmed.find('[')?, trimmed.rfind(']')?);
     (start <= end)
         .then(|| &trimmed[start..=end])
-        .and_then(|json| serde_json::from_str(json).ok())
+        .and_then(|json| serde_json::from_str::<Vec<IndexedUserSummary>>(json).ok())
+}
+
+fn validate_indexed_user_summaries(
+    text: &str,
+    batch: &[usize],
+    items: &[RawItem],
+    public_safe: bool,
+) -> Result<Vec<IndexedUserSummary>, String> {
+    let summaries = parse_indexed_user_summaries(text).ok_or_else(|| {
+        "user-summary batch validation failed: JSON shape (expected {\"summaries\":[...]})"
+            .to_string()
+    })?;
+    if summaries.len() != batch.len() {
+        return Err(format!(
+            "user-summary batch validation failed: count mismatch (expected {}, received {})",
+            batch.len(),
+            summaries.len()
+        ));
+    }
+    for (position, (summary, expected_index)) in summaries.iter().zip(batch).enumerate() {
+        if summary.message_index != *expected_index {
+            return Err(format!(
+                "user-summary batch validation failed: index mismatch at position {position} (expected {expected_index}, received {})",
+                summary.message_index
+            ));
+        }
+        if summary.summary.trim().is_empty() {
+            return Err(format!(
+                "user-summary batch validation failed: empty summary for message {expected_index}"
+            ));
+        }
+        if public_safe
+            && raw_public_text_leaks_prompt(
+                &summary.summary,
+                std::slice::from_ref(&items[*expected_index]),
+            )
+        {
+            write_privacy_overlap_debug_file(
+                *expected_index,
+                &items[*expected_index].text,
+                &summary.summary,
+            );
+            return Err(format!(
+                "user-summary batch validation failed: privacy overlap for message {expected_index}"
+            ));
+        }
+    }
+    Ok(summaries)
 }
 
 fn public_story_input(
@@ -1376,6 +1742,7 @@ fn implementation_fingerprint(
 /// Whether every retained user prompt has a generated per-prompt summary.
 pub fn has_all_prompt_summaries(group: &CommitGroup, summary: &CommitSummary) -> bool {
     summary.summarizer_version == SUMMARIZER_VERSION
+        && summary.prompt_failures.is_empty()
         && summary.messages.len() == source_messages(group).len()
         && summary.messages.iter().all(|message| {
             message.kind != MessageKind::UserWrote
@@ -1565,6 +1932,64 @@ fn privacy_words(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// In debug builds, retain the exact source/rewrite pair that tripped the
+/// privacy guard so its thresholds can be audited. These files can contain
+/// private prompt text, so they are owner-readable only and never emitted by
+/// release binaries.
+#[cfg(debug_assertions)]
+fn write_privacy_overlap_debug_file(message_index: usize, original: &str, rewritten: &str) {
+    if cfg!(test) {
+        return;
+    }
+    let now = chrono::Utc::now();
+    let timestamp = now.format("%Y%m%dT%H%M%S%.3fZ");
+    let path = PathBuf::from(format!(
+        "/tmp/aissence-privacy-error-{timestamp}-{}.md",
+        uuid::Uuid::new_v4()
+    ));
+    let markdown =
+        privacy_overlap_debug_markdown(message_index, original, rewritten, &now.to_rfc3339());
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options
+        .open(&path)
+        .and_then(|mut file| file.write_all(markdown.as_bytes()))
+    {
+        Ok(()) => eprintln!("privacy-overlap diagnostic written to {}", path.display()),
+        Err(error) => eprintln!(
+            "warning: could not write privacy-overlap diagnostic {}: {error}",
+            path.display()
+        ),
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn write_privacy_overlap_debug_file(_message_index: usize, _original: &str, _rewritten: &str) {}
+
+#[cfg(any(debug_assertions, test))]
+fn privacy_overlap_debug_markdown(
+    message_index: usize,
+    original: &str,
+    rewritten: &str,
+    recorded_at: &str,
+) -> String {
+    let longest_backtick_run = original
+        .split(|character| character != '`')
+        .chain(rewritten.split(|character| character != '`'))
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    let fence = "`".repeat(longest_backtick_run.saturating_add(1).max(3));
+    format!(
+        "# Aissence privacy-overlap diagnostic\n\n- Recorded: `{recorded_at}`\n- Message index: `{message_index}`\n- Warning: this file contains the original private prompt.\n\n## Original prompt\n\n{fence}text\n{original}\n{fence}\n\n## Rewritten summary\n\n{fence}text\n{rewritten}\n{fence}\n"
+    )
+}
+
 fn nonempty_or_none(text: &str) -> &str {
     if text.trim().is_empty() {
         "(none)"
@@ -1662,6 +2087,13 @@ fn is_retryable_request_error(error: &OpenRouterError) -> bool {
 
 fn is_retryable_status(status: u16) -> bool {
     matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+}
+
+fn is_unsupported_reasoning_error(status: u16, message: &str) -> bool {
+    if !matches!(status, 400 | 422) {
+        return false;
+    }
+    message.to_ascii_lowercase().contains("reasoning")
 }
 
 /// Exponential backoff with a cap and up to +50% jitter, so the many
@@ -2272,7 +2704,7 @@ mod tests {
     #[tokio::test]
     async fn entitled_short_prompts_are_reused_without_a_request() {
         let summarizer = Summarizer::new("test-key", "test/model").unwrap();
-        let commit = crate::document::AissenceCommit {
+        let mut commit = crate::document::AissenceCommit {
             commit_hash: "a".repeat(40),
             source_digest: String::new(),
             sanitizer_version: crate::document::SANITIZER_VERSION,
@@ -2301,7 +2733,23 @@ mod tests {
             .await;
 
         assert_eq!(cost, SummarizationCost::default());
-        assert_eq!(summaries.unwrap(), vec![(0, "Use dark mode".into())]);
+        let outcome = summaries.unwrap();
+        assert_eq!(outcome.summaries, vec![(0, "Use dark mode".into())]);
+        assert!(outcome.failures.is_empty());
+
+        let mut completed = commit.source.messages.clone();
+        completed[0].subscriber_summary = Some("Already summarized.".into());
+        commit.summary = Some(CommitSummary {
+            messages: completed,
+            ..CommitSummary::default()
+        });
+        let (outcome, cost) = summarizer
+            .summarize_subscriber_prompts_with_cost(&commit)
+            .await;
+        assert_eq!(cost, SummarizationCost::default());
+        let outcome = outcome.unwrap();
+        assert!(outcome.summaries.is_empty());
+        assert!(outcome.failures.is_empty());
     }
 
     #[tokio::test]
@@ -2420,6 +2868,7 @@ mod tests {
                 }],
                 agents: Vec::new(),
                 tokens: None,
+                prompt_failures: Vec::new(),
             }),
         };
         let mut history = CoalescedHistory {
@@ -2506,6 +2955,7 @@ mod tests {
         assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
         assert!(!request.to_ascii_lowercase().contains("authorization:"));
         assert!(!request.contains("\"provider\""));
+        assert!(!request.contains("\"reasoning\""));
         assert!(!request.contains("\"stream_options\""));
         assert_eq!(costs.total().unpriced_request_count, 1);
     }
@@ -2588,7 +3038,7 @@ mod tests {
                 attempt: 2,
                 error,
                 ..
-            } if error == "model returned an invalid user-summary batch"
+            } if error.contains("index mismatch")
         )));
         assert_eq!(
             progress
@@ -2602,6 +3052,83 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, SummarizationProgress::Failed { .. }))
         );
+    }
+
+    #[tokio::test]
+    async fn failed_batch_falls_back_to_individual_prompts_and_keeps_partial_results() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let first_prompt = "a".repeat(300);
+        let first_prompt_for_server = first_prompt.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut socket).await;
+                let content = if request.contains("Summarize each of these user prompts") {
+                    r#"{"summaries":[]}"#
+                } else if request.contains(&first_prompt_for_server) {
+                    "The user asks for a placeholder-related improvement."
+                } else {
+                    "   "
+                };
+                let body = serde_json::json!({
+                    "id": "test-completion",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "local-model",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": content},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let summarizer = Summarizer::from_config(LlmConfig {
+            api: LlmApi::OpenaiCompatible,
+            base_url: format!("http://{address}/v1"),
+            api_key: None,
+            model: "local-model".to_string(),
+            provider: None,
+        })
+        .unwrap()
+        .with_max_request_retries(0);
+        let costs = CostTracker::default();
+        let items = vec![
+            item(MessageKind::UserWrote, &first_prompt),
+            item(MessageKind::UserWrote, &"b".repeat(300)),
+        ];
+
+        let outcome = summarizer
+            .summarize_user_entries_resilient(
+                &items,
+                &costs,
+                ShortPromptPolicy::ParaphraseForPublic,
+                None,
+            )
+            .await;
+        server.await.unwrap();
+
+        assert_eq!(
+            outcome.summaries,
+            vec![(
+                0,
+                "The user asks for a placeholder-related improvement.".to_string()
+            )]
+        );
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].message_index, 1);
+        assert_eq!(outcome.failures[0].model, "local-model");
+        assert!(outcome.failures[0].error.contains("empty response"));
+        assert_eq!(costs.total().request_count, 3);
     }
 
     #[tokio::test]
@@ -2719,6 +3246,110 @@ mod tests {
             serde_json::to_value(preferences).unwrap(),
             serde_json::json!({ "order": ["deepinfra"] })
         );
+    }
+
+    #[test]
+    fn openrouter_requests_disable_reasoning_with_unified_effort() {
+        let summarizer = Summarizer::new("test-key", "example/model").unwrap();
+        let request = summarizer
+            .completion_request(
+                "Summarize.",
+                "Some input",
+                100,
+                Some(Effort::None),
+                Some(user_summary_batch_response_format(3)),
+            )
+            .unwrap();
+
+        let json = serde_json::to_value(request).unwrap();
+        assert_eq!(json["reasoning"]["effort"], "none");
+        assert_eq!(json["response_format"]["type"], "json_schema");
+        assert_eq!(
+            json["response_format"]["json_schema"]["schema"]["properties"]["summaries"]["minItems"],
+            3
+        );
+        assert_eq!(json["response_format"]["json_schema"]["strict"], true);
+    }
+
+    #[test]
+    fn debug_request_markdown_records_the_payload_without_authentication() {
+        let summarizer = Summarizer::new("secret-test-key", "example/model").unwrap();
+        let request = summarizer
+            .completion_request(
+                "Summarize safely.",
+                "User evidence containing ``` fences.",
+                100,
+                Some(Effort::None),
+                None,
+            )
+            .unwrap();
+        let markdown =
+            debug_request_markdown(&request, LlmApi::OpenRouter, 7, "2026-08-08T12:00:00Z")
+                .unwrap();
+
+        assert!(markdown.contains("Request ID: `007`"));
+        assert!(markdown.contains("`openrouter`"));
+        assert!(markdown.contains("Summarize safely."));
+        assert!(markdown.contains("User evidence containing ``` fences."));
+        assert!(markdown.contains("\"effort\": \"none\""));
+        assert!(markdown.contains("````json"));
+        assert!(!markdown.contains("secret-test-key"));
+
+        let path = debug_request_path(
+            "20260808T120000.000Z",
+            uuid::Uuid::parse_str("12345678-1234-4234-8234-123456789abc").unwrap(),
+        );
+        assert_eq!(
+            path,
+            PathBuf::from(
+                "/tmp/aissence-req-20260808T120000.000Z-12345678-1234-4234-8234-123456789abc.md"
+            )
+        );
+
+        let written = write_debug_request(&request, LlmApi::OpenRouter, 7).unwrap();
+        assert!(written.starts_with("/tmp"));
+        assert!(
+            written
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("aissence-req-")
+        );
+        assert_eq!(
+            written.extension().and_then(|value| value.to_str()),
+            Some("md")
+        );
+        assert!(
+            std::fs::read_to_string(&written)
+                .unwrap()
+                .contains("Summarize safely.")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&written).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        std::fs::remove_file(written).unwrap();
+    }
+
+    #[test]
+    fn only_reasoning_client_errors_trigger_compatibility_fallback() {
+        assert!(is_unsupported_reasoning_error(
+            400,
+            "reasoning effort none is unsupported"
+        ));
+        assert!(is_unsupported_reasoning_error(
+            422,
+            "reasoning is mandatory for this model"
+        ));
+        assert!(!is_unsupported_reasoning_error(
+            429,
+            "reasoning unavailable"
+        ));
+        assert!(!is_unsupported_reasoning_error(400, "invalid model"));
     }
 
     #[test]
@@ -3087,7 +3718,85 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].message_index, 2);
         assert_eq!(parsed[0].summary, "one");
+        let envelope = parse_indexed_user_summaries(
+            "{\"summaries\":[{\"message_index\":3,\"summary\":\"two\"}]}",
+        )
+        .unwrap();
+        assert_eq!(envelope[0].message_index, 3);
         assert!(parse_indexed_user_summaries("no json here").is_none());
+    }
+
+    #[test]
+    fn batch_validation_reports_shape_count_index_empty_and_privacy_failures() {
+        let items = vec![
+            item(
+                MessageKind::UserWrote,
+                "Add retry support to the network client now",
+            ),
+            item(MessageKind::UserWrote, "Use a compact toolbar layout"),
+        ];
+        let batch = [0, 1];
+        assert!(
+            validate_indexed_user_summaries("not json", &batch, &items, true)
+                .unwrap_err()
+                .contains("JSON shape")
+        );
+        assert!(
+            validate_indexed_user_summaries(
+                r#"{"summaries":[{"message_index":0,"summary":"Safe."}]}"#,
+                &batch,
+                &items,
+                true,
+            )
+            .unwrap_err()
+            .contains("count mismatch")
+        );
+        assert!(
+            validate_indexed_user_summaries(
+                r#"{"summaries":[{"message_index":1,"summary":"Safe."},{"message_index":0,"summary":"Also safe."}]}"#,
+                &batch,
+                &items,
+                true,
+            )
+            .unwrap_err()
+            .contains("index mismatch")
+        );
+        assert!(
+            validate_indexed_user_summaries(
+                r#"{"summaries":[{"message_index":0,"summary":""},{"message_index":1,"summary":"Safe."}]}"#,
+                &batch,
+                &items,
+                true,
+            )
+            .unwrap_err()
+            .contains("empty summary")
+        );
+        assert!(
+            validate_indexed_user_summaries(
+                r#"{"summaries":[{"message_index":0,"summary":"Add retry support to the network client now"},{"message_index":1,"summary":"The interface was simplified."}]}"#,
+                &batch,
+                &items,
+                true,
+            )
+            .unwrap_err()
+            .contains("privacy overlap")
+        );
+    }
+
+    #[test]
+    fn privacy_overlap_debug_report_keeps_original_and_rewrite_auditable() {
+        let report = privacy_overlap_debug_markdown(
+            17,
+            "Original prompt with ``` an embedded fence",
+            "Rewritten summary with the same private wording",
+            "2026-08-08T12:00:00Z",
+        );
+
+        assert!(report.contains("Message index: `17`"));
+        assert!(report.contains("Original prompt with ``` an embedded fence"));
+        assert!(report.contains("Rewritten summary with the same private wording"));
+        assert!(report.contains("````text"));
+        assert!(report.contains("contains the original private prompt"));
     }
 
     #[test]
@@ -3101,11 +3810,17 @@ mod tests {
         ];
 
         let (prefilled, batches) =
-            plan_user_entry_jobs(&items, ShortPromptPolicy::CopyForSubscriber);
+            plan_user_entry_jobs(&items, ShortPromptPolicy::CopyForSubscriber, None);
 
         assert_eq!(prefilled[0].as_deref(), Some("ok"));
         assert_eq!(prefilled[1], None);
         assert_eq!(batches, vec![vec![2, 3], vec![4]]);
+
+        let targets = BTreeSet::from([3]);
+        let (prefilled, batches) =
+            plan_user_entry_jobs(&items, ShortPromptPolicy::CopyForSubscriber, Some(&targets));
+        assert!(prefilled.iter().all(Option::is_none));
+        assert_eq!(batches, vec![vec![3]]);
     }
 
     #[test]
@@ -3113,7 +3828,7 @@ mod tests {
         let items = vec![item(MessageKind::UserWrote, "ok")];
 
         let (prefilled, batches) =
-            plan_user_entry_jobs(&items, ShortPromptPolicy::ParaphraseForPublic);
+            plan_user_entry_jobs(&items, ShortPromptPolicy::ParaphraseForPublic, None);
 
         assert_eq!(prefilled, vec![None]);
         assert_eq!(batches, vec![vec![0]]);
@@ -3124,7 +3839,7 @@ mod tests {
         let items = vec![item(MessageKind::UserWrote, "  \n  ")];
 
         let (prefilled, batches) =
-            plan_user_entry_jobs(&items, ShortPromptPolicy::CopyForSubscriber);
+            plan_user_entry_jobs(&items, ShortPromptPolicy::CopyForSubscriber, None);
 
         assert_eq!(prefilled[0].as_deref(), Some(EMPTY_USER_SUMMARY));
         assert!(batches.is_empty());
@@ -3137,7 +3852,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let (prefilled, batches) =
-            plan_user_entry_jobs(&items, ShortPromptPolicy::CopyForSubscriber);
+            plan_user_entry_jobs(&items, ShortPromptPolicy::CopyForSubscriber, None);
 
         assert!(prefilled.iter().all(|summary| summary.is_none()));
         assert_eq!(

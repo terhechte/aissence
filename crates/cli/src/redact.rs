@@ -69,6 +69,10 @@ impl Redactor {
                 change.diff = self.redact_text(&change.diff);
             }
         }
+        for failure in &mut summary.prompt_failures {
+            failure.model = self.redact_text(&failure.model);
+            failure.error = self.redact_text(&failure.error);
+        }
     }
 
     pub fn redact_commit(&self, commit: &mut AissenceCommit) {

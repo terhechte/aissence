@@ -54,14 +54,15 @@ pub use git::ProjectMetadata;
 pub use llm::{LlmApi, LlmConfig, LlmConfigOverrides};
 pub use model::{
     AgentUsage, CoalescedHistory, CodeChange, CommitFileChange, CommitFileStatus, CommitGroup,
-    CommitInfo, CommitStats, CommitSummary, MessageKind, MessageSummary, PublicBeat, PublicStory,
-    SUMMARIZER_VERSION, SummaryOrigin, TimedMessage, TokenCount, agents_for, friendly_agent,
+    CommitInfo, CommitStats, CommitSummary, MessageKind, MessageSummary, PromptSummaryFailure,
+    PublicBeat, PublicStory, SUMMARIZER_VERSION, SummaryOrigin, TimedMessage, TokenCount,
+    agents_for, friendly_agent,
 };
 pub use persist::SummaryStore;
 pub use redact::Redactor;
 pub use summarize::{
-    MAX_CONCURRENT_GROUPS, MAX_CONCURRENT_REQUESTS, SummarizationCost, SummarizationProgress,
-    SummarizationRequestKind, SummarizationRequestUsage, Summarizer,
+    MAX_CONCURRENT_GROUPS, MAX_CONCURRENT_REQUESTS, PromptSummarizationOutcome, SummarizationCost,
+    SummarizationProgress, SummarizationRequestKind, SummarizationRequestUsage, Summarizer,
 };
 pub use ui::{CodeView, DiffView};
 

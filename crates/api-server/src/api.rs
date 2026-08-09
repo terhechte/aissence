@@ -929,6 +929,23 @@ fn validate_summary(commit: &AissenceCommit, max_entry_chars: usize) -> Result<(
         validate_optional_text(agent.model.as_deref(), max_entry_chars)?;
         validate_token_count(agent.tokens)?;
     }
+    let mut failed_prompt_indices = std::collections::HashSet::new();
+    for failure in &summary.prompt_failures {
+        validate_text(&failure.model, max_entry_chars)?;
+        validate_text(&failure.error, max_entry_chars)?;
+        if failure.message_index >= commit.source.messages.len()
+            || commit.source.messages[failure.message_index].kind != MessageKind::UserWrote
+            || summary.messages[failure.message_index]
+                .subscriber_summary
+                .is_some()
+            || !failed_prompt_indices.insert(failure.message_index)
+        {
+            return Err(ApiError::Invalid(format!(
+                "invalid prompt failure metadata for {}",
+                commit.commit_hash
+            )));
+        }
+    }
     if summary
         .messages
         .iter()
@@ -1774,6 +1791,7 @@ mod tests {
             }],
             agents: Vec::new(),
             tokens: None,
+            prompt_failures: Vec::new(),
         });
         let body = serde_json::to_vec(&document).unwrap();
 
@@ -1806,6 +1824,7 @@ mod tests {
             }],
             agents: Vec::new(),
             tokens: None,
+            prompt_failures: Vec::new(),
         });
         let body = serde_json::to_vec(&document).unwrap();
 
@@ -1815,6 +1834,36 @@ mod tests {
                 .subscriber_summary
                 .as_deref(),
             Some(aissence::summarize::EMPTY_USER_SUMMARY)
+        );
+    }
+
+    #[test]
+    fn upload_parser_accepts_partial_prompt_results_with_retry_metadata() {
+        let mut document = sample_document();
+        document.commits[0].summary = Some(aissence::CommitSummary {
+            summarizer_version: aissence::SUMMARIZER_VERSION,
+            public: aissence::PublicStory {
+                subline: "Documentation behavior was clarified.".into(),
+                summary: "The documentation behavior was updated safely.".into(),
+                beats: Vec::new(),
+                origin: aissence::SummaryOrigin::Model,
+            },
+            messages: document.commits[0].source.messages.clone(),
+            agents: Vec::new(),
+            tokens: None,
+            prompt_failures: vec![aissence::PromptSummaryFailure {
+                message_index: 0,
+                model: "nvidia/example".into(),
+                error: "user-summary validation failed: JSON shape".into(),
+                attempted_at: chrono::DateTime::UNIX_EPOCH,
+            }],
+        });
+        let body = serde_json::to_vec(&document).unwrap();
+
+        let parsed = parse_upload(&test_config(), &body).unwrap();
+        assert_eq!(
+            parsed.commits[0].summary.as_ref().unwrap().prompt_failures[0].message_index,
+            0
         );
     }
 
@@ -1833,6 +1882,7 @@ mod tests {
                 messages: document.commits[0].source.messages.clone(),
                 agents: Vec::new(),
                 tokens: None,
+                prompt_failures: Vec::new(),
             });
 
             let body = serde_json::to_vec(&document).unwrap();

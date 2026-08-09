@@ -64,6 +64,11 @@ the command line can expose it in shell history and process listings, so
 `--api-key-env NAME` is preferred. Authentication is optional for compatible
 local endpoints.
 
+Pass `--debug` to a local summarize run to write every outbound LLM attempt to
+`/tmp/aissence-req-[timestamp]-[uuid].md`. Files contain the complete serialized
+request body, including prompt evidence, but never HTTP authorization headers
+or API keys. On Unix they are created with owner-only permissions.
+
 The same values can live under `[llm]` in `<project>/.aissence.toml`, or in a
 file selected with `--llm-config PATH`:
 
@@ -87,10 +92,18 @@ zero-configuration backend.
 Compatible endpoints use `POST <base_url>/chat/completions` with standard
 system/user messages, `temperature`, and `max_tokens`. OpenRouter-specific
 provider routing, ZDR policy fields, streaming usage, and cost metadata are
-only enabled for OpenRouter. Other endpoints use the more widely implemented
+only enabled for OpenRouter. OpenRouter requests also set unified reasoning
+effort to `none`; if a model requires reasoning, Aissence retries with
+`minimal`, then omits the reasoning parameter if the model rejects it entirely.
+Other endpoints use the more widely implemented
 non-streaming response path; token usage is recorded when returned, but cost is
 reported as unpriced unless the endpoint supplies OpenRouter-compatible cost
 metadata.
+
+OpenRouter batch prompt summaries use a strict JSON schema. Invalid batches
+fall back to individual prompt requests, successful partial results remain in
+the `.aissence` cache, and unresolved indexes retain model/error metadata for a
+later retry with the same or a different model.
 
 ## Server
 
