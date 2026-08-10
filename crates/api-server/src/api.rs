@@ -569,20 +569,15 @@ async fn sync_plan(
     let rows = client
         .query(
             "select commit_hash, source_digest, summary_status::text, public_prompt_summaries, \
-                    btrim(public_subline) <> '', coalesce(summarizer_version,0) \
+                    coalesce(summarizer_version,0) \
              from public.commits where project_id = $1",
             &[&project_id],
         )
         .await?;
-    type RemoteCommitState = (Option<String>, Option<String>, bool, bool, i32);
+    type RemoteCommitState = (Option<String>, Option<String>, bool, i32);
     let remote: HashMap<String, RemoteCommitState> = rows
         .into_iter()
-        .map(|row| {
-            (
-                row.get(0),
-                (row.get(1), row.get(2), row.get(3), row.get(4), row.get(5)),
-            )
-        })
+        .map(|row| (row.get(0), (row.get(1), row.get(2), row.get(3), row.get(4))))
         .collect();
     let mut seen = HashSet::new();
     let mut upload = Vec::new();
@@ -600,13 +595,11 @@ async fn sync_plan(
                 commit_hash: commit.commit_hash.clone(),
                 reason: UploadReason::Missing,
             }),
-            Some((digest, _status, public_prompts, has_subline, summary_version))
+            Some((digest, _status, public_prompts, summary_version))
                 if stored_commit_satisfies_upload(
                     digest.as_deref() == Some(commit.source_digest.as_str()),
                     commit.all_prompts,
                     *public_prompts,
-                    commit.has_subline,
-                    *has_subline,
                     commit.summarizer_version,
                     *summary_version,
                 ) =>
@@ -655,14 +648,11 @@ fn stored_commit_satisfies_upload(
     digest_matches: bool,
     incoming_all_prompts: bool,
     stored_public_prompts: bool,
-    incoming_has_subline: bool,
-    stored_has_subline: bool,
     incoming_summary_version: u32,
     stored_summary_version: i32,
 ) -> bool {
     digest_matches
         && (!incoming_all_prompts || stored_public_prompts)
-        && (!incoming_has_subline || stored_has_subline)
         && (incoming_summary_version == 0
             || i64::from(stored_summary_version) >= i64::from(incoming_summary_version))
 }
@@ -959,12 +949,6 @@ fn validate_summary(commit: &AissenceCommit, max_entry_chars: usize) -> Result<(
     }
     let mut seen_beats = std::collections::HashSet::new();
     if summary.public.summary.trim().is_empty()
-        || summary.public.subline.trim().is_empty()
-        || summary
-            .public
-            .subline
-            .trim()
-            .eq_ignore_ascii_case(commit.title.trim())
         || summary.public.beats.len() > 3
         || aissence::summarize::public_story_has_verbatim_prompt(
             &summary.public,
@@ -999,8 +983,8 @@ fn validate_summary(commit: &AissenceCommit, max_entry_chars: usize) -> Result<(
                 generated.kind == MessageKind::UserWrote
                     && generated.subscriber_summary.as_deref().is_some_and(|text| {
                         let public = aissence::PublicStory {
-                            subline: text.to_string(),
-                            summary: "Safe placeholder.".into(),
+                            subline: String::new(),
+                            summary: text.to_string(),
                             beats: Vec::new(),
                             origin: aissence::SummaryOrigin::Model,
                         };
@@ -1169,10 +1153,6 @@ async fn ingest_document(
                     message.kind != MessageKind::UserWrote || message.subscriber_summary.is_some()
                 })
         });
-        let incoming_subline = commit
-            .summary
-            .as_ref()
-            .is_some_and(|summary| !summary.public.subline.trim().is_empty());
         let incoming_summary_version = commit
             .summary
             .as_ref()
@@ -1183,8 +1163,7 @@ async fn ingest_document(
                 "select c.id, c.source_digest, c.summary_status::text, \
                  exists(select 1 from public.summary_jobs sj where sj.commit_id=c.id \
                         and sj.status in ('queued','processing')), \
-                 c.public_prompt_summaries, btrim(c.public_subline) <> '', \
-                 coalesce(c.summarizer_version,0) \
+                 c.public_prompt_summaries, coalesce(c.summarizer_version,0) \
                  from public.commits c \
                  where project_id = $1 and commit_hash = $2",
                 &[&project_id, &commit.commit_hash],
@@ -1193,7 +1172,7 @@ async fn ingest_document(
         if existing.as_ref().is_some_and(|row| {
             (row.get::<_, Option<String>>(1).as_deref() != Some(commit.source_digest.as_str())
                 || incoming_all_prompts
-                || incoming_subline)
+                || incoming_summary_version > 0)
                 && row.get::<_, bool>(3)
         }) {
             return Err(ApiError::Conflict(format!(
@@ -1206,10 +1185,8 @@ async fn ingest_document(
                 row.get::<_, Option<String>>(1).as_deref() == Some(commit.source_digest.as_str()),
                 incoming_all_prompts,
                 row.get::<_, bool>(4),
-                incoming_subline,
-                row.get::<_, bool>(5),
                 incoming_summary_version,
-                row.get::<_, i32>(6),
+                row.get::<_, i32>(5),
             )
         });
         if unchanged {
@@ -1313,7 +1290,7 @@ async fn ingest_document(
                     &u64_to_i64(commit.stats.lines_added)?,
                     &u64_to_i64(commit.stats.lines_deleted)?,
                     &summary.map(|s| s.public.summary.as_str()).unwrap_or(""),
-                    &summary.map(|s| s.public.subline.as_str()).unwrap_or(""),
+                    &"",
                     &summary
                         .map(|s| serde_json::to_value(&s.public.beats))
                         .transpose()
@@ -1716,14 +1693,10 @@ mod tests {
 
     #[test]
     fn source_only_sync_does_not_require_a_remote_summary() {
-        assert!(stored_commit_satisfies_upload(
-            true, false, false, false, false, 0, 0,
-        ));
+        assert!(stored_commit_satisfies_upload(true, false, false, 0, 0));
         assert!(!stored_commit_satisfies_upload(
             true,
             false,
-            false,
-            true,
             false,
             aissence::SUMMARIZER_VERSION,
             0,
@@ -1732,8 +1705,6 @@ mod tests {
             true,
             false,
             false,
-            true,
-            true,
             aissence::SUMMARIZER_VERSION,
             aissence::SUMMARIZER_VERSION as i32,
         ));
@@ -1776,7 +1747,7 @@ mod tests {
         document.commits[0].summary = Some(aissence::CommitSummary {
             summarizer_version: aissence::SUMMARIZER_VERSION,
             public: aissence::PublicStory {
-                subline: "Documentation behavior was clarified.".into(),
+                subline: String::new(),
                 summary: "The documentation was updated.".into(),
                 beats: Vec::new(),
                 origin: aissence::SummaryOrigin::Model,
@@ -1809,7 +1780,7 @@ mod tests {
         document.commits[0].summary = Some(aissence::CommitSummary {
             summarizer_version: aissence::SUMMARIZER_VERSION,
             public: aissence::PublicStory {
-                subline: "An empty request was recorded.".into(),
+                subline: String::new(),
                 summary: "An empty request entry was recorded.".into(),
                 beats: Vec::new(),
                 origin: aissence::SummaryOrigin::Model,
@@ -1843,7 +1814,7 @@ mod tests {
         document.commits[0].summary = Some(aissence::CommitSummary {
             summarizer_version: aissence::SUMMARIZER_VERSION,
             public: aissence::PublicStory {
-                subline: "Documentation behavior was clarified.".into(),
+                subline: String::new(),
                 summary: "The documentation behavior was updated safely.".into(),
                 beats: Vec::new(),
                 origin: aissence::SummaryOrigin::Model,
@@ -1868,29 +1839,24 @@ mod tests {
     }
 
     #[test]
-    fn upload_parser_rejects_empty_or_title_repeating_sublines() {
-        for subline in ["", "Test commit"] {
-            let mut document = sample_document();
-            document.commits[0].summary = Some(aissence::CommitSummary {
-                summarizer_version: aissence::SUMMARIZER_VERSION,
-                public: aissence::PublicStory {
-                    subline: subline.into(),
-                    summary: "The requested documentation behavior was clarified.".into(),
-                    beats: Vec::new(),
-                    origin: aissence::SummaryOrigin::Model,
-                },
-                messages: document.commits[0].source.messages.clone(),
-                agents: Vec::new(),
-                tokens: None,
-                prompt_failures: Vec::new(),
-            });
+    fn upload_parser_accepts_legacy_generated_sublines() {
+        let mut document = sample_document();
+        document.commits[0].summary = Some(aissence::CommitSummary {
+            summarizer_version: aissence::SUMMARIZER_VERSION,
+            public: aissence::PublicStory {
+                subline: "Obsolete duplicate summary.".into(),
+                summary: "The requested documentation behavior was clarified.".into(),
+                beats: Vec::new(),
+                origin: aissence::SummaryOrigin::Model,
+            },
+            messages: document.commits[0].source.messages.clone(),
+            agents: Vec::new(),
+            tokens: None,
+            prompt_failures: Vec::new(),
+        });
 
-            let body = serde_json::to_vec(&document).unwrap();
-            assert!(matches!(
-                parse_upload(&test_config(), &body),
-                Err(ApiError::Invalid(detail)) if detail.contains("invalid public story")
-            ));
-        }
+        let body = serde_json::to_vec(&document).unwrap();
+        assert!(parse_upload(&test_config(), &body).is_ok());
     }
 
     #[tokio::test]

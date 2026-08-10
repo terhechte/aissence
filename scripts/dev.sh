@@ -110,33 +110,32 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 if curl --silent --fail "$API_URL/health" >/dev/null 2>&1; then
-  echo "An Aissence API is already running at $API_URL. Stop it before starting this stack." >&2
-  exit 1
-fi
-
-(
-  cd "$REPOSITORY_DIR"
-  exec cargo run -p aissence-server
-) &
-SERVER_PID="$!"
-for _ in {1..120}; do
-  if curl --silent --fail "$API_URL/health" >/dev/null 2>&1; then
-    break
-  fi
-  if ! kill -0 "$SERVER_PID" >/dev/null 2>&1; then
-    wait "$SERVER_PID"
+  echo "Reusing the Aissence API already running at $API_URL."
+else
+  (
+    cd "$REPOSITORY_DIR"
+    exec cargo run -p aissence-server
+  ) &
+  SERVER_PID="$!"
+  for _ in {1..120}; do
+    if curl --silent --fail "$API_URL/health" >/dev/null 2>&1; then
+      break
+    fi
+    if ! kill -0 "$SERVER_PID" >/dev/null 2>&1; then
+      wait "$SERVER_PID"
+      exit 1
+    fi
+    sleep 0.5
+  done
+  if ! curl --silent --fail "$API_URL/health" >/dev/null 2>&1; then
+    echo "The Aissence API did not become ready." >&2
     exit 1
   fi
-  sleep 0.5
-done
-if ! curl --silent --fail "$API_URL/health" >/dev/null 2>&1; then
-  echo "The Aissence API did not become ready." >&2
-  exit 1
 fi
 
 (
   cd "$FRONTEND_DIR"
-  exec pnpm dev --host 127.0.0.1 --port 5173
+  exec pnpm dev --host 127.0.0.1 --port 5173 --strictPort
 ) &
 FRONTEND_PID="$!"
 for _ in {1..120}; do

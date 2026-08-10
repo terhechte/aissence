@@ -145,6 +145,25 @@ terminal:
 cargo run -p aissence -- sync /path/to/project
 ```
 
+### Fast local summary previews
+
+For quick iteration on the summarization prompts and ledger rendering, run:
+
+```sh
+scripts/preview-summary.sh /path/to/project openai/gpt-5.4
+
+# Also generate a summary for every user prompt.
+scripts/preview-summary.sh --all-prompts /path/to/project openai/gpt-5.4
+```
+
+The script removes the target repository's existing `.aissence` cache, runs
+local summarization with the selected OpenRouter model, starts `scripts/dev.sh`
+in the background when the frontend is not already available, and opens an
+in-memory preview in the default browser. Re-running it reuses the development
+server. The preview upload requires no login, but exists only in Vite
+development mode, accepts only a loopback host, and disappears when the server
+restarts (or after 24 hours). The normal authenticated upload path is unchanged.
+
 The startup migration is idempotent and creates the import queue, usage ledger,
 and hashed device/refresh-token tables. Production must use HTTPS and unique,
 high-entropy values for both JWT secrets. Aissence stores hashes—not plaintext—

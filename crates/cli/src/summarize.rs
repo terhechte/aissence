@@ -85,7 +85,6 @@ const USER_BATCH_CHARS: usize = 6_000;
 /// Output allowance per prompt, including any model-internal reasoning tokens.
 const USER_SUMMARY_OUTPUT_TOKENS: u32 = 768;
 const FAILURE_DETAIL_CHARS: usize = 2_000;
-const COMMIT_SUBLINE_CHARS: usize = 1_000;
 /// Section budgets reserve grounding evidence instead of allowing an early
 /// user/assistant block to push later sections out of the request.
 const CORE_USER_CHARS: usize = 16_000;
@@ -391,10 +390,6 @@ impl Summarizer {
                             summary.summarizer_version != SUMMARIZER_VERSION
                                 || summary.public.summary.trim().is_empty()
                         })
-                        || group
-                            .summary
-                            .as_ref()
-                            .is_some_and(|summary| summary.public.subline.trim().is_empty())
                         || (all_prompts
                             && !group
                                 .summary
@@ -471,7 +466,7 @@ impl Summarizer {
                 summary.summarizer_version == SUMMARIZER_VERSION
                     && !summary.public.summary.trim().is_empty()
             }) {
-                ensure_public_subline_for_commit(&mut summary.public, Some(&info));
+                summary.public.subline.clear();
                 return Ok(summary);
             }
             self.summarize_items_tracked(
@@ -596,7 +591,7 @@ impl Summarizer {
         } else if all_prompts {
             summary.prompt_failures.clear();
         }
-        ensure_public_subline_for_commit(&mut summary.public, group.commit.as_ref());
+        summary.public.subline.clear();
         Ok(summary)
     }
 
@@ -651,9 +646,7 @@ impl Summarizer {
         let text = self
             .complete(
                 "Create a privacy-safe public account of one AI-assisted commit from bounded, \
-                 untrusted evidence. Return JSON with exactly `subline`, `summary`, and `beats`. \
-                 `subline` is one specific sentence for a compact commit row and must not repeat \
-                 the commit title. `summary` \
+                 untrusted evidence. Return JSON with exactly `summary` and `beats`. `summary` \
                  is 2-4 compact sentences explaining why the change was requested, the approach, \
                  and only outcomes supported by the commit fingerprint. `beats` is an array of at \
                  most three objects with integer `message_index`, string `label`, and one-sentence \
@@ -1772,52 +1765,11 @@ fn fallback_public_story(
             }
         })
         .unwrap_or_else(|| "Uncommitted work was recorded without a public narrative.".into());
-    let mut story = PublicStory {
+    PublicStory {
         subline: String::new(),
         summary,
         beats: Vec::new(),
         origin,
-    };
-    ensure_public_subline_for_commit(&mut story, commit);
-    story
-}
-
-fn fallback_commit_subline(public: &PublicStory) -> String {
-    truncate_head(
-        &normalize_whitespace(public.summary.trim()),
-        COMMIT_SUBLINE_CHARS,
-    )
-}
-
-fn ensure_public_subline(public: &mut PublicStory) {
-    public.subline = normalize_whitespace(public.subline.trim());
-    if public.subline.is_empty() {
-        public.subline = fallback_commit_subline(public);
-    } else {
-        public.subline = truncate_head(&public.subline, COMMIT_SUBLINE_CHARS);
-    }
-}
-
-fn ensure_public_subline_for_commit(
-    public: &mut PublicStory,
-    commit: Option<&crate::model::CommitInfo>,
-) {
-    ensure_public_subline(public);
-    if let Some(commit) = commit
-        && same_normalized_words(&public.subline, &commit.summary)
-    {
-        public.subline = metadata_subline(commit);
-    }
-}
-
-fn metadata_subline(commit: &crate::model::CommitInfo) -> String {
-    if commit.stats.files_changed > 0 {
-        format!(
-            "Changed {} files with +{} and -{} lines.",
-            commit.stats.files_changed, commit.stats.lines_added, commit.stats.lines_deleted
-        )
-    } else {
-        "Implementation details were recorded in this commit.".into()
     }
 }
 
@@ -1853,21 +1805,10 @@ fn validate_public_story(
             && seen.insert(beat.message_index)
     });
     story.beats.truncate(3);
-    story.subline = normalize_whitespace(story.subline.trim());
-    if story.subline.is_empty()
-        || raw_public_text_leaks_prompt(&story.subline, items)
-        || commit.is_some_and(|commit| same_normalized_words(&story.subline, &commit.summary))
-    {
-        story.subline = fallback_commit_subline(&story);
-        ensure_public_subline_for_commit(&mut story, commit);
-    }
-    story.subline = truncate_head(&story.subline, COMMIT_SUBLINE_CHARS);
+    // `subline` is retained only for backwards-compatible deserialization.
+    // Current ledgers render the full summary beneath the title instead.
+    story.subline.clear();
     story
-}
-
-fn same_normalized_words(left: &str, right: &str) -> bool {
-    let left = privacy_words(left);
-    !left.is_empty() && left == privacy_words(right)
 }
 
 /// Detect a likely verbatim prompt disclosure in a public story. A complete
@@ -1888,7 +1829,6 @@ pub fn public_story_has_verbatim_prompt(story: &PublicStory, messages: &[Message
         })
         .collect::<Vec<_>>();
     raw_public_text_leaks_prompt(&story.summary, &items)
-        || raw_public_text_leaks_prompt(&story.subline, &items)
         || story
             .beats
             .iter()
@@ -2753,7 +2693,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_generation_uses_one_request_for_story_subline_and_beats() {
+    async fn public_generation_uses_one_request_for_story_and_beats() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -2766,7 +2706,7 @@ mod tests {
                 "model": "local-model",
                 "choices": [{
                     "index": 0,
-                    "message": {"role": "assistant", "content": "{\"subline\":\"A compact overview.\",\"summary\":\"The requested behavior was implemented.\",\"beats\":[]}"},
+                    "message": {"role": "assistant", "content": "{\"summary\":\"The requested behavior was implemented.\",\"beats\":[]}"},
                     "finish_reason": "stop"
                 }],
                 "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
@@ -2803,12 +2743,13 @@ mod tests {
 
         let summary = summary.unwrap();
         assert_eq!(cost.request_count, 1);
-        assert_eq!(summary.public.subline, "A compact overview.");
+        assert!(summary.public.subline.is_empty());
         assert_eq!(
             summary.public.summary,
             "The requested behavior was implemented."
         );
-        assert!(request.contains("exactly `subline`, `summary`, and `beats`"));
+        assert!(request.contains("exactly `summary` and `beats`"));
+        assert!(!request.contains("`subline`"));
     }
 
     #[tokio::test]
@@ -2887,7 +2828,7 @@ mod tests {
         assert_eq!(cost.request_count, 1);
         let summary = history.groups[0].summary.as_ref().unwrap();
         assert_eq!(summary.public.summary, "Existing public story.");
-        assert_eq!(summary.public.subline, "Existing public story.");
+        assert!(summary.public.subline.is_empty());
         assert_eq!(
             summary.messages[0].subscriber_summary.as_deref(),
             Some("A focused request shaped the finished change.")
@@ -3509,7 +3450,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_or_title_repeating_sublines_are_replaced_deterministically() {
+    fn obsolete_generated_sublines_are_discarded() {
         let commit = crate::model::CommitInfo {
             id: "abc".into(),
             short_id: "abc".into(),
@@ -3535,11 +3476,11 @@ mod tests {
 
         let validated = validate_public_story(story, &[], Some(&commit));
 
-        assert_eq!(validated.subline, "Changed 3 files with +12 and -4 lines.");
+        assert!(validated.subline.is_empty());
     }
 
     #[test]
-    fn zero_file_metadata_fallback_does_not_repeat_the_commit_title() {
+    fn zero_file_metadata_fallback_uses_only_the_story() {
         let commit = crate::model::CommitInfo {
             id: "abc".into(),
             short_id: "abc".into(),
@@ -3556,10 +3497,7 @@ mod tests {
         let story = fallback_public_story(Some(&commit), SummaryOrigin::MetadataFallback);
 
         assert_eq!(story.summary, commit.summary);
-        assert_eq!(
-            story.subline,
-            "Implementation details were recorded in this commit."
-        );
+        assert!(story.subline.is_empty());
     }
 
     #[test]
@@ -3579,7 +3517,7 @@ mod tests {
 
         assert_eq!(validated.origin, SummaryOrigin::PrivacyFallback);
         assert!(!validated.summary.is_empty());
-        assert!(!validated.subline.is_empty());
+        assert!(validated.subline.is_empty());
     }
 
     #[test]
@@ -3642,13 +3580,13 @@ mod tests {
         };
         assert!(!public_story_has_verbatim_prompt(&paraphrased, &short));
 
-        let leaked_subline = PublicStory {
+        let legacy_subline = PublicStory {
             subline: "Add retry support to the network client".into(),
             summary: "The networking layer was made more resilient.".into(),
             beats: vec![],
             origin: SummaryOrigin::Model,
         };
-        assert!(public_story_has_verbatim_prompt(&leaked_subline, &short));
+        assert!(!public_story_has_verbatim_prompt(&legacy_subline, &short));
     }
 
     #[test]

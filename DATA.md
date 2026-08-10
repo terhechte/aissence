@@ -68,7 +68,7 @@ redaction upgrades explicit synchronization changes.
 `summary` is absent or `null` until generated. When present it contains:
 
 - `public.summary`: the single privacy-safe commit narrative
-- `public.subline`: the compact summary shown beneath the commit title
+- `public.subline`: a legacy compatibility field; current generation leaves it empty
 - `public.beats`: zero to three representative, paraphrased prompt moments
 - `public.origin`: `model` or the explicit metadata/parse/privacy fallback used
 - `summarizer_version`: the prompt, evidence, and validation policy version
@@ -79,8 +79,8 @@ redaction upgrades explicit synchronization changes.
 - `agents` and `tokens`
 
 The summary message list must have the same length and kinds as `source.messages`.
-Normal public generation makes one request per commit for the story, subline,
-and beats together, and leaves every `subscriber_summary` absent. Subscriber summaries are normally a separate
+Normal public generation makes one request per commit for the story and beats
+together, and leaves every `subscriber_summary` absent. Subscriber summaries are normally a separate
 on-demand tier; `--all-prompts` is the explicit exception that publishes a
 complete locally generated set.
 

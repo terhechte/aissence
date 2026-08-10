@@ -77,26 +77,6 @@
     );
   });
 
-  const projectMilestones = $derived.by(() => {
-    const ready = commits.filter((commit: any) =>
-      String(commit.public_subline || commit.public_story || '').trim()
-    );
-    if (ready.length <= 4) return ready;
-    const first = ready[0];
-    const last = ready.at(-1);
-    const middle = ready.slice(1, -1);
-    const impact = [...middle]
-      .sort((left: any, right: any) =>
-        Number(right.files_changed ?? 0) + Number(right.lines_added ?? 0) + Number(right.lines_deleted ?? 0) -
-        (Number(left.files_changed ?? 0) + Number(left.lines_added ?? 0) + Number(left.lines_deleted ?? 0))
-      )[0];
-    const midpoint = middle[Math.floor(middle.length / 2)];
-    return [first, impact, midpoint, last]
-      .filter(Boolean)
-      .filter((commit, index, selected) => selected.findIndex((item) => item.id === commit.id) === index)
-      .sort((left, right) => Number(left.sort_order ?? 0) - Number(right.sort_order ?? 0));
-  });
-
   function chartRatio(value: number, maximum: number) {
     const safeValue = Math.max(0, value);
     const safeMaximum = Math.max(1, maximum);
@@ -161,8 +141,6 @@
 
   function promptBlurb(commit: any) {
     const count = promptCount(commit);
-    const subline = String(commit.public_subline ?? '').trim();
-    if (subline) return subline;
     const story = String(commit.public_story ?? '').trim();
     if (story) return story;
     if (commit.summary_status === 'failed') return 'Public story generation failed; the creator can retry it.';
@@ -170,20 +148,6 @@
     return count
       ? `${count} ${count === 1 ? 'prompt' : 'prompts'} · public story is being prepared`
       : 'No user prompt was associated with this commit.';
-  }
-
-  function summaryOriginLabel(commit: any) {
-    if (commit.summary_status === 'failed') return 'failed';
-    if (['queued', 'processing'].includes(commit.summary_status) && !commit.public_story) {
-      return commit.summary_status;
-    }
-    switch (commit.summary_origin) {
-      case 'metadata_fallback': return 'metadata fallback';
-      case 'parse_fallback': return 'format fallback';
-      case 'privacy_fallback': return 'privacy fallback';
-      case 'model': return 'model summary';
-      default: return commit.public_story ? 'summary' : 'pending';
-    }
   }
 
   function sameText(left: unknown, right: unknown) {
@@ -258,19 +222,6 @@
         {#if project.repository_url}<a href={project.repository_url} target="_blank" rel="noreferrer">Repository ↗</a>{/if}
         {#if totals.first && totals.last}<span>{formatDate(totals.first)} – {formatDate(totals.last)}</span>{/if}
       </div>
-      {#if projectMilestones.length}
-        <div class="project-arc">
-          <p class="label">Project arc from the commit record</p>
-          <ol>
-            {#each projectMilestones as milestone}
-              <li>
-                <span>{formatDate(milestone.committed_at, { month: 'short', day: 'numeric', year: undefined })}</span>
-                <div><strong>{milestone.title}</strong><p>{milestone.public_subline || milestone.public_story}</p></div>
-              </li>
-            {/each}
-          </ol>
-        </div>
-      {/if}
     </div>
 
     <div class="gallery">
@@ -381,14 +332,13 @@
               <div>
                 <div class="summary-grid">
                   <div>
-                    <span>How this commit came to be · {summaryOriginLabel(commit)}</span>
-                    <PromptMarkdown content={commit.public_story || promptBlurb(commit)} />
+                    <span>Changed</span>
+                    <p>{changedSummary(commit)}</p>
                     {#if isOwner && commit.summary_error}<p class="summary-error">{commit.summary_error}</p>{/if}
                     {#if isOwner && commit.summary_status === 'succeeded' && !publicPromptSummaries(commit).length && !publicBeats(commit).length}
                       <p class="summary-note">No representative prompt moments were returned or passed the privacy checks.</p>
                     {/if}
                   </div>
-                  <div><span>Changed</span><p>{changedSummary(commit)}</p></div>
                 </div>
 
                 {#if !isEntitled}
@@ -410,7 +360,7 @@
                         </div>
                       {/each}
                     {/if}
-                    <p class="public-activity">{promptCount(commit)} user {promptCount(commit) === 1 ? 'prompt' : 'prompts'}, {Number(commit.reply_count ?? 0)} agent replies, and {Number(commit.change_message_count ?? 0)} recorded change steps.</p>
+                    <p class="public-activity">{promptCount(commit)} user {promptCount(commit) === 1 ? 'prompt' : 'prompts'}, {Number(commit.reply_count ?? 0)} agent replies, and {Number(commit.change_message_count ?? 0)} agent code-edit {Number(commit.change_message_count ?? 0) === 1 ? 'event' : 'events'}.</p>
                     {#if !publicPromptSummaries(commit).length}
                       <div class="locked">
                         <span>Every prompt summary and full prompt is reserved for subscribers</span>
@@ -551,29 +501,6 @@
     color: var(--muted);
     font: 400 10px/1 'JetBrains Mono', monospace;
   }
-  .project-arc {
-    margin-top: 38px;
-    border-top: 1px solid var(--rule2);
-    padding-top: 14px;
-  }
-  .project-arc ol {
-    list-style: none;
-    margin: 10px 0 0;
-    padding: 0;
-  }
-  .project-arc li {
-    display: grid;
-    grid-template-columns: 62px 1fr;
-    gap: 14px;
-    padding: 12px 0;
-    border-top: 1px solid var(--rule);
-  }
-  .project-arc li > span {
-    color: var(--muted);
-    font: 400 9px/1.4 'JetBrains Mono', monospace;
-  }
-  .project-arc strong { font-weight: 500; }
-  .project-arc p { margin: 4px 0 0; color: var(--soft); line-height: 1.4; }
   .gallery {
     border-top: 1px solid var(--ink);
     padding-top: 13px;
@@ -645,6 +572,8 @@
   .chart {
     display: flex;
     flex-direction: column;
+    height: 230px;
+    align-self: center;
   }
   .chart-head {
     display: flex;
@@ -959,8 +888,7 @@
   }
   .summary-grid {
     display: grid;
-    grid-template-columns: repeat(2, 1fr);
-    gap: 28px;
+    grid-template-columns: minmax(0, 1fr);
     padding-top: 20px;
     border-top: 1px solid var(--rule2);
   }
@@ -994,8 +922,6 @@
   }
   .public-story {
     margin-top: 28px;
-    padding-top: 19px;
-    border-top: 1px solid var(--rule2);
   }
   .public-story h4,
   .public-beat > span {
@@ -1151,6 +1077,9 @@
     .project-intro,
     .account {
       grid-template-columns: 1fr;
+    }
+    .chart {
+      align-self: stretch;
     }
     .commit-row {
       grid-template-columns: 64px 1fr 20px;

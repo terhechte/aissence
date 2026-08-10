@@ -39,7 +39,7 @@ export const load: PageServerLoad = async ({ locals, params, parent }) => {
         .order('created_at', { ascending: false }),
       supabase
         .from('commits')
-        .select('id,prompt_count,summary_status,summary_origin,public_story,public_subline,summarizer_version')
+        .select('id,prompt_count,summary_status,summary_origin,public_story,summarizer_version')
         .eq('project_id', params.id)
     ]);
   if (!project) redirect(303, '/dashboard');
@@ -59,8 +59,7 @@ export const load: PageServerLoad = async ({ locals, params, parent }) => {
     (commit) =>
       commit.summary_status === 'succeeded' &&
       Number(commit.summarizer_version ?? 0) >= 2 &&
-      String(commit.public_story ?? '').trim() &&
-      String(commit.public_subline ?? '').trim()
+      String(commit.public_story ?? '').trim()
   );
 
   return {

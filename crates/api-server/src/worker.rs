@@ -307,7 +307,7 @@ async fn succeed_public_job(
             &[
                 &job.commit_id,
                 &summary.public.summary,
-                &summary.public.subline,
+                &"",
                 &serde_json::to_value(&summary.public.beats)?,
                 &summary_origin(summary.public.origin),
                 &(aissence::SUMMARIZER_VERSION as i32),

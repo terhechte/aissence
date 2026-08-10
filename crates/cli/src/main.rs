@@ -409,10 +409,9 @@ async fn upload_document(
                                     || message.subscriber_summary.is_some()
                             })
                     }),
-                    has_subline: commit
-                        .summary
-                        .as_ref()
-                        .is_some_and(|summary| !summary.public.subline.trim().is_empty()),
+                    // Retained in the wire format for compatibility with older
+                    // servers. Version 3 no longer generates a separate subline.
+                    has_subline: false,
                     summarizer_version: commit
                         .summary
                         .as_ref()

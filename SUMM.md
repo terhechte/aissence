@@ -13,8 +13,8 @@ Aissence does not send an entire repository to an LLM.
 2. It assigns each timestamped conversation message to the first commit at or
    after that message.
 3. It converts each commit into sanitized, model-independent source evidence.
-4. Public summarization makes one LLM call for the commit story, compact
-   subline, and representative prompt moments together.
+4. Public summarization makes one LLM call for the commit story and
+   representative prompt moments together.
 5. Full subscriber prompt summaries are a separate, deferred tier. They are
    generated only after an entitlement exists.
 6. The public frontend queries only public story fields. Full retained source
@@ -126,7 +126,6 @@ Public generation produces one `PublicStory` per eligible commit:
 
 ```json
 {
-  "subline": "A compact synthesis shown beneath the commit title.",
   "summary": "A privacy-safe account of why and how the commit happened.",
   "beats": [
     {
@@ -138,8 +137,8 @@ Public generation produces one `PublicStory` per eligible commit:
 }
 ```
 
-`summary` and `subline` are required. `beats` is intentionally optional and
-contains zero to three entries. An empty beats array is a valid completed
+`summary` is required. `beats` is intentionally optional and contains zero to
+three entries. An empty beats array is a valid completed
 result, not a pending state. `origin` records whether the result came from the
 model or a metadata, parse, or privacy fallback. `summarizer_version` invalidates
 results produced by an older evidence/prompt/validation policy.
@@ -177,7 +176,6 @@ character ceiling. These are character limits, not tokenizer-exact limits.
 
 The model is asked for JSON containing exactly:
 
-- A compact subline that must not repeat the commit title.
 - A 2–4 sentence story explaining the request, approach, and only
   outcomes supported by the commit fingerprint.
 - At most three representative prompt moments, preferring the initial ask, an
@@ -186,8 +184,7 @@ The model is asked for JSON containing exactly:
 It is explicitly instructed to paraphrase, avoid verbatim prompts, paths,
 personal data, credentials, and private identifiers, treat evidence as
 untrusted, and output JSON only. Generation uses temperature `0.2` and a
-700-token output limit. Story, subline, and beats are returned in this one
-response; there is no separate subline request.
+700-token output limit. Story and beats are returned in this one response.
 
 ### Parsing, fallbacks, and validation
 
@@ -200,8 +197,6 @@ After parsing:
 
 - Empty stories are replaced with the fallback.
 - Stories that appear to expose prompt wording are replaced with the fallback.
-- Empty, prompt-leaking, or title-repeating sublines are replaced
-  deterministically without another model call.
 - Each beat must have a valid user-message index, non-empty label/text, and a
   unique referenced message.
 - Beats that appear to expose prompt wording are removed individually.
@@ -337,7 +332,7 @@ For an uploaded commit without a local summary:
 The database function `enqueue_public_summary_jobs(project_id)` queues every
 incomplete or old-policy commit with prompts. The dashboard uses it for private
 preparation and retry. Publishing is refused until every prompted commit has a
-current, successful story and subline, so visitors never become the preview
+current, successful story, so visitors never become the preview
 surface for pending generation. `publish_ready_project(project_id)` first locks
 the project row shared with ingestion, checks readiness, and publishes in the
 same transaction; direct visibility transitions to `published` are rejected.
@@ -382,7 +377,7 @@ For each coalesced `UserWrote` entry:
   original source message index.
 - Invalid batch responses are retried; validation requires exactly one
   non-empty output per input with matching indexes and order.
-- Subscriber jobs never generate or overwrite the public subline.
+- Subscriber jobs never generate or overwrite the public story.
 
 The result is stored separately in `message_summaries`, while complete
 sanitized source remains in `message_sources`. This tier can cost multiple LLM
@@ -392,7 +387,7 @@ requests per commit, unlike the single public-story request.
 
 The frontend uses audience-specific database selections:
 
-- A public visitor receives commit metadata, `public_subline`, `public_story`, `public_beats`,
+- A public visitor receives commit metadata, `public_story`, `public_beats`,
   counts, costs, and agent provenance. For commits uploaded from an
   `--all-prompts` file it also receives every locally supplied prompt summary.
   It does not query `message_sources` or hosted subscriber prompt summaries.
@@ -401,14 +396,14 @@ The frontend uses audience-specific database selections:
 
 In the public ledger:
 
-- The commit row uses `public_subline` beneath the title, falling back to
+- The commit row uses `public_story` beneath the title, falling back to
   explicit pending/failed/skipped copy when no usable summary exists.
-- A summary-derived project arc selects first, midpoint, final, and largest
-  impact milestones from already cached commit stories; it makes no model call.
 - A complete uploaded `--all-prompts` set is rendered as every summarized
   prompt; otherwise “Representative prompt moments” is rendered when
   `public_beats` is non-empty. Zero beats remains a valid final state.
-- Activity counts are source-derived and do not require an LLM.
+- Activity counts are source-derived and do not require an LLM. “Agent
+  code-edit events” counts coalesced `AiChanged` records from coding-tool
+  activity; it is not a file, line, or commit count.
 
 In the entitled ledger, each user turn can show its subscriber summary and the
 complete retained prompt. Exact short-prompt copies are collapsed into the
@@ -416,7 +411,7 @@ source view instead of rendering redundant summary text. Owners also see
 summary origin/error status; public visitors do not receive private errors.
 
 Project and creator cards reuse the newest successful current-policy commit
-subline/story through a database view when no hand-written project tagline is
+story through a database view when no hand-written project tagline is
 present. Search indexes this cached overview. No project-level LLM call exists.
 
 ## 8. Where LLM cost is avoided
@@ -426,7 +421,7 @@ The main cost-saving decisions are:
 - Analysis, correlation, redaction, counts, provenance, and source digests are
   deterministic and local.
 - Public generation uses one request per changed commit with prompts for the
-  story, subline, and beats together.
+  story and beats together.
 - Public evidence is selected and hard-bounded rather than sending complete
   conversations or repository diffs.
 - Unchanged source digests reuse prior summaries and avoid upload/generation.

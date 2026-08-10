@@ -9,7 +9,7 @@ export async function attachProjectOverviews(supabase: any, projects: any[]) {
 
   const { data } = await supabase
     .from('project_summary_overviews')
-    .select('project_id,title,public_subline,public_story,sort_order')
+    .select('project_id,title,public_story,sort_order')
     .in('project_id', ids)
     .order('sort_order', { ascending: false });
 
@@ -22,7 +22,7 @@ export async function attachProjectOverviews(supabase: any, projects: any[]) {
     const commit = newest.get(project.id);
     return {
       ...project,
-      summary_overview: String(commit?.public_subline || commit?.public_story || '').trim() || null,
+      summary_overview: String(commit?.public_story || '').trim() || null,
       summary_commit_title: commit?.title ?? null
     };
   });

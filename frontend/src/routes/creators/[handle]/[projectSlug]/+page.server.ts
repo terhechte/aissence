@@ -37,7 +37,7 @@ export const load: PageServerLoad = async ({ locals, params, setHeaders }) => {
 
   const publicCommitFields = [
     'id', 'commit_hash', 'title', 'committed_at', 'files_changed', 'lines_added',
-    'lines_deleted', 'public_story', 'public_subline', 'public_beats', 'prompt_count', 'reply_count',
+    'lines_deleted', 'public_story', 'public_beats', 'prompt_count', 'reply_count',
     'change_message_count', 'token_input', 'token_output', 'token_cache_read',
     'token_cache_create', 'sort_order', 'potential_cost_usd', 'input_cost_usd',
     'output_cost_usd', 'pricing_model_ids', 'pricing_calculated_at', 'summary_status',

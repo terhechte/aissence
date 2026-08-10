@@ -371,8 +371,8 @@ pub enum SummaryOrigin {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PublicStory {
-    /// Compelling, compact synthesis shown directly beneath the commit title.
-    /// Generated with the story and beats in the single public request.
+    /// Legacy compact synthesis retained only for reading older files.
+    /// Current generation renders `summary` beneath the title and leaves this empty.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub subline: String,
     /// Concise account of why the change was requested, how it was approached,

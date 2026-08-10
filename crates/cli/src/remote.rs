@@ -81,6 +81,8 @@ pub struct ManifestCommit {
     #[serde(default)]
     pub all_prompts: bool,
     #[serde(default)]
+    /// Deprecated compatibility field. Version 3 renders `public_story`
+    /// directly beneath the commit title.
     pub has_subline: bool,
     #[serde(default)]
     pub summarizer_version: u32,

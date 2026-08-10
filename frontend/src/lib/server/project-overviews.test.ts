@@ -30,7 +30,7 @@ function supabaseWith(data: any[]) {
 }
 
 describe('project summary overviews', () => {
-  it('uses cached sublines and falls back to stories without an LLM call', async () => {
+  it('uses cached stories without an LLM call', async () => {
     const supabase = supabaseWith([
       {
         project_id: 'a',
@@ -55,7 +55,7 @@ describe('project summary overviews', () => {
     ]);
 
     expect(projects.map((project) => project.summary_overview)).toEqual([
-      'Compact A',
+      'Story A',
       'Story B',
       null
     ]);
