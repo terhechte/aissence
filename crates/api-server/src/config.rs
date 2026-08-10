@@ -57,8 +57,8 @@ impl Config {
             max_entry_chars: number("AISSENCE_MAX_ENTRY_CHARS", 64 * 1024)?,
             daily_user_request_limit: number("AISSENCE_DAILY_REQUEST_LIMIT", 2_000)?,
             daily_global_request_limit: number("AISSENCE_DAILY_GLOBAL_REQUEST_LIMIT", 10_000)?,
-            daily_user_input_chars: number("AISSENCE_DAILY_USER_INPUT_CHARS", 5_000_000)?,
-            daily_global_input_chars: number("AISSENCE_DAILY_GLOBAL_INPUT_CHARS", 50_000_000)?,
+            daily_user_input_chars: number("AISSENCE_DAILY_USER_INPUT_CHARS", 20_000_000)?,
+            daily_global_input_chars: number("AISSENCE_DAILY_GLOBAL_INPUT_CHARS", 200_000_000)?,
         };
         config.validate()?;
         Ok(config)

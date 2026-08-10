@@ -18,10 +18,12 @@ pub const ENV_BASE_URL: &str = "AISSENCE_LLM_BASE_URL";
 pub const ENV_API_KEY: &str = "AISSENCE_LLM_API_KEY";
 pub const ENV_API_KEY_ENV: &str = "AISSENCE_LLM_API_KEY_ENV";
 pub const ENV_MODEL: &str = "AISSENCE_LLM_MODEL";
+pub const ENV_FALLBACK_MODEL: &str = "AISSENCE_LLM_FALLBACK_MODEL";
 pub const ENV_PROVIDER: &str = "AISSENCE_LLM_PROVIDER";
 
 pub const ENV_OPENROUTER_API_KEY: &str = "OPENROUTER_API_KEY";
 pub const ENV_OPENROUTER_MODEL: &str = "OPENROUTER_MODEL";
+pub const ENV_OPENROUTER_FALLBACK_MODEL: &str = "OPENROUTER_FALLBACK_MODEL";
 pub const ENV_OPENROUTER_PROVIDER: &str = "OPENROUTER_PROVIDER";
 
 /// The request dialect used by the configured endpoint.
@@ -52,6 +54,7 @@ pub struct LlmConfig {
     pub base_url: String,
     pub api_key: Option<String>,
     pub model: String,
+    pub fallback_model: Option<String>,
     pub provider: Option<String>,
 }
 
@@ -63,6 +66,7 @@ pub struct LlmConfigOverrides {
     pub api_key: Option<String>,
     pub api_key_env: Option<String>,
     pub model: Option<String>,
+    pub fallback_model: Option<String>,
     pub provider: Option<String>,
 }
 
@@ -74,6 +78,7 @@ impl std::fmt::Debug for LlmConfig {
             .field("base_url", &self.base_url)
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
             .field("model", &self.model)
+            .field("fallback_model", &self.fallback_model)
             .field("provider", &self.provider)
             .finish()
     }
@@ -88,6 +93,7 @@ impl std::fmt::Debug for LlmConfigOverrides {
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
             .field("api_key_env", &self.api_key_env)
             .field("model", &self.model)
+            .field("fallback_model", &self.fallback_model)
             .field("provider", &self.provider)
             .finish()
     }
@@ -108,6 +114,7 @@ struct PartialConfig {
     api_key: Option<String>,
     api_key_env: Option<String>,
     model: Option<String>,
+    fallback_model: Option<String>,
     provider: Option<String>,
 }
 
@@ -160,11 +167,15 @@ impl LlmConfig {
     pub fn openrouter_from_environment() -> Result<Self, Error> {
         let api_key = nonempty_env(ENV_OPENROUTER_API_KEY)
             .ok_or(Error::MissingEnv(ENV_OPENROUTER_API_KEY))?;
+        let model = nonempty_env(ENV_OPENROUTER_MODEL).unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let fallback_model =
+            nonempty_env(ENV_OPENROUTER_FALLBACK_MODEL).filter(|fallback| fallback != &model);
         Ok(Self {
             api: LlmApi::OpenRouter,
             base_url: OPENROUTER_BASE_URL.to_string(),
             api_key: Some(api_key),
-            model: nonempty_env(ENV_OPENROUTER_MODEL).unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+            model,
+            fallback_model,
             provider: nonempty_env(ENV_OPENROUTER_PROVIDER),
         })
     }
@@ -186,6 +197,7 @@ impl LlmConfig {
             api_key: overrides.api_key,
             api_key_env: overrides.api_key_env,
             model: overrides.model,
+            fallback_model: overrides.fallback_model,
             provider: overrides.provider,
         });
 
@@ -210,6 +222,10 @@ impl LlmConfig {
             }
         };
         let provider = partial.provider.and_then(nonempty);
+        let fallback_model = partial
+            .fallback_model
+            .and_then(nonempty)
+            .filter(|fallback| fallback != &model);
         if api == LlmApi::OpenaiCompatible && provider.is_some() {
             return Err(Error::LlmConfig(
                 "provider is an OpenRouter-only option".to_string(),
@@ -236,6 +252,7 @@ impl LlmConfig {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
             model,
+            fallback_model,
             provider,
         })
     }
@@ -251,6 +268,9 @@ impl PartialConfig {
         }
         if higher.model.is_some() {
             self.model = higher.model;
+        }
+        if higher.fallback_model.is_some() {
+            self.fallback_model = higher.fallback_model;
         }
         if higher.provider.is_some() {
             self.provider = higher.provider;
@@ -293,6 +313,11 @@ fn environment_config(base_api: LlmApi) -> Result<PartialConfig, Error> {
         model: nonempty_env(ENV_MODEL).or_else(|| {
             use_legacy
                 .then(|| nonempty_env(ENV_OPENROUTER_MODEL))
+                .flatten()
+        }),
+        fallback_model: nonempty_env(ENV_FALLBACK_MODEL).or_else(|| {
+            use_legacy
+                .then(|| nonempty_env(ENV_OPENROUTER_FALLBACK_MODEL))
                 .flatten()
         }),
         provider: nonempty_env(ENV_PROVIDER).or_else(|| {
@@ -341,6 +366,7 @@ mod tests {
                 api = "openai-compatible"
                 base_url = "http://127.0.0.1:11434/v1/"
                 model = "qwen2.5-coder:7b"
+                fallback_model = "qwen2.5-coder:32b"
             "#,
         )
         .unwrap();
@@ -355,6 +381,7 @@ mod tests {
         assert_eq!(config.base_url, "http://127.0.0.1:11434/v1");
         assert_eq!(config.api_key, None);
         assert_eq!(config.model, "qwen2.5-coder:7b");
+        assert_eq!(config.fallback_model.as_deref(), Some("qwen2.5-coder:32b"));
     }
 
     #[test]
@@ -363,22 +390,26 @@ mod tests {
             api: Some(LlmApi::OpenaiCompatible),
             base_url: Some("http://localhost:11434/v1".into()),
             model: Some("file-model".into()),
+            fallback_model: Some("file-fallback".into()),
             ..PartialConfig::default()
         };
         let config = LlmConfig::resolve(
             file,
             PartialConfig {
                 model: Some("environment-model".into()),
+                fallback_model: Some("environment-fallback".into()),
                 ..PartialConfig::default()
             },
             LlmConfigOverrides {
                 model: Some("cli-model".into()),
+                fallback_model: Some("cli-fallback".into()),
                 ..LlmConfigOverrides::default()
             },
         )
         .unwrap();
 
         assert_eq!(config.model, "cli-model");
+        assert_eq!(config.fallback_model.as_deref(), Some("cli-fallback"));
     }
 
     #[test]
@@ -406,6 +437,7 @@ mod tests {
             base_url: "https://example.test/v1".into(),
             api_key: Some("super-secret-key".into()),
             model: "model".into(),
+            fallback_model: None,
             provider: None,
         };
         let overrides = LlmConfigOverrides {

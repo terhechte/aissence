@@ -132,6 +132,9 @@ struct LlmOptions {
     /// Model identifier understood by the endpoint.
     #[arg(long)]
     model: Option<String>,
+    /// Better model used when the primary model's request or output fails.
+    #[arg(long)]
+    fallback_model: Option<String>,
     /// Preferred OpenRouter provider (invalid for generic endpoints).
     #[arg(long)]
     provider: Option<String>,
@@ -145,6 +148,7 @@ impl LlmOptions {
             api_key: self.api_key,
             api_key_env: self.api_key_env,
             model: self.model,
+            fallback_model: self.fallback_model,
             provider: self.provider,
         }
     }
@@ -156,6 +160,7 @@ impl LlmOptions {
             && self.api_key.is_none()
             && self.api_key_env.is_none()
             && self.model.is_none()
+            && self.fallback_model.is_none()
             && self.provider.is_none()
     }
 }

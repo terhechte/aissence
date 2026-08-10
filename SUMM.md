@@ -143,20 +143,32 @@ result, not a pending state. `origin` records whether the result came from the
 model or a metadata, parse, or privacy fallback. `summarizer_version` invalidates
 results produced by an older evidence/prompt/validation policy.
 
-### What is sent to the public-story LLM call
+### Public prompt-summary stage
 
-The public call is bounded to at most 32,000 characters of assembled evidence.
-It contains three sections:
+Before generating the public story, Aissence creates a privacy-safe summary of
+every non-empty user prompt. Prompts are batched by the existing limits of eight
+entries and 6,000 combined input characters. Each source entry is capped at
+6,000 characters while retaining both ends. Batch output uses indexed strict
+JSON; a failed batch switches to the configured fallback model and then retries
+its entries individually.
 
-1. **Selected user evidence — up to 16,000 characters**
-   - Always considers the first user entry.
-   - Includes the final user entry when different.
-   - Selects up to two intermediate entries, prioritizing correction/refinement
-     signals and then useful length.
-   - The budget is divided fairly across selected entries. Oversized entries
-     retain both their beginning and ending.
-   - Original coalesced message indexes are included so beats can reference a
-     specific user entry.
+These summaries are synthesis evidence. Normal local and hosted public jobs use
+them ephemerally and leave `subscriber_summary` absent. Local `--all-prompts`
+stores the same already-generated summaries for display, so this mode incurs no
+extra requests beyond the two-stage public pipeline.
+
+### What is sent to the public-story synthesis call
+
+The synthesis call is bounded to at most 32,000 characters of assembled
+evidence. It contains three sections:
+
+1. **Privacy-safe prompt summaries — up to 16,000 characters**
+   - Includes every generated prompt summary when they fit.
+   - If an unusually large commit exceeds the section budget, selection keeps
+     complete entries rather than truncating them. It prioritizes the first and
+     final prompt, then correction-like and information-rich intermediates.
+   - Original coalesced message indexes are included so beats can reference the
+     corresponding user entry.
 
 2. **Assistant conclusion evidence — up to 7,000 characters**
    - Takes both ends of the final assistant reply.
@@ -166,7 +178,7 @@ It contains three sections:
      commit body within the remaining section budget.
    - File count and added/deleted line counts.
    - Status and path for at most 20 changed files.
-   - It does not include committed diff bodies in the public-story prompt.
+   - It does not include committed diff bodies in the synthesis prompt.
 
 The section budgets total 30,000 characters so labels cannot cause an earlier
 section to crowd out later grounding. The complete prompt has a final 32,000
@@ -176,15 +188,26 @@ character ceiling. These are character limits, not tokenizer-exact limits.
 
 The model is asked for JSON containing exactly:
 
-- A 2–4 sentence story explaining the request, approach, and only
-  outcomes supported by the commit fingerprint.
+- An evidence-scaled story explaining the request, approach, and only outcomes
+  supported by the commit fingerprint. Sentence count is unconstrained.
 - At most three representative prompt moments, preferring the initial ask, an
   important correction, and a final refinement.
 
 It is explicitly instructed to paraphrase, avoid verbatim prompts, paths,
-personal data, credentials, and private identifiers, treat evidence as
-untrusted, and output JSON only. Generation uses temperature `0.2` and a
-700-token output limit. Story and beats are returned in this one response.
+personal data, credentials, and private identifiers, treat the generated
+summaries as untrusted evidence, and output JSON only. Generation uses
+temperature `0.2` and a 700-token output limit. Story and beats are returned in
+this one synthesis response.
+For local `--all-prompts`, the representative beats are unused, so that public
+request asks for only the story.
+
+The target length is computed from the words in the bounded prompt summaries,
+assistant conclusion, and implementation fingerprint. Its lower bound is
+`clamp(50 + evidence_words / 16, 60, 120)` and its upper bound is 30 words
+higher, capped at 150. Compact evidence therefore targets 60–90 words, while
+substantial commits can target up to 120–150. The target guides generation;
+validation uses a stable global 50–165-word safety envelope so changing models
+does not discard useful copy merely because it missed the preferred range.
 
 ### Parsing, fallbacks, and validation
 
@@ -196,6 +219,7 @@ no beats and requires no additional LLM call.
 After parsing:
 
 - Empty stories are replaced with the fallback.
+- Model stories outside the evidence-scaled acceptance band fail validation.
 - Stories that appear to expose prompt wording are replaced with the fallback.
 - Each beat must have a valid user-message index, non-empty label/text, and a
   unique referenced message.
@@ -231,10 +255,11 @@ The file records a complete set of per-prompt summaries; if it is uploaded, the
 server marks those locally supplied summaries public without exposing the full
 prompt source. Hosted subscriber summaries remain subscriber-only.
 
-The default backend is OpenRouter and requires `OPENROUTER_API_KEY`. The model
-and provider can be selected with `OPENROUTER_MODEL` and
-`OPENROUTER_PROVIDER`. CLI flags or `[llm]` in `.aissence.toml` can instead
-select an OpenAI-compatible endpoint.
+The default backend is OpenRouter and requires `OPENROUTER_API_KEY`. The model,
+fallback model, and provider can be selected with `OPENROUTER_MODEL`,
+`OPENROUTER_FALLBACK_MODEL`, and `OPENROUTER_PROVIDER`. CLI flags (including
+`--fallback-model`) or `[llm]` in `.aissence.toml` can instead select an
+OpenAI-compatible endpoint.
 
 Every OpenRouter request asks for unified reasoning effort `none`. If the
 selected model requires reasoning and rejects that value, the request is
@@ -251,27 +276,38 @@ The CLI:
    message kinds still align, the public story is non-empty, and every beat
    points at a user message.
 4. Runs public generation for every non-empty group still lacking a cached
-   summary. A group with no user prompt takes the metadata fallback without an
-   LLM request.
+   summary: prompt-summary batches first, then public-story synthesis. A group
+   with no user prompt takes the metadata fallback without an LLM request.
 5. Applies successful commit summaries even if another commit fails, then
    persists those successes before returning the batch error.
 
 Per-prompt batch calls through OpenRouter use a strict JSON schema with one
-indexed summary per requested entry. Validation distinguishes JSON shape,
-entry count, index/order, empty summaries, and privacy overlap. If a batch
-still fails after its bounded retries, each prompt is retried independently.
-Successful batches and individual results are applied immediately to the
-commit summary; unresolved entries are recorded in `prompt_failures` with
-their message index, model, error, and timestamp. A future `--all-prompts` run
-targets only those missing entries, so selecting a stronger model does not
-regenerate successful work. Hosted subscriber jobs likewise persist partial
-message summaries while leaving the job failed and retryable.
+indexed summary per requested entry. Targets scale independently of the
+evidence-scaled public commit story: 8–18 words for very short source prompts,
+12–35 for prompts up to 60 words, and 35–60 for longer prompts. Validation uses
+wider safety bands (6–24, 8–45, and 20–75 respectively), so modest model
+variance does not fail a commit. Validation still distinguishes JSON shape,
+entry count, index/order, empty summaries, extreme word counts, and privacy
+overlap. If a batch still fails after its bounded retries, each prompt is
+retried independently.
+For `--all-prompts`, successful batches and individual results are applied
+immediately to the commit summary; unresolved entries are recorded in
+`prompt_failures` with their message index, model, error, and timestamp. Story
+synthesis waits for this stage to complete. A future `--all-prompts` run targets
+only missing entries and then regenerates the story from the complete set.
+Normal local and hosted public jobs keep first-stage results ephemeral and fail
+before synthesis if a prompt remains unresolved. Hosted subscriber jobs
+continue to persist partial message summaries while leaving their job failed
+and retryable.
 
 Up to 32 commit groups may be in flight, with a global maximum of 24 concurrent
-LLM requests. Retryable transport/status errors use exponential backoff. An
-invalid subscriber batch response is also retryable; malformed public-story
-JSON currently takes the metadata fallback without retrying. Local
-configuration currently allows seven retries after the initial attempt.
+LLM requests. Retryable transport/status errors use exponential backoff. When
+a fallback model is configured, a terminal request failure or any output
+validation failure switches to it. A failed subscriber batch is then retried
+as individual prompts. If both public-story model attempts fail validation,
+the existing deterministic metadata/privacy fallback remains the last resort.
+Local configuration allows seven transport retries after the initial attempt
+on each selected model.
 The interactive CLI dashboard reports current aggregate output tokens per
 second and mean end-to-end latency across completed requests. Active streaming
 token estimates contribute to throughput before the first request completes.
@@ -298,8 +334,8 @@ cache invalidation mechanism; zero beats alone does not force regeneration.
 
 The Rust server starts only when its hosted OpenRouter configuration is valid.
 Hosted generation deliberately uses `OPENROUTER_API_KEY` and optional
-`OPENROUTER_MODEL`/`OPENROUTER_PROVIDER`; generic client-side LLM settings do
-not control the hosted worker.
+`OPENROUTER_MODEL`/`OPENROUTER_FALLBACK_MODEL`/`OPENROUTER_PROVIDER`; generic
+client-side LLM settings do not control the hosted worker.
 
 Hosted OpenRouter requests apply a stricter provider policy:
 
@@ -373,15 +409,18 @@ For each coalesced `UserWrote` entry:
   request.
 - Generation allows up to 768 output tokens per prompt, including any hidden
   model reasoning, before returning the requested concise summary.
-- The model returns one concise 2–3 sentence summary per prompt with the
-  original source message index.
+- The model targets 8–18 words for source prompts up to 12 words, 12–35 words
+  for source prompts up to 60 words, and 35–60 words for longer prompts, with
+  the original source message index. Sentence count is unconstrained, and a
+  wider validation safety band tolerates modest model variance.
 - Invalid batch responses are retried; validation requires exactly one
   non-empty output per input with matching indexes and order.
 - Subscriber jobs never generate or overwrite the public story.
 
 The result is stored separately in `message_summaries`, while complete
-sanitized source remains in `message_sources`. This tier can cost multiple LLM
-requests per commit, unlike the single public-story request.
+sanitized source remains in `message_sources`. Public generation also performs
+prompt-summary batches, but its ephemeral results are not exposed unless they
+came from an uploaded local `--all-prompts` file.
 
 ## 7. What the ledger reads
 
@@ -420,10 +459,11 @@ The main cost-saving decisions are:
 
 - Analysis, correlation, redaction, counts, provenance, and source digests are
   deterministic and local.
-- Public generation uses one request per changed commit with prompts for the
-  story and beats together.
-- Public evidence is selected and hard-bounded rather than sending complete
-  conversations or repository diffs.
+- Public generation batches prompt paraphrases before one story/beat synthesis
+  request. This costs more than the former raw-evidence call but gives the
+  synthesis model normalized evidence across providers.
+- Both prompt evidence and final synthesis evidence are hard-bounded; complete
+  conversations and repository diffs are never sent to the synthesis call.
 - Unchanged source digests reuse prior summaries and avoid upload/generation.
 - Draft server imports do not generate automatically; creators opt into private
   generation and review before publishing.
@@ -438,8 +478,9 @@ These are useful areas for product feedback:
 
 1. **Time-based commit attribution:** Is “first commit after the message” good
    enough for real branching/rebase workflows?
-2. **Selected public evidence:** Do first/final prompts plus two correction-like
-   prompts capture the project story, or omit important exploration?
+2. **Oversized synthesis evidence:** Is first/final plus correction- and
+   information-prioritized selection the right overflow policy when all prompt
+   summaries do not fit?
 3. **Assistant evidence:** Is favoring final-response tails reliable across
    agents, or should tool outcomes/structured plans contribute differently?
 4. **Implementation fingerprint:** Are commit metadata and paths sufficient to

@@ -5,7 +5,7 @@ use std::sync::{Arc, OnceLock};
 use redact_core::{AnalyzerEngine, AnonymizationStrategy, AnonymizerConfig};
 use regex::Regex;
 
-use crate::{AissenceCommit, AissenceDocument, CommitSummary, SANITIZER_VERSION};
+use crate::{AissenceCommit, AissenceDocument, CommitStats, CommitSummary, SANITIZER_VERSION};
 
 static REDACTOR: OnceLock<Redactor> = OnceLock::new();
 
@@ -75,6 +75,65 @@ impl Redactor {
         }
     }
 
+    /// Redact generated copy while preserving authoritative numeric git
+    /// statistics. Pattern/NER recognizers can otherwise mistake a five-digit
+    /// addition count for a postal code.
+    pub fn redact_summary_with_stats(&self, summary: &mut CommitSummary, stats: CommitStats) {
+        summary.public.subline = self.redact_text_preserving_stats(&summary.public.subline, stats);
+        summary.public.summary = self.redact_text_preserving_stats(&summary.public.summary, stats);
+        for beat in &mut summary.public.beats {
+            beat.label = self.redact_text(&beat.label);
+            beat.text = self.redact_text(&beat.text);
+        }
+        for message in &mut summary.messages {
+            message.subscriber_summary = message
+                .subscriber_summary
+                .as_deref()
+                .map(|value| self.redact_text(value));
+            message.content = message
+                .content
+                .as_deref()
+                .map(|value| self.redact_text(value));
+            for change in &mut message.changes {
+                change.file = self.redact_text(&change.file);
+                change.diff = self.redact_text(&change.diff);
+            }
+        }
+        for failure in &mut summary.prompt_failures {
+            failure.model = self.redact_text(&failure.model);
+            failure.error = self.redact_text(&failure.error);
+        }
+    }
+
+    fn redact_text_preserving_stats(&self, text: &str, stats: CommitStats) -> String {
+        let mut values = [stats.files_changed, stats.lines_added, stats.lines_deleted]
+            .into_iter()
+            .filter(|value| *value > 0)
+            .collect::<Vec<_>>();
+        values.sort_unstable();
+        values.dedup();
+        if values.is_empty() {
+            return self.redact_text(text);
+        }
+
+        let alternatives = values
+            .into_iter()
+            .map(|value| regex::escape(&value.to_string()))
+            .collect::<Vec<_>>()
+            .join("|");
+        let pattern =
+            Regex::new(&format!(r"\b(?:{alternatives})\b")).expect("escaped statistic regex");
+        let mut output = String::with_capacity(text.len());
+        let mut end = 0;
+        for matched in pattern.find_iter(text) {
+            output.push_str(&self.redact_text(&text[end..matched.start()]));
+            output.push_str(matched.as_str());
+            end = matched.end();
+        }
+        output.push_str(&self.redact_text(&text[end..]));
+        output
+    }
+
     pub fn redact_commit(&self, commit: &mut AissenceCommit) {
         commit.sanitizer_version = SANITIZER_VERSION;
         commit.title = self.redact_text(&commit.title);
@@ -97,7 +156,7 @@ impl Redactor {
             }
         }
         if let Some(summary) = &mut commit.summary {
-            self.redact_summary(summary);
+            self.redact_summary_with_stats(summary, commit.stats);
         }
         commit.source_digest = commit.calculate_source_digest();
     }
@@ -215,5 +274,30 @@ mod tests {
             redact_secrets("See /Users/alice/Desktop/private.png and C:\\Users\\alice\\secret.txt");
         assert!(!output.contains("alice"));
         assert!(output.contains("[REDACTED_PATH]"));
+    }
+
+    #[test]
+    fn preserves_authoritative_commit_statistics_in_generated_copy() {
+        let redactor = Redactor::from_environment();
+        let mut summary = CommitSummary {
+            public: crate::PublicStory {
+                summary: "The commit changed 78 files with 23524 additions and 22 deletions."
+                    .into(),
+                ..crate::PublicStory::default()
+            },
+            ..CommitSummary::default()
+        };
+
+        redactor.redact_summary_with_stats(
+            &mut summary,
+            CommitStats {
+                files_changed: 78,
+                lines_added: 23_524,
+                lines_deleted: 22,
+            },
+        );
+
+        assert!(summary.public.summary.contains("23524"));
+        assert!(!summary.public.summary.contains("[US_ZIP_CODE]"));
     }
 }

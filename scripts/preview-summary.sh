@@ -5,6 +5,7 @@ REPOSITORY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_URL="${AISSENCE_APP_URL:-http://127.0.0.1:5173}"
 DEV_LOG="${AISSENCE_DEV_LOG:-/tmp/aissence-dev.log}"
 ALL_PROMPTS=false
+FALLBACK_MODEL=""
 POSITIONAL=()
 
 preview_server_ready() {
@@ -13,7 +14,7 @@ preview_server_ready() {
 
 usage() {
   cat <<'EOF'
-Usage: scripts/preview-summary.sh [--all-prompts] <repository-path> <openrouter-model>
+Usage: scripts/preview-summary.sh [--all-prompts] [--fallback-model <model>] <repository-path> <openrouter-model>
 
 Deletes <repository-path>/.aissence, regenerates it with local OpenRouter
 summaries, starts the development stack when needed, uploads the result to a
@@ -21,6 +22,8 @@ loopback-only preview, and opens that preview in the default browser.
 
 Environment:
   OPENROUTER_API_KEY  OpenRouter credential used by the CLI
+  OPENROUTER_FALLBACK_MODEL
+                      Optional fallback model; overridden by --fallback-model
   AISSENCE_APP_URL    Frontend URL (default: http://127.0.0.1:5173)
   AISSENCE_DEV_LOG    Background dev-stack log (default: /tmp/aissence-dev.log)
 EOF
@@ -30,6 +33,24 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --all-prompts)
       ALL_PROMPTS=true
+      shift
+      ;;
+    --fallback-model)
+      if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]; then
+        echo "--fallback-model requires a model identifier" >&2
+        usage >&2
+        exit 2
+      fi
+      FALLBACK_MODEL="$2"
+      shift 2
+      ;;
+    --fallback-model=*)
+      FALLBACK_MODEL="${1#*=}"
+      if [[ -z "$FALLBACK_MODEL" ]]; then
+        echo "--fallback-model requires a model identifier" >&2
+        usage >&2
+        exit 2
+      fi
       shift
       ;;
     -h|--help)
@@ -78,6 +99,9 @@ for command in cargo curl; do
 done
 
 SUMMARY_ARGS=(summarize --mode local --api openrouter --model "$MODEL")
+if [[ -n "$FALLBACK_MODEL" ]]; then
+  SUMMARY_ARGS+=(--fallback-model "$FALLBACK_MODEL")
+fi
 if [[ "$ALL_PROMPTS" == true ]]; then
   SUMMARY_ARGS+=(--all-prompts)
 fi
@@ -87,6 +111,11 @@ echo "Removing the previous summary cache: $TARGET_DIR/.aissence"
 rm -f -- "$TARGET_DIR/.aissence"
 
 echo "Generating summaries with OpenRouter model: $MODEL"
+if [[ -n "$FALLBACK_MODEL" ]]; then
+  echo "Using fallback OpenRouter model: $FALLBACK_MODEL"
+elif [[ -n "${OPENROUTER_FALLBACK_MODEL:-}" ]]; then
+  echo "Using fallback OpenRouter model from OPENROUTER_FALLBACK_MODEL: $OPENROUTER_FALLBACK_MODEL"
+fi
 (
   cd "$REPOSITORY_DIR"
   cargo run -p aissence -- "${SUMMARY_ARGS[@]}"

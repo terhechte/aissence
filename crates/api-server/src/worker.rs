@@ -91,7 +91,18 @@ async fn claim(state: &AppState) -> Result<Option<Job>, Box<dyn std::error::Erro
 }
 
 async fn process(state: &AppState, mut job: Job) {
-    let source_input_chars = job
+    let public_prompt_input_chars = job
+        .commit
+        .source
+        .messages
+        .iter()
+        .filter(|message| message.kind == aissence::MessageKind::UserWrote)
+        .filter_map(|message| message.content.as_deref())
+        .filter(|content| !content.trim().is_empty())
+        .map(str::chars)
+        .map(|chars| chars.count().min(6_000))
+        .fold(0usize, usize::saturating_add);
+    let subscriber_prompt_input_chars = job
         .commit
         .source
         .messages
@@ -103,12 +114,24 @@ async fn process(state: &AppState, mut job: Job) {
         .map(|chars| chars.count().min(6_000))
         .fold(0usize, usize::saturating_add);
     let (request_ceiling, input_char_ceiling) = if job.kind == "public" {
-        hosted_usage_ceiling(1, HOSTED_PUBLIC_PROMPT_CHARS)
+        let planned = planned_public_requests(&job.commit);
+        // Public generation summarizes every prompt, allows a worst-case
+        // individual retry for each failed batch member, then synthesizes the
+        // story from those summaries.
+        hosted_usage_ceiling(
+            planned,
+            HOSTED_PUBLIC_PROMPT_CHARS.saturating_add(public_prompt_input_chars.saturating_mul(2)),
+            state.summarizer.fallback_model().is_some(),
+        )
     } else {
         let planned = planned_subscriber_requests(&job.commit);
         // Reserve for the initial batches plus worst-case individual fallback,
         // which can send the bounded prompt evidence a second time.
-        hosted_usage_ceiling(planned, source_input_chars.saturating_mul(2))
+        hosted_usage_ceiling(
+            planned,
+            subscriber_prompt_input_chars.saturating_mul(2),
+            state.summarizer.fallback_model().is_some(),
+        )
     };
     match reserve_budget(state, &job, request_ceiling, input_char_ceiling).await {
         Ok(Some(attempt_id)) => job.attempt_id = Some(attempt_id),
@@ -142,7 +165,8 @@ async fn process(state: &AppState, mut job: Job) {
         match result {
             Ok(summary) => {
                 let mut summary = summary;
-                aissence::Redactor::global().redact_summary(&mut summary);
+                aissence::Redactor::global()
+                    .redact_summary_with_stats(&mut summary, job.commit.stats);
                 job.commit.summary = Some(summary.clone());
                 if let Err(error) = succeed_public_job(state, &job, &summary, cost).await {
                     tracing::error!(error = %error, job_id = %job.id, "cannot persist public story");
@@ -166,16 +190,63 @@ async fn process(state: &AppState, mut job: Job) {
     }
 }
 
-fn hosted_usage_ceiling(planned_requests: usize, source_input_chars: usize) -> (usize, usize) {
+fn hosted_usage_ceiling(
+    planned_requests: usize,
+    source_input_chars: usize,
+    has_fallback_model: bool,
+) -> (usize, usize) {
     if planned_requests == 0 {
         return (0, 0);
     }
-    let request_ceiling = planned_requests.saturating_mul(HOSTED_REQUEST_RETRIES + 1);
+    let model_attempts = if has_fallback_model { 2 } else { 1 };
+    let request_ceiling = planned_requests
+        .saturating_mul(HOSTED_REQUEST_RETRIES + 1)
+        .saturating_mul(model_attempts);
     let input_char_ceiling = source_input_chars
         .saturating_add(HOSTED_CORE_INPUT_CHARS)
         .saturating_mul(HOSTED_REQUEST_RETRIES + 1)
+        .saturating_mul(model_attempts)
         .saturating_add(request_ceiling.saturating_mul(HOSTED_FIXED_INPUT_CHARS_PER_REQUEST));
     (request_ceiling, input_char_ceiling)
+}
+
+fn planned_public_requests(commit: &AissenceCommit) -> usize {
+    let mut batch_requests = 0usize;
+    let mut individual_fallbacks = 0usize;
+    let mut batch_entries = 0usize;
+    let mut batch_chars = 0usize;
+    for message in commit
+        .source
+        .messages
+        .iter()
+        .filter(|message| message.kind == aissence::MessageKind::UserWrote)
+    {
+        let Some(content) = message
+            .content
+            .as_deref()
+            .map(str::trim)
+            .filter(|content| !content.is_empty())
+        else {
+            continue;
+        };
+        let chars = content.chars().count().min(6_000);
+        individual_fallbacks += 1;
+        if batch_entries > 0 && (batch_entries >= 8 || batch_chars + chars > 6_000) {
+            batch_requests += 1;
+            batch_entries = 0;
+            batch_chars = 0;
+        }
+        batch_entries += 1;
+        batch_chars += chars;
+        if batch_chars >= 6_000 {
+            batch_requests += 1;
+            batch_entries = 0;
+            batch_chars = 0;
+        }
+    }
+    // One final public-story synthesis request follows the prompt-summary
+    // batches. Empty-prompt commits are not queued by the database policy.
+    1 + batch_requests + usize::from(batch_entries > 0) + individual_fallbacks
 }
 
 fn planned_subscriber_requests(commit: &AissenceCommit) -> usize {
@@ -344,6 +415,7 @@ async fn finish_subscriber_job(
     cost: SummarizationCost,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut retry_commit = job.commit.clone();
+    let retry_stats = retry_commit.stats;
     let summary = retry_commit
         .summary
         .get_or_insert_with(aissence::CommitSummary::default);
@@ -356,7 +428,7 @@ async fn finish_subscriber_job(
         }
     }
     summary.prompt_failures = outcome.failures.clone();
-    aissence::Redactor::global().redact_summary(summary);
+    aissence::Redactor::global().redact_summary_with_stats(summary, retry_stats);
     let retry_payload = serde_json::to_value(&retry_commit)?;
 
     let mut client = state.pool.get().await?;
@@ -491,15 +563,56 @@ mod tests {
 
     #[test]
     fn usage_reservation_includes_core_prompts_fixed_overhead_and_retries() {
-        let (requests, chars) = hosted_usage_ceiling(1, 100);
+        let (requests, chars) = hosted_usage_ceiling(1, 100, true);
+        assert_eq!(requests, 4);
+        assert_eq!(chars, ((100 + 8_192) * 2 + 2 * 4_096) * 2);
+    }
+
+    #[test]
+    fn public_usage_reservation_covers_the_full_prompt_limit() {
+        let (requests, chars) = hosted_usage_ceiling(1, HOSTED_PUBLIC_PROMPT_CHARS, true);
+        assert_eq!(requests, 4);
+        assert_eq!(chars, ((32_000 + 8_192) * 2 + 2 * 4_096) * 2);
+    }
+
+    #[test]
+    fn usage_reservation_does_not_charge_for_an_unconfigured_fallback() {
+        let (requests, chars) = hosted_usage_ceiling(1, 100, false);
         assert_eq!(requests, 2);
         assert_eq!(chars, (100 + 8_192) * 2 + 2 * 4_096);
     }
 
     #[test]
-    fn public_usage_reservation_covers_the_full_prompt_limit() {
-        let (requests, chars) = hosted_usage_ceiling(1, HOSTED_PUBLIC_PROMPT_CHARS);
-        assert_eq!(requests, 2);
-        assert_eq!(chars, (32_000 + 8_192) * 2 + 2 * 4_096);
+    fn public_planning_includes_batches_individual_recovery_and_synthesis() {
+        let messages = (0..9)
+            .map(|_| aissence::MessageSummary {
+                kind: aissence::MessageKind::UserWrote,
+                subscriber_summary: None,
+                content: Some("A short public prompt requiring a safe paraphrase.".into()),
+                changes: Vec::new(),
+                timestamp: None,
+                tokens: None,
+            })
+            .collect();
+        let commit = AissenceCommit {
+            commit_hash: "a".repeat(40),
+            source_digest: String::new(),
+            sanitizer_version: aissence::SANITIZER_VERSION,
+            title: "Test".into(),
+            body: None,
+            date: chrono::DateTime::UNIX_EPOCH,
+            stats: aissence::CommitStats::default(),
+            files: Vec::new(),
+            source: aissence::CommitSource {
+                messages,
+                agents: Vec::new(),
+                tokens: None,
+            },
+            summary: None,
+        };
+
+        // Two eight-entry-limited batches, nine possible individual recovery
+        // calls, and one final public-story synthesis.
+        assert_eq!(planned_public_requests(&commit), 12);
     }
 }

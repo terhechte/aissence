@@ -79,10 +79,12 @@ redaction upgrades explicit synchronization changes.
 - `agents` and `tokens`
 
 The summary message list must have the same length and kinds as `source.messages`.
-Normal public generation makes one request per commit for the story and beats
-together, and leaves every `subscriber_summary` absent. Subscriber summaries are normally a separate
-on-demand tier; `--all-prompts` is the explicit exception that publishes a
-complete locally generated set.
+Normal public generation first creates privacy-safe summaries for every user
+prompt, then asks for an evidence-scaled story and beats using those summaries.
+The intermediate results remain ephemeral and every `subscriber_summary` stays
+absent. Subscriber summaries are normally a separate on-demand tier;
+`--all-prompts` stores and publishes the public-safe prompt summaries already
+created by this pipeline and asks only for the story without unused beats.
 
 ## Hosted generation lifecycle
 
@@ -90,11 +92,14 @@ Uploading stores sanitized source and completes the import immediately. Draft
 projects do not create public summary jobs automatically. A creator explicitly
 generates and reviews private summaries before publishing; publication is
 blocked while prompted commits are pending, failed, incomplete, or outdated.
-The public job receives separately bounded evidence: first/final user prompts,
-up to two correction-like intermediate prompts, the bounded final assistant
-reply, and a metadata-only git fingerprint. The sections reserve 16,000,
+For raw imports, the public job summarizes every non-empty user prompt in
+batches of at most eight entries/6,000 characters. It then synthesizes the
+story from those privacy-safe summaries, the bounded final assistant reply,
+and a metadata-only git fingerprint. The synthesis sections reserve 16,000,
 7,000, and 7,000 characters respectively inside a 32,000-character ceiling.
-Oversized entries retain both ends. Diff bodies are not sent.
+If prompt summaries exceed their section, complete first/final entries and
+correction- or information-rich intermediates are prioritized. Raw user text
+and diff bodies are not sent to the synthesis call.
 
 Local generation with `--all-prompts` additionally fills every user message's
 `subscriber_summary`. When a complete set is uploaded, those summaries are
@@ -113,6 +118,19 @@ another prompt remains unresolved. Subscriber work never rewrites public copy.
 Later imports queue both tiers only when the creator still has an active
 subscriber.
 
+Prompt-summary length is normalized independently from the public commit story.
+Prompts of at most five words target 4–12 words, prompts of six to twelve words
+target 6–18, prompts up to 60 words target 12–35, and longer prompts target
+35–60. Validation accepts wider 3–24, 4–24, 8–45, and 20–75-word safety bands
+respectively. A configured fallback model handles request, shape, index,
+emptiness, extreme word-count, or privacy failures before work is recorded as
+unresolved.
+
+Public-story targets grow with the bounded synthesis evidence: 60–90 words at
+the low end through 120–150 words at the high end. Validation uses a stable
+50–165-word safety envelope, avoiding a metadata fallback merely because
+otherwise-good copy missed its preferred evidence-scaled target.
+
 ## Redaction
 
 Before persistence and upload, Aissence runs `redact-core`, optional
@@ -120,6 +138,11 @@ Before persistence and upload, Aissence runs `redact-core`, optional
 recognizers. The server runs the same scanner again and rejects an upload if it
 would change under redaction. Server-generated summaries are scanned before
 being written to Postgres or returned to the client.
+
+Authoritative commit statistics are protected while generated summary text is
+redacted, so file counts and added/deleted line counts bypass person/location
+NER. For example, `23524` remains a line count instead of becoming a location
+placeholder.
 
 The format is intentionally strict: unknown fields, unsupported versions,
 invalid digests, oversized entries, and mismatched summary shapes are rejected.

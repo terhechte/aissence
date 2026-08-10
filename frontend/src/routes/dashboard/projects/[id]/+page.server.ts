@@ -58,7 +58,7 @@ export const load: PageServerLoad = async ({ locals, params, parent }) => {
   const readyCommits = promptedCommits.filter(
     (commit) =>
       commit.summary_status === 'succeeded' &&
-      Number(commit.summarizer_version ?? 0) >= 2 &&
+      Number(commit.summarizer_version ?? 0) >= 5 &&
       String(commit.public_story ?? '').trim()
   );
 

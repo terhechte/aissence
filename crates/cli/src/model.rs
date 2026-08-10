@@ -7,7 +7,7 @@ use normalize_chat_sessions as ncs;
 use serde::{Deserialize, Serialize};
 
 /// Current version of the summary prompts, evidence policy, and validators.
-pub const SUMMARIZER_VERSION: u32 = 2;
+pub const SUMMARIZER_VERSION: u32 = 5;
 
 /// Authoritative statistics for the tree change introduced by a git commit.
 ///

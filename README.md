@@ -77,6 +77,7 @@ file selected with `--llm-config PATH`:
 api = "openai-compatible"
 base_url = "http://127.0.0.1:11434/v1"
 model = "qwen2.5-coder:7b"
+fallback_model = "qwen2.5-coder:32b"
 # api_key_env = "MY_LLM_API_KEY"
 ```
 
@@ -84,10 +85,13 @@ Use `api_key_env` rather than `api_key` in a file that might be committed.
 Configuration precedence is CLI arguments, then environment variables, then
 the TOML file, then built-in defaults. The generic environment names are
 `AISSENCE_LLM_API`, `AISSENCE_LLM_BASE_URL`, `AISSENCE_LLM_MODEL`,
-`AISSENCE_LLM_API_KEY`, `AISSENCE_LLM_API_KEY_ENV`, and
-`AISSENCE_LLM_PROVIDER`. Existing `OPENROUTER_API_KEY`, `OPENROUTER_MODEL`, and
+`AISSENCE_LLM_FALLBACK_MODEL`, `AISSENCE_LLM_API_KEY`,
+`AISSENCE_LLM_API_KEY_ENV`, and `AISSENCE_LLM_PROVIDER`. Existing
+`OPENROUTER_API_KEY`, `OPENROUTER_MODEL`, `OPENROUTER_FALLBACK_MODEL`, and
 `OPENROUTER_PROVIDER` settings remain supported and OpenRouter remains the
-zero-configuration backend.
+zero-configuration backend. `--fallback-model` selects a better model for any
+request or output-validation failure; it is unused when it matches the primary
+model.
 
 Compatible endpoints use `POST <base_url>/chat/completions` with standard
 system/user messages, `temperature`, and `max_tokens`. OpenRouter-specific
@@ -100,10 +104,20 @@ non-streaming response path; token usage is recorded when returned, but cost is
 reported as unpriced unless the endpoint supplies OpenRouter-compatible cost
 metadata.
 
-OpenRouter batch prompt summaries use a strict JSON schema. Invalid batches
-fall back to individual prompt requests, successful partial results remain in
-the `.aissence` cache, and unresolved indexes retain model/error metadata for a
-later retry with the same or a different model.
+OpenRouter batch prompt summaries use a strict JSON schema. An invalid request
+or response first switches to the configured fallback model. Invalid batches
+then fall back to individual prompt requests, successful partial results remain
+in the `.aissence` cache, and unresolved indexes retain model/error metadata for
+a later retry with the same or a different model.
+
+Public summaries use a two-stage pipeline in both the CLI and server: every
+user prompt is first converted to a privacy-safe bounded summary, then the
+commit narrative is synthesized from those summaries plus bounded assistant
+and git evidence. Its requested range scales from 60–90 words for compact
+evidence to 120–150 for substantial commits, with a stable 50–165-word
+validation envelope across all models. Normal/hosted generation keeps the intermediate
+summaries private and ephemeral; local `--all-prompts` stores the same results
+without making additional requests.
 
 ## Server
 
@@ -116,7 +130,8 @@ AISSENCE_BIND=127.0.0.1:8787
 
 The server also reads:
 
-- `OPENROUTER_API_KEY` and optional `OPENROUTER_MODEL` / `OPENROUTER_PROVIDER`.
+- `OPENROUTER_API_KEY` and optional `OPENROUTER_MODEL`,
+  `OPENROUTER_FALLBACK_MODEL`, and `OPENROUTER_PROVIDER`.
 - `SUPABASE_JWT_SECRET` for validating browser login approval.
 - `AISSENCE_TOKEN_SECRET`, issuer, audience, public API URL, frontend site URL,
   and token lifetimes. Set `AISSENCE_SITE_URL` to the frontend origin used for
@@ -154,6 +169,13 @@ scripts/preview-summary.sh /path/to/project openai/gpt-5.4
 
 # Also generate a summary for every user prompt.
 scripts/preview-summary.sh --all-prompts /path/to/project openai/gpt-5.4
+```
+
+Add a stronger fallback model for failed requests or invalid summaries with:
+
+```sh
+scripts/preview-summary.sh --fallback-model openai/gpt-5.4 \
+  /path/to/project inclusionai/ling-2.6-flash
 ```
 
 The script removes the target repository's existing `.aissence` cache, runs
