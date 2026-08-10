@@ -65,11 +65,14 @@ use crate::ncs;
 pub const MAX_CONCURRENT_GROUPS: usize = 32;
 /// Maximum number of LLM requests in flight across all commit groups.
 pub const MAX_CONCURRENT_REQUESTS: usize = 24;
-/// Number of retries after the initial request for retryable failures.
-/// Provider rate limits (429) can persist well beyond a few seconds when a
-/// batch of groups starts at once, so the budget is generous. Malformed model
-/// output that fails response validation uses the same bounded budget.
+/// Number of retries after the initial request for retryable transport or
+/// provider failures. Provider rate limits (429) can persist well beyond a few
+/// seconds when a batch of groups starts at once, so the budget is generous.
 const DEFAULT_MAX_REQUEST_RETRIES: usize = 7;
+/// Successful responses that fail local validation use a deliberately small,
+/// separate budget. Retrying unchanged invalid output seven times is expensive
+/// and rarely improves quality.
+const DEFAULT_MAX_INVALID_OUTPUT_RETRIES: usize = 1;
 /// Initial grace period before retrying; subsequent waits double.
 const RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
 /// Longest grace period between retries (before jitter).
@@ -105,6 +108,10 @@ pub struct SummarizationCost {
     pub usd: f64,
     pub request_count: usize,
     pub unpriced_request_count: usize,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub upstream_prompt_usd: f64,
+    pub upstream_completion_usd: f64,
 }
 
 /// Partial result of per-prompt generation. Successful summaries are always
@@ -134,6 +141,8 @@ pub struct SummarizationRequestUsage {
     pub completion_tokens: u32,
     pub total_tokens: u32,
     pub cost: Option<f64>,
+    pub upstream_prompt_cost: Option<f64>,
+    pub upstream_completion_cost: Option<f64>,
 }
 
 /// Live progress emitted by [`Summarizer::with_progress`].
@@ -174,6 +183,10 @@ impl SummarizationCost {
         self.usd += other.usd;
         self.request_count += other.request_count;
         self.unpriced_request_count += other.unpriced_request_count;
+        self.prompt_tokens += other.prompt_tokens;
+        self.completion_tokens += other.completion_tokens;
+        self.upstream_prompt_usd += other.upstream_prompt_usd;
+        self.upstream_completion_usd += other.upstream_completion_usd;
     }
 }
 
@@ -181,12 +194,29 @@ impl SummarizationCost {
 struct CostTracker(Mutex<SummarizationCost>);
 
 impl CostTracker {
-    fn record(&self, cost: Option<f64>) {
+    fn record(&self, usage: Option<&ResponseUsage>) {
         let mut total = self.0.lock().expect("summarization cost lock");
         total.request_count += 1;
+        let cost = usage.and_then(|usage| usage.cost);
         match cost.filter(|value| value.is_finite() && *value >= 0.0) {
             Some(cost) => total.usd += cost,
             None => total.unpriced_request_count += 1,
+        }
+        if let Some(usage) = usage {
+            total.prompt_tokens += u64::from(usage.prompt_tokens);
+            total.completion_tokens += u64::from(usage.completion_tokens);
+            if let Some(details) = &usage.cost_details {
+                if details.upstream_inference_prompt_cost.is_finite()
+                    && details.upstream_inference_prompt_cost >= 0.0
+                {
+                    total.upstream_prompt_usd += details.upstream_inference_prompt_cost;
+                }
+                if details.upstream_inference_completions_cost.is_finite()
+                    && details.upstream_inference_completions_cost >= 0.0
+                {
+                    total.upstream_completion_usd += details.upstream_inference_completions_cost;
+                }
+            }
         }
     }
 
@@ -209,11 +239,13 @@ pub struct Summarizer {
     client: CompletionClient,
     api: LlmApi,
     model: String,
+    prompt_model: Option<String>,
     fallback_model: Option<String>,
     provider: Option<String>,
     hosted_policy: bool,
     debug_requests: bool,
     max_request_retries: usize,
+    max_invalid_output_retries: usize,
     request_limit: Arc<Semaphore>,
     progress: Option<Arc<dyn Fn(SummarizationProgress) + Send + Sync>>,
     next_request_id: AtomicUsize,
@@ -260,11 +292,13 @@ impl Summarizer {
             client,
             api: config.api,
             model: config.model,
+            prompt_model: config.prompt_model,
             fallback_model: config.fallback_model,
             provider: config.provider,
             hosted_policy: false,
             debug_requests: false,
             max_request_retries: DEFAULT_MAX_REQUEST_RETRIES,
+            max_invalid_output_retries: DEFAULT_MAX_INVALID_OUTPUT_RETRIES,
             request_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
             progress: None,
             next_request_id: AtomicUsize::new(0),
@@ -287,6 +321,7 @@ impl Summarizer {
             base_url: crate::llm::OPENROUTER_BASE_URL.to_string(),
             api_key: Some(api_key.into()),
             model: model.into(),
+            prompt_model: None,
             fallback_model: None,
             provider,
         })
@@ -300,6 +335,12 @@ impl Summarizer {
     /// The model id this summarizer uses.
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    /// The model used for per-prompt paraphrases. When absent, [`Self::model`]
+    /// handles both prompt summaries and public stories.
+    pub fn prompt_model(&self) -> &str {
+        self.prompt_model.as_deref().unwrap_or(&self.model)
     }
 
     /// The model used after the primary model exhausts request retries or
@@ -318,6 +359,13 @@ impl Summarizer {
     /// default.
     pub fn with_max_request_retries(mut self, retries: usize) -> Self {
         self.max_request_retries = retries;
+        self
+    }
+
+    /// Set the number of retries after a successful response fails local
+    /// parsing or validation. This is independent from transport retries.
+    pub fn with_max_invalid_output_retries(mut self, retries: usize) -> Self {
+        self.max_invalid_output_retries = retries;
         self
     }
 
@@ -388,7 +436,7 @@ impl Summarizer {
     ) -> (Result<(), Error>, SummarizationCost) {
         let costs = CostTracker::default();
         let costs_ref = &costs;
-        let jobs = history
+        let group_indices = history
             .groups
             .iter()
             .enumerate()
@@ -405,11 +453,25 @@ impl Summarizer {
                                 .as_ref()
                                 .is_some_and(|summary| has_all_prompt_summaries(group, summary))))
             })
-            .map(|(index, group)| async move {
-                self.summarize_group_options_tracked(group, all_prompts, costs_ref)
-                    .await
-                    .map(|summary| (index, summary))
-            });
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let prompt_outcomes = self
+            .summarize_history_user_entries(history, &group_indices, all_prompts, costs_ref)
+            .await;
+        let jobs = group_indices.into_iter().map(|index| {
+            let group = &history.groups[index];
+            let prompt_outcome = prompt_outcomes.get(&index).cloned();
+            async move {
+                self.summarize_group_options_precomputed_tracked(
+                    group,
+                    all_prompts,
+                    prompt_outcome,
+                    costs_ref,
+                )
+                .await
+                .map(|summary| (index, summary))
+            }
+        });
         let outcomes: Vec<Result<(usize, CommitSummary), Error>> = stream::iter(jobs)
             .buffer_unordered(MAX_CONCURRENT_GROUPS)
             .collect()
@@ -439,6 +501,72 @@ impl Summarizer {
             }
         }
         (first_error.map_or(Ok(()), Err), costs.total())
+    }
+
+    /// Summarize missing user entries across the entire history so sparse
+    /// commits can share a batch. The model-facing limits and per-entry
+    /// validation remain identical to commit-local batching.
+    async fn summarize_history_user_entries(
+        &self,
+        history: &CoalescedHistory,
+        group_indices: &[usize],
+        all_prompts: bool,
+        costs: &CostTracker,
+    ) -> BTreeMap<usize, PromptSummarizationOutcome> {
+        let mut flat_items = Vec::new();
+        let mut locations = Vec::new();
+        for group_index in group_indices {
+            let group = &history.groups[*group_index];
+            let items = coalesce_consecutive(raw_items(group));
+            let cached_summary = all_prompts
+                .then(|| group.summary.as_ref())
+                .flatten()
+                .filter(|summary| {
+                    summary.summarizer_version == SUMMARIZER_VERSION
+                        && items_match_summary(&items, summary)
+                });
+            for (message_index, item) in items.iter().enumerate() {
+                let already_summarized = cached_summary
+                    .and_then(|summary| summary.messages.get(message_index))
+                    .and_then(|message| message.subscriber_summary.as_deref())
+                    .is_some_and(|summary| !summary.trim().is_empty());
+                if item.kind == MessageKind::UserWrote && !already_summarized {
+                    locations.push((*group_index, message_index));
+                    flat_items.push(item.clone());
+                }
+            }
+        }
+        if flat_items.is_empty() {
+            return BTreeMap::new();
+        }
+
+        let flat_outcome = self
+            .summarize_user_entries_resilient(
+                &flat_items,
+                costs,
+                ShortPromptPolicy::ParaphraseForPublic,
+                None,
+            )
+            .await;
+        let mut outcomes = BTreeMap::<usize, PromptSummarizationOutcome>::new();
+        for (flat_index, summary) in flat_outcome.summaries {
+            let (group_index, message_index) = locations[flat_index];
+            outcomes
+                .entry(group_index)
+                .or_default()
+                .summaries
+                .push((message_index, summary));
+        }
+        for mut failure in flat_outcome.failures {
+            let (group_index, message_index) = locations[failure.message_index];
+            failure.message_index = message_index;
+            outcomes
+                .entry(group_index)
+                .or_default()
+                .failures
+                .push(failure);
+        }
+        outcomes
     }
 
     /// Summarize a single commit group by first paraphrasing its user prompts,
@@ -485,6 +613,7 @@ impl Summarizer {
                 commit.source.tokens,
                 true,
                 false,
+                None,
                 None,
                 &costs,
             )
@@ -545,6 +674,17 @@ impl Summarizer {
         all_prompts: bool,
         costs: &CostTracker,
     ) -> Result<CommitSummary, Error> {
+        self.summarize_group_options_precomputed_tracked(group, all_prompts, None, costs)
+            .await
+    }
+
+    async fn summarize_group_options_precomputed_tracked(
+        &self,
+        group: &CommitGroup,
+        all_prompts: bool,
+        prompt_outcome: Option<PromptSummarizationOutcome>,
+        costs: &CostTracker,
+    ) -> Result<CommitSummary, Error> {
         // Consecutive messages of the same kind (e.g. several "ai changed" in a
         // row) are merged locally into a single retained entry.
         let items = coalesce_consecutive(raw_items(group));
@@ -565,6 +705,7 @@ impl Summarizer {
                 !all_prompts,
                 all_prompts,
                 cached_prompt_summaries,
+                prompt_outcome,
                 costs,
             )
             .await?;
@@ -581,6 +722,7 @@ impl Summarizer {
         include_beats: bool,
         retain_prompt_summaries: bool,
         cached_summary: Option<&CommitSummary>,
+        prompt_outcome: Option<PromptSummarizationOutcome>,
         costs: &CostTracker,
     ) -> Result<CommitSummary, Error> {
         let mut messages: Vec<MessageSummary> = items
@@ -610,14 +752,18 @@ impl Summarizer {
             })
             .map(|(index, _)| index)
             .collect::<BTreeSet<_>>();
-        let outcome = self
-            .summarize_user_entries_resilient(
-                items,
-                costs,
-                ShortPromptPolicy::ParaphraseForPublic,
-                Some(&missing),
-            )
-            .await;
+        let outcome = match prompt_outcome {
+            Some(outcome) => outcome,
+            None => {
+                self.summarize_user_entries_resilient(
+                    items,
+                    costs,
+                    ShortPromptPolicy::ParaphraseForPublic,
+                    Some(&missing),
+                )
+                .await
+            }
+        };
         let mut prompt_summaries = BTreeMap::new();
         for (index, message) in messages.iter().enumerate() {
             if let Some(summary) = message.subscriber_summary.as_deref() {
@@ -643,7 +789,12 @@ impl Summarizer {
             }
             return Ok(CommitSummary {
                 summarizer_version: SUMMARIZER_VERSION,
-                public: fallback_public_story(commit, SummaryOrigin::ParseFallback),
+                public: reusable_cached_public_story(
+                    cached_summary,
+                    retain_prompt_summaries,
+                    include_beats,
+                )
+                .unwrap_or_else(|| fallback_public_story(commit, SummaryOrigin::ParseFallback)),
                 messages,
                 agents,
                 tokens,
@@ -651,9 +802,19 @@ impl Summarizer {
             });
         }
 
-        let public = self
-            .summarize_public_story(items, &prompt_summaries, commit, include_beats, costs)
-            .await?;
+        // `--all-prompts` changes only paid/local prompt detail. If the source
+        // shape and summarizer version still match, preserve the already
+        // approved public story instead of paying to regenerate it merely to
+        // clear beats.
+        let public =
+            reusable_cached_public_story(cached_summary, retain_prompt_summaries, include_beats);
+        let public = match public {
+            Some(public) => public,
+            None => {
+                self.summarize_public_story(items, &prompt_summaries, commit, include_beats, costs)
+                    .await?
+            }
+        };
 
         Ok(CommitSummary {
             summarizer_version: SUMMARIZER_VERSION,
@@ -733,41 +894,66 @@ impl Summarizer {
                 .await;
             (batch, outcome)
         });
-        let outcomes: Vec<(Vec<usize>, Result<Vec<String>, Error>)> = stream::iter(jobs)
+        let outcomes: Vec<(Vec<usize>, Result<UserBatchOutcome, Error>)> = stream::iter(jobs)
             .buffered(MAX_CONCURRENT_REQUESTS)
             .collect()
             .await;
         let mut individual_retries = Vec::new();
+        let mut unresolved = Vec::new();
         for (indices, outcome) in outcomes {
             match outcome {
-                Ok(summaries) => {
-                    for (index, summary) in indices.into_iter().zip(summaries) {
+                Ok(batch_outcome) => {
+                    for (index, summary) in batch_outcome.summaries {
                         results[index] = Some(summary);
+                    }
+                    for (index, error) in batch_outcome.failures {
+                        individual_retries.push((index, Error::Llm(error)));
                     }
                 }
                 Err(error) if indices.len() == 1 => {
-                    individual_retries.push((indices[0], error));
+                    unresolved.push((indices[0], error));
                 }
                 Err(_) => {
-                    // A malformed or privacy-invalid batch should not discard
-                    // valid siblings. Retry each source prompt independently.
-                    let retries = stream::iter(indices.into_iter().map(|index| async move {
-                        let batch = [index];
-                        let outcome = self
-                            .summarize_user_batch(items, &batch, costs, public_safe)
-                            .await;
-                        (index, outcome)
-                    }))
-                    .buffered(MAX_CONCURRENT_REQUESTS)
-                    .collect::<Vec<_>>()
-                    .await;
-                    for (index, outcome) in retries {
-                        match outcome {
-                            Ok(mut summaries) => results[index] = summaries.pop(),
-                            Err(error) => individual_retries.push((index, error)),
-                        }
+                    for index in indices {
+                        individual_retries.push((
+                            index,
+                            Error::Llm("user-summary batch response could not be parsed".into()),
+                        ));
                     }
                 }
+            }
+        }
+
+        // Retry only unresolved entries. Valid siblings from a partially valid
+        // batch are retained and never regenerated.
+        let retries = stream::iter(individual_retries.into_iter().map(
+            |(index, first_error)| async move {
+                let batch = [index];
+                let outcome = self
+                    .summarize_user_batch(items, &batch, costs, public_safe)
+                    .await;
+                (index, first_error, outcome)
+            },
+        ))
+        .buffered(MAX_CONCURRENT_REQUESTS)
+        .collect::<Vec<_>>()
+        .await;
+        for (index, first_error, outcome) in retries {
+            match outcome {
+                Ok(batch_outcome) => {
+                    if let Some((_, summary)) = batch_outcome.summaries.into_iter().next() {
+                        results[index] = Some(summary);
+                    } else {
+                        let detail = batch_outcome
+                            .failures
+                            .into_iter()
+                            .next()
+                            .map(|(_, detail)| Error::Llm(detail))
+                            .unwrap_or(first_error);
+                        unresolved.push((index, detail));
+                    }
+                }
+                Err(error) => unresolved.push((index, error)),
             }
         }
         let attempted_at = chrono::Utc::now();
@@ -777,14 +963,15 @@ impl Summarizer {
                 .enumerate()
                 .filter_map(|(index, summary)| summary.map(|summary| (index, summary)))
                 .collect(),
-            failures: individual_retries
+            failures: unresolved
                 .into_iter()
                 .map(|(message_index, error)| PromptSummaryFailure {
                     message_index,
                     model: self
-                        .fallback_model
-                        .clone()
-                        .unwrap_or_else(|| self.model.clone()),
+                        .request_models(SummarizationRequestKind::UserBatch { entries: 1 })
+                        .last()
+                        .expect("prompt request model")
+                        .to_string(),
                     error: truncate_head(&error.to_string(), FAILURE_DETAIL_CHARS),
                     attempted_at,
                 })
@@ -800,7 +987,7 @@ impl Summarizer {
         batch: &[usize],
         costs: &CostTracker,
         public_safe: bool,
-    ) -> Result<Vec<String>, Error> {
+    ) -> Result<UserBatchOutcome, Error> {
         if batch.len() == 1 {
             let (target_minimum, target_maximum) =
                 prompt_summary_target_word_range(&items[batch[0]]);
@@ -857,7 +1044,10 @@ impl Summarizer {
                                 batch[0]
                             ));
                         }
-                        Ok(vec![summary.to_string()])
+                        Ok(UserBatchOutcome {
+                            summaries: vec![(batch[0], summary.to_string())],
+                            failures: Vec::new(),
+                        })
                     },
                 )
                 .await;
@@ -899,12 +1089,7 @@ impl Summarizer {
             Some(user_summary_batch_response_format(batch.len())),
             true,
             |text| {
-                validate_indexed_user_summaries(text, batch, items, public_safe).map(|summaries| {
-                    summaries
-                        .into_iter()
-                        .map(|summary| summary.summary.trim().to_string())
-                        .collect()
-                })
+                validate_indexed_user_summaries(text, batch, items, public_safe)
             },
         )
         .await
@@ -925,9 +1110,9 @@ impl Summarizer {
         .await
     }
 
-    /// Issue chat completions until the response passes `parser` or the shared
-    /// retry budget is exhausted. Successful-but-invalid model responses are
-    /// billed and surfaced as retries just like retryable transport failures.
+    /// Issue chat completions until the response passes `parser` or its
+    /// applicable retry budget is exhausted. Transport failures and
+    /// successful-but-invalid model responses have separate budgets.
     async fn complete_with_parser<T, F>(
         &self,
         system: &'static str,
@@ -979,8 +1164,10 @@ impl Summarizer {
                 "the hosted privacy policy requires the OpenRouter API".to_string(),
             ));
         }
+        let models = self.request_models(kind);
+        let has_distinct_fallback = models.len() > 1;
         let retry_invalid_output = allow_invalid_output_retry
-            && self.fallback_model.is_none()
+            && !has_distinct_fallback
             && (self.api != LlmApi::OpenRouter || response_format.is_none());
         // Ask OpenRouter to disable reasoning. Models where reasoning is
         // mandatory reject `none`, so retain progressively more compatible
@@ -991,10 +1178,6 @@ impl Summarizer {
         } else {
             vec![None]
         };
-        let mut models = vec![self.model.as_str()];
-        if let Some(fallback) = self.fallback_model.as_deref() {
-            models.push(fallback);
-        }
         let build_requests = |model: &str| {
             reasoning_efforts
                 .iter()
@@ -1015,7 +1198,8 @@ impl Summarizer {
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
         let mut model_index = 0;
         let mut requests = build_requests(models[model_index])?;
-        let mut retry = 0;
+        let mut request_retry = 0;
+        let mut invalid_output_retry = 0;
         let mut request_index = 0;
         let mut attempts = 0;
         loop {
@@ -1035,12 +1219,13 @@ impl Summarizer {
                 {
                     Ok(response) => {
                         let CompletionResponse { text, usage } = response;
-                        costs.record(usage.as_ref().and_then(|usage| usage.cost));
+                        costs.record(usage.as_ref());
                         parser(&text)
                             .map(|parsed| (parsed, usage))
                             .map_err(|message| CompletionError {
                                 message,
-                                retryable: retry_invalid_output,
+                                retryable: false,
+                                invalid_output: retry_invalid_output,
                                 unsupported_reasoning: false,
                             })
                     }
@@ -1067,20 +1252,33 @@ impl Summarizer {
                         ),
                     });
                 }
-                Err(error) if error.retryable && retry < self.max_request_retries => {
+                Err(error)
+                    if error.invalid_output
+                        && invalid_output_retry < self.max_invalid_output_retries =>
+                {
                     self.emit_progress(SummarizationProgress::Retrying {
                         id: request_id,
                         kind,
                         attempt: attempts + 1,
                         error: error.to_string(),
                     });
-                    tokio::time::sleep(retry_delay(retry)).await;
-                    retry += 1;
+                    invalid_output_retry += 1;
+                }
+                Err(error) if error.retryable && request_retry < self.max_request_retries => {
+                    self.emit_progress(SummarizationProgress::Retrying {
+                        id: request_id,
+                        kind,
+                        attempt: attempts + 1,
+                        error: error.to_string(),
+                    });
+                    tokio::time::sleep(retry_delay(request_retry)).await;
+                    request_retry += 1;
                 }
                 Err(error) if model_index + 1 < models.len() => {
                     model_index += 1;
                     request_index = 0;
-                    retry = 0;
+                    request_retry = 0;
+                    invalid_output_retry = 0;
                     requests = build_requests(models[model_index])?;
                     self.emit_progress(SummarizationProgress::Retrying {
                         id: request_id,
@@ -1174,6 +1372,28 @@ impl Summarizer {
         Some(preferences)
     }
 
+    /// Ordered, de-duplicated recovery chain for one request stage. Prompt
+    /// paraphrases start with the optional cheap model, then use the primary
+    /// story model before the explicitly configured fallback.
+    fn request_models(&self, kind: SummarizationRequestKind) -> Vec<&str> {
+        let mut models = Vec::with_capacity(3);
+        match kind {
+            SummarizationRequestKind::UserBatch { .. } => {
+                models.push(self.prompt_model());
+                if self.model != self.prompt_model() {
+                    models.push(self.model.as_str());
+                }
+            }
+            SummarizationRequestKind::PublicStory => models.push(self.model.as_str()),
+        }
+        if let Some(fallback) = self.fallback_model.as_deref()
+            && !models.contains(&fallback)
+        {
+            models.push(fallback);
+        }
+        models
+    }
+
     async fn stream_completion(
         &self,
         client: &OpenRouterClient,
@@ -1248,6 +1468,7 @@ impl Summarizer {
                     .map_err(|error| CompletionError {
                         message: error.to_string(),
                         retryable: error.is_timeout() || error.is_connect(),
+                        invalid_output: false,
                         unsupported_reasoning: false,
                     })?;
                 let status = response.status();
@@ -1257,12 +1478,14 @@ impl Summarizer {
                     return Err(CompletionError {
                         message: format!("upstream returned {status}: {detail}"),
                         retryable: is_retryable_status(status.as_u16()),
+                        invalid_output: false,
                         unsupported_reasoning: false,
                     });
                 }
                 let body = response.text().await.map_err(|error| CompletionError {
                     message: error.to_string(),
                     retryable: error.is_timeout() || error.is_connect(),
+                    invalid_output: false,
                     unsupported_reasoning: false,
                 })?;
                 // Some OpenAI-compatible providers emit malformed JSON with
@@ -1279,6 +1502,7 @@ impl Summarizer {
                             truncate_for_error(&body)
                         ),
                         retryable: false,
+                        invalid_output: false,
                         unsupported_reasoning: false,
                     })
             }
@@ -1379,6 +1603,7 @@ fn completion_response(response: CompletionsResponse) -> CompletionResponse {
 struct CompletionError {
     message: String,
     retryable: bool,
+    invalid_output: bool,
     unsupported_reasoning: bool,
 }
 
@@ -1387,6 +1612,7 @@ impl CompletionError {
         Self {
             message,
             retryable: false,
+            invalid_output: false,
             unsupported_reasoning: false,
         }
     }
@@ -1401,6 +1627,7 @@ impl CompletionError {
         Self {
             retryable: is_retryable_request_error(&error),
             message: error.to_string(),
+            invalid_output: false,
             unsupported_reasoning,
         }
     }
@@ -1447,6 +1674,14 @@ fn request_usage(usage: &ResponseUsage) -> SummarizationRequestUsage {
         completion_tokens: usage.completion_tokens,
         total_tokens: usage.total_tokens,
         cost: usage.cost,
+        upstream_prompt_cost: usage
+            .cost_details
+            .as_ref()
+            .map(|details| details.upstream_inference_prompt_cost),
+        upstream_completion_cost: usage
+            .cost_details
+            .as_ref()
+            .map(|details| details.upstream_inference_completions_cost),
     }
 }
 
@@ -1595,6 +1830,12 @@ struct IndexedUserSummaryEnvelope {
     summaries: Vec<IndexedUserSummary>,
 }
 
+#[derive(Debug, Default)]
+struct UserBatchOutcome {
+    summaries: Vec<(usize, String)>,
+    failures: Vec<(usize, String)>,
+}
+
 fn user_summary_batch_response_format(entries: usize) -> ResponseFormat {
     ResponseFormat::json_schema(
         "aissence_user_summary_batch",
@@ -1652,57 +1893,88 @@ fn validate_indexed_user_summaries(
     batch: &[usize],
     items: &[RawItem],
     public_safe: bool,
-) -> Result<Vec<IndexedUserSummary>, String> {
+) -> Result<UserBatchOutcome, String> {
     let summaries = parse_indexed_user_summaries(text).ok_or_else(|| {
         "user-summary batch validation failed: JSON shape (expected {\"summaries\":[...]})"
             .to_string()
     })?;
-    if summaries.len() != batch.len() {
-        return Err(format!(
-            "user-summary batch validation failed: count mismatch (expected {}, received {})",
-            batch.len(),
-            summaries.len()
-        ));
+    let mut by_index = BTreeMap::<usize, Vec<IndexedUserSummary>>::new();
+    for summary in summaries {
+        by_index
+            .entry(summary.message_index)
+            .or_default()
+            .push(summary);
     }
-    for (position, (summary, expected_index)) in summaries.iter().zip(batch).enumerate() {
-        if summary.message_index != *expected_index {
-            return Err(format!(
-                "user-summary batch validation failed: index mismatch at position {position} (expected {expected_index}, received {})",
-                summary.message_index
+
+    let mut outcome = UserBatchOutcome::default();
+    for expected_index in batch {
+        let Some(mut candidates) = by_index.remove(expected_index) else {
+            outcome.failures.push((
+                *expected_index,
+                format!(
+                    "user-summary batch validation failed: missing summary for message {expected_index}"
+                ),
             ));
+            continue;
+        };
+        if candidates.len() != 1 {
+            outcome.failures.push((
+                *expected_index,
+                format!(
+                    "user-summary batch validation failed: duplicate summaries for message {expected_index}"
+                ),
+            ));
+            continue;
         }
-        if summary.summary.trim().is_empty() {
-            return Err(format!(
-                "user-summary batch validation failed: empty summary for message {expected_index}"
+        let summary = candidates.pop().expect("one candidate");
+        let normalized = summary.summary.trim();
+        if normalized.is_empty() {
+            outcome.failures.push((
+                *expected_index,
+                format!(
+                    "user-summary batch validation failed: empty summary for message {expected_index}"
+                ),
             ));
+            continue;
         }
         if public_safe
             && raw_public_text_leaks_prompt(
-                &summary.summary,
+                normalized,
                 std::slice::from_ref(&items[*expected_index]),
             )
         {
             write_privacy_overlap_debug_file(
                 *expected_index,
                 &items[*expected_index].text,
-                &summary.summary,
+                normalized,
             );
-            return Err(format!(
-                "user-summary batch validation failed: privacy overlap for message {expected_index}"
+            outcome.failures.push((
+                *expected_index,
+                format!(
+                    "user-summary batch validation failed: privacy overlap for message {expected_index}"
+                ),
             ));
+            continue;
         }
         let (minimum_words, maximum_words) =
             prompt_summary_accepted_word_range(&items[*expected_index]);
         let (target_minimum, target_maximum) =
             prompt_summary_target_word_range(&items[*expected_index]);
-        let words = word_count(&summary.summary);
+        let words = word_count(normalized);
         if !(minimum_words..=maximum_words).contains(&words) {
-            return Err(format!(
-                "user-summary batch validation failed: word count for message {expected_index} (accepted {minimum_words}-{maximum_words}, received {words}; target was {target_minimum}-{target_maximum})"
+            outcome.failures.push((
+                *expected_index,
+                format!(
+                    "user-summary batch validation failed: word count for message {expected_index} (accepted {minimum_words}-{maximum_words}, received {words}; target was {target_minimum}-{target_maximum})"
+                ),
             ));
+            continue;
         }
+        outcome
+            .summaries
+            .push((*expected_index, normalized.to_string()));
     }
-    Ok(summaries)
+    Ok(outcome)
 }
 
 fn prompt_summary_target_word_range(item: &RawItem) -> (usize, usize) {
@@ -1985,6 +2257,24 @@ fn fallback_public_story(
     }
 }
 
+fn reusable_cached_public_story(
+    cached_summary: Option<&CommitSummary>,
+    retain_prompt_summaries: bool,
+    include_beats: bool,
+) -> Option<PublicStory> {
+    if !retain_prompt_summaries || include_beats {
+        return None;
+    }
+    cached_summary
+        .map(|summary| {
+            let mut public = summary.public.clone();
+            public.beats.clear();
+            public.subline.clear();
+            public
+        })
+        .filter(|public| public.origin == SummaryOrigin::Model && !public.summary.trim().is_empty())
+}
+
 fn parse_public_story(text: &str) -> Option<PublicStory> {
     let trimmed = text.trim();
     let start = trimmed.find('{')?;
@@ -2021,14 +2311,8 @@ fn validate_public_story_output(
         ));
     }
     if include_beats {
-        if story.beats.len() > 3 {
-            return Err(format!(
-                "public-story validation failed: beat count (expected at most 3, received {})",
-                story.beats.len()
-            ));
-        }
         let mut seen = std::collections::HashSet::new();
-        for beat in &mut story.beats {
+        story.beats.retain_mut(|beat| {
             beat.label = normalize_whitespace(beat.label.trim());
             beat.text = normalize_whitespace(beat.text.trim());
             if beat.message_index >= items.len()
@@ -2037,21 +2321,17 @@ fn validate_public_story_output(
                 || beat.text.is_empty()
                 || !seen.insert(beat.message_index)
             {
-                return Err(format!(
-                    "public-story validation failed: invalid beat for message {}",
-                    beat.message_index
-                ));
+                return false;
             }
             if raw_public_text_leaks_prompt(
                 &beat.text,
                 std::slice::from_ref(&items[beat.message_index]),
             ) {
-                return Err(format!(
-                    "public-story validation failed: privacy overlap in beat for message {}",
-                    beat.message_index
-                ));
+                return false;
             }
-        }
+            true
+        });
+        story.beats.truncate(3);
     } else {
         story.beats.clear();
     }
@@ -2339,6 +2619,7 @@ fn retry_delay(retry: usize) -> Duration {
 
 /// One source message turned into a locally retained conversation entry and
 /// aggregate-summary input.
+#[derive(Clone)]
 struct RawItem {
     kind: MessageKind,
     /// Complete text used by the relevant commit-level summary call.
@@ -2737,6 +3018,29 @@ mod tests {
     }
 
     #[test]
+    fn prompt_requests_try_prompt_primary_and_fallback_models_in_order() {
+        let summarizer = Summarizer::from_config(LlmConfig {
+            api: LlmApi::OpenaiCompatible,
+            base_url: "http://127.0.0.1:1/v1".into(),
+            api_key: None,
+            model: "story-model".into(),
+            prompt_model: Some("prompt-model".into()),
+            fallback_model: Some("fallback-model".into()),
+            provider: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            summarizer.request_models(SummarizationRequestKind::UserBatch { entries: 1 }),
+            vec!["prompt-model", "story-model", "fallback-model"]
+        );
+        assert_eq!(
+            summarizer.request_models(SummarizationRequestKind::PublicStory),
+            vec!["story-model", "fallback-model"]
+        );
+    }
+
+    #[test]
     fn public_story_word_range_scales_with_bounded_evidence() {
         assert_eq!(
             public_story_word_range(0),
@@ -2975,14 +3279,20 @@ mod tests {
     #[test]
     fn cost_tracker_sums_reported_costs_and_counts_unpriced_requests() {
         let tracker = CostTracker::default();
-        tracker.record(Some(0.001));
+        let mut first = ResponseUsage::new(100, 20, 120);
+        first.cost = Some(0.001);
+        tracker.record(Some(&first));
         tracker.record(None);
-        tracker.record(Some(0.002));
+        let mut second = ResponseUsage::new(200, 30, 230);
+        second.cost = Some(0.002);
+        tracker.record(Some(&second));
 
         let total = tracker.total();
         assert!((total.usd - 0.003).abs() < f64::EPSILON);
         assert_eq!(total.request_count, 3);
         assert_eq!(total.unpriced_request_count, 1);
+        assert_eq!(total.prompt_tokens, 300);
+        assert_eq!(total.completion_tokens, 50);
     }
 
     #[tokio::test]
@@ -3112,6 +3422,7 @@ mod tests {
             base_url: format!("http://{address}/v1"),
             api_key: None,
             model: "local-model".to_string(),
+            prompt_model: Some("cheap-prompt-model".to_string()),
             fallback_model: None,
             provider: None,
         })
@@ -3136,6 +3447,8 @@ mod tests {
         assert_eq!(word_count(&summary.public.summary), 100);
         assert!(summary.messages[0].subscriber_summary.is_none());
         assert!(requests[0].contains("privacy-safe public paraphrase"));
+        assert!(requests[0].contains("\"model\":\"cheap-prompt-model\""));
+        assert!(requests[1].contains("\"model\":\"local-model\""));
         assert!(requests[1].contains("User message index 0 summary"));
         assert!(!requests[1].contains("Please implement the behavior"));
         assert!(requests[1].contains("exactly `summary` and `beats`"));
@@ -3187,11 +3500,13 @@ mod tests {
             base_url: format!("http://{address}/v1"),
             api_key: None,
             model: "primary-model".into(),
+            prompt_model: None,
             fallback_model: Some("fallback-model".into()),
             provider: None,
         })
         .unwrap()
-        .with_max_request_retries(0);
+        .with_max_request_retries(0)
+        .with_max_invalid_output_retries(0);
         let group = CommitGroup {
             commit: None,
             messages: vec![timed(ncs::Role::User, prompt, None)],
@@ -3208,41 +3523,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn all_prompts_regenerates_public_story_from_new_prompt_summaries() {
+    async fn all_prompts_reuses_matching_public_story() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let prompt_summary = generated_words("prompt", 12);
         let prompt_summary_for_server = prompt_summary.clone();
-        let public_summary = generated_words("synthesis", 100);
-        let public_summary_for_server = public_summary.clone();
         let server = tokio::spawn(async move {
             let mut requests = Vec::new();
-            for content in [
-                prompt_summary_for_server,
-                serde_json::json!({"summary": public_summary_for_server}).to_string(),
-            ] {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                requests.push(read_http_request(&mut socket).await);
-                let body = serde_json::json!({
+            let (mut socket, _) = listener.accept().await.unwrap();
+            requests.push(read_http_request(&mut socket).await);
+            let body = serde_json::json!({
                     "id": "test-completion",
                     "object": "chat.completion",
                     "created": 1,
                     "model": "local-model",
                     "choices": [{
                         "index": 0,
-                        "message": {"role": "assistant", "content": content},
+                        "message": {"role": "assistant", "content": prompt_summary_for_server},
                         "finish_reason": "stop"
                     }],
                     "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
-                })
-                .to_string();
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                socket.write_all(response.as_bytes()).await.unwrap();
-            }
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
             requests
         });
         let summarizer = Summarizer::from_config(LlmConfig {
@@ -3250,6 +3558,7 @@ mod tests {
             base_url: format!("http://{address}/v1"),
             api_key: None,
             model: "local-model".to_string(),
+            prompt_model: None,
             fallback_model: None,
             provider: None,
         })
@@ -3291,9 +3600,9 @@ mod tests {
         let requests = server.await.unwrap();
 
         assert!(outcome.is_ok());
-        assert_eq!(cost.request_count, 2);
+        assert_eq!(cost.request_count, 1);
         let summary = history.groups[0].summary.as_ref().unwrap();
-        assert_eq!(summary.public.summary, public_summary);
+        assert_eq!(summary.public.summary, "Existing public story.");
         assert!(summary.public.subline.is_empty());
         assert_eq!(
             summary.messages[0].subscriber_summary.as_deref(),
@@ -3302,8 +3611,183 @@ mod tests {
         assert!(has_all_prompt_summaries(&history.groups[0], summary));
         assert!(requests[0].contains("privacy-safe public paraphrase"));
         assert!(requests[0].contains("short complete prompt"));
-        assert!(requests[1].contains(prompt_summary.as_str()));
-        assert!(!requests[1].contains("short complete prompt"));
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unresolved_all_prompt_entry_preserves_cached_public_story() {
+        let summarizer = Summarizer::new("test-key", "story-model").unwrap();
+        let items = vec![item(MessageKind::UserWrote, "A complete source prompt")];
+        let cached = CommitSummary {
+            summarizer_version: SUMMARIZER_VERSION,
+            public: PublicStory {
+                subline: "obsolete".into(),
+                summary: "Existing reviewed public story.".into(),
+                beats: vec![crate::model::PublicBeat {
+                    message_index: 0,
+                    label: "Request".into(),
+                    text: "Existing beat.".into(),
+                }],
+                origin: SummaryOrigin::Model,
+            },
+            messages: vec![MessageSummary {
+                kind: MessageKind::UserWrote,
+                subscriber_summary: None,
+                content: Some("A complete source prompt".into()),
+                changes: Vec::new(),
+                timestamp: None,
+                tokens: None,
+            }],
+            ..CommitSummary::default()
+        };
+        let prompt_outcome = PromptSummarizationOutcome {
+            summaries: Vec::new(),
+            failures: vec![PromptSummaryFailure {
+                message_index: 0,
+                model: "fallback-model".into(),
+                error: "privacy overlap".into(),
+                attempted_at: chrono::Utc::now(),
+            }],
+        };
+        let costs = CostTracker::default();
+        let mut degraded = cached.clone();
+        degraded.public.origin = SummaryOrigin::ParseFallback;
+        assert!(reusable_cached_public_story(Some(&degraded), true, false).is_none());
+
+        let summary = summarizer
+            .summarize_items_tracked(
+                &items,
+                None,
+                Vec::new(),
+                None,
+                false,
+                true,
+                Some(&cached),
+                Some(prompt_outcome),
+                &costs,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(summary.public.summary, "Existing reviewed public story.");
+        assert!(summary.public.subline.is_empty());
+        assert!(summary.public.beats.is_empty());
+        assert_eq!(summary.prompt_failures.len(), 1);
+        assert_eq!(costs.total(), SummarizationCost::default());
+    }
+
+    #[tokio::test]
+    async fn history_prompt_batches_span_commit_boundaries() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let first_summary = generated_words("first", 12);
+        let second_summary = generated_words("second", 12);
+        let first_for_server = first_summary.clone();
+        let second_for_server = second_summary.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut socket).await;
+            let content = serde_json::json!({
+                "summaries": [
+                    {"message_index": 0, "summary": first_for_server},
+                    {"message_index": 1, "summary": second_for_server}
+                ]
+            })
+            .to_string();
+            let body = serde_json::json!({
+                "id": "test-completion",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "local-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 8, "completion_tokens": 4, "total_tokens": 12}
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            request
+        });
+        let summarizer = Summarizer::from_config(LlmConfig {
+            api: LlmApi::OpenaiCompatible,
+            base_url: format!("http://{address}/v1"),
+            api_key: None,
+            model: "local-model".to_string(),
+            prompt_model: None,
+            fallback_model: None,
+            provider: None,
+        })
+        .unwrap();
+        let make_group = |prompt: &str, story: &str| CommitGroup {
+            commit: None,
+            messages: vec![timed(ncs::Role::User, prompt, None)],
+            summary: Some(CommitSummary {
+                summarizer_version: SUMMARIZER_VERSION,
+                public: PublicStory {
+                    subline: String::new(),
+                    summary: story.into(),
+                    beats: Vec::new(),
+                    origin: SummaryOrigin::Model,
+                },
+                messages: vec![MessageSummary {
+                    kind: MessageKind::UserWrote,
+                    subscriber_summary: None,
+                    content: Some(prompt.into()),
+                    changes: Vec::new(),
+                    timestamp: None,
+                    tokens: None,
+                }],
+                agents: Vec::new(),
+                tokens: None,
+                prompt_failures: Vec::new(),
+            }),
+        };
+        let mut history = CoalescedHistory {
+            folder: std::path::PathBuf::from("/test/project"),
+            groups: vec![
+                make_group("first short complete prompt", "First existing story."),
+                make_group("second short complete prompt", "Second existing story."),
+            ],
+            undated: Vec::new(),
+            warnings: Vec::new(),
+        };
+
+        let (outcome, cost) = summarizer
+            .summarize_all_prompts_history_with_cost(&mut history)
+            .await;
+        let request = server.await.unwrap();
+
+        assert!(outcome.is_ok());
+        assert_eq!(cost.request_count, 1);
+        assert!(request.contains("first short complete prompt"));
+        assert!(request.contains("second short complete prompt"));
+        assert_eq!(
+            history.groups[0].summary.as_ref().unwrap().messages[0]
+                .subscriber_summary
+                .as_deref(),
+            Some(first_summary.as_str())
+        );
+        assert_eq!(
+            history.groups[1].summary.as_ref().unwrap().messages[0]
+                .subscriber_summary
+                .as_deref(),
+            Some(second_summary.as_str())
+        );
+        assert_eq!(
+            history.groups[0].summary.as_ref().unwrap().public.summary,
+            "First existing story."
+        );
+        assert_eq!(
+            history.groups[1].summary.as_ref().unwrap().public.summary,
+            "Second existing story."
+        );
     }
 
     #[tokio::test]
@@ -3343,6 +3827,7 @@ mod tests {
             base_url: format!("http://{address}/v1"),
             api_key: None,
             model: "local-model".to_string(),
+            prompt_model: None,
             fallback_model: None,
             provider: None,
         })
@@ -3414,6 +3899,7 @@ mod tests {
             base_url: format!("http://{address}/v1"),
             api_key: None,
             model: "primary-model".into(),
+            prompt_model: None,
             fallback_model: Some("fallback-model".into()),
             provider: None,
         })
@@ -3440,7 +3926,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_user_summary_batch_is_retried() {
+    async fn reordered_user_summary_batch_is_accepted_without_retry() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let first_summary = generated_words("first", 20);
@@ -3448,16 +3934,14 @@ mod tests {
         let expected_first = first_summary.clone();
         let expected_second = second_summary.clone();
         let server = tokio::spawn(async move {
-            for content in [
-                r#"[{"message_index":1,"summary":"Wrongly ordered."},{"message_index":0,"summary":"Wrongly ordered."}]"#.to_string(),
-                serde_json::json!([
-                    {"message_index": 0, "summary": first_summary},
-                    {"message_index": 1, "summary": second_summary}
-                ]).to_string(),
-            ] {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let _request = read_http_request(&mut socket).await;
-                let body = serde_json::json!({
+            let content = serde_json::json!([
+                {"message_index": 1, "summary": second_summary},
+                {"message_index": 0, "summary": first_summary}
+            ])
+            .to_string();
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut socket).await;
+            let body = serde_json::json!({
                     "id": "test-completion",
                     "object": "chat.completion",
                     "created": 1,
@@ -3472,15 +3956,14 @@ mod tests {
                         "completion_tokens": 2,
                         "total_tokens": 6
                     }
-                })
-                .to_string();
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                socket.write_all(response.as_bytes()).await.unwrap();
-            }
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
         });
         let progress = Arc::new(Mutex::new(Vec::new()));
         let captured_progress = Arc::clone(&progress);
@@ -3489,6 +3972,7 @@ mod tests {
             base_url: format!("http://{address}/v1"),
             api_key: None,
             model: "local-model".to_string(),
+            prompt_model: None,
             fallback_model: None,
             provider: None,
         })
@@ -3507,26 +3991,27 @@ mod tests {
             .unwrap();
         server.await.unwrap();
 
-        assert_eq!(summaries, [expected_first, expected_second]);
+        assert_eq!(
+            summaries.summaries,
+            vec![(0, expected_first), (1, expected_second)]
+        );
+        assert!(summaries.failures.is_empty());
         let cost = costs.total();
-        assert_eq!(cost.request_count, 2);
-        assert_eq!(cost.unpriced_request_count, 2);
+        assert_eq!(cost.request_count, 1);
+        assert_eq!(cost.unpriced_request_count, 1);
         let progress = progress.lock().unwrap();
         assert_eq!(
             progress
                 .iter()
                 .filter(|event| matches!(event, SummarizationProgress::Started { .. }))
                 .count(),
-            2
+            1
         );
-        assert!(progress.iter().any(|event| matches!(
-            event,
-            SummarizationProgress::Retrying {
-                attempt: 2,
-                error,
-                ..
-            } if error.contains("index mismatch")
-        )));
+        assert!(
+            !progress
+                .iter()
+                .any(|event| matches!(event, SummarizationProgress::Retrying { .. }))
+        );
         assert_eq!(
             progress
                 .iter()
@@ -3546,19 +4031,22 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let first_prompt = "a".repeat(300);
-        let first_prompt_for_server = first_prompt.clone();
         let successful_summary = generated_words("successful", 20);
         let successful_summary_for_server = successful_summary.clone();
         let server = tokio::spawn(async move {
-            for _ in 0..3 {
+            for _ in 0..2 {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let request = read_http_request(&mut socket).await;
                 let content = if request.contains("Summarize each of these user prompts") {
-                    r#"{"summaries":[]}"#
-                } else if request.contains(&first_prompt_for_server) {
-                    successful_summary_for_server.as_str()
+                    serde_json::json!({
+                        "summaries": [
+                            {"message_index": 0, "summary": successful_summary_for_server},
+                            {"message_index": 1, "summary": ""}
+                        ]
+                    })
+                    .to_string()
                 } else {
-                    "   "
+                    "   ".to_string()
                 };
                 let body = serde_json::json!({
                     "id": "test-completion",
@@ -3586,11 +4074,13 @@ mod tests {
             base_url: format!("http://{address}/v1"),
             api_key: None,
             model: "local-model".to_string(),
+            prompt_model: None,
             fallback_model: None,
             provider: None,
         })
         .unwrap()
-        .with_max_request_retries(0);
+        .with_max_request_retries(0)
+        .with_max_invalid_output_retries(0);
         let costs = CostTracker::default();
         let items = vec![
             item(MessageKind::UserWrote, &first_prompt),
@@ -3612,7 +4102,7 @@ mod tests {
         assert_eq!(outcome.failures[0].message_index, 1);
         assert_eq!(outcome.failures[0].model, "local-model");
         assert!(outcome.failures[0].error.contains("empty response"));
-        assert_eq!(costs.total().request_count, 3);
+        assert_eq!(costs.total().request_count, 2);
     }
 
     #[tokio::test]
@@ -3655,6 +4145,7 @@ mod tests {
             base_url: format!("http://{address}/v1"),
             api_key: None,
             model: "local-model".to_string(),
+            prompt_model: None,
             fallback_model: None,
             provider: None,
         })
@@ -3669,7 +4160,8 @@ mod tests {
             .unwrap();
         server.await.unwrap();
 
-        assert_eq!(summaries, [useful_summary]);
+        assert_eq!(summaries.summaries, vec![(0, useful_summary)]);
+        assert!(summaries.failures.is_empty());
         assert_eq!(costs.total().request_count, 2);
     }
 
@@ -4120,6 +4612,42 @@ mod tests {
     }
 
     #[test]
+    fn public_story_validation_drops_only_invalid_optional_beats() {
+        let items = vec![
+            item(
+                MessageKind::UserWrote,
+                "A private source request with several words",
+            ),
+            item(MessageKind::AiWrote, "Assistant evidence"),
+        ];
+        let text = serde_json::json!({
+            "summary": "The implementation addressed the request with a focused and verified change.",
+            "beats": [
+                {"message_index": 0, "label": "Request", "text": "The user requested a focused improvement."},
+                {"message_index": 1, "label": "Invalid", "text": "This points at assistant output."},
+                {"message_index": 0, "label": "Duplicate", "text": "This duplicates the same user moment."}
+            ]
+        })
+        .to_string();
+        let story = validate_public_story_output(
+            &text,
+            &items,
+            true,
+            PublicStoryWordRange {
+                target_minimum: 8,
+                target_maximum: 20,
+                accepted_minimum: 3,
+                accepted_maximum: 30,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(story.origin, SummaryOrigin::Model);
+        assert_eq!(story.beats.len(), 1);
+        assert_eq!(story.beats[0].message_index, 0);
+    }
+
+    #[test]
     fn public_story_leak_guard_detects_short_and_long_verbatim_prompt_text() {
         let short = vec![MessageSummary {
             kind: MessageKind::UserWrote,
@@ -4238,7 +4766,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_validation_reports_shape_count_index_empty_and_privacy_failures() {
+    fn batch_validation_salvages_reordered_and_valid_siblings() {
         let items = vec![
             item(
                 MessageKind::UserWrote,
@@ -4252,46 +4780,52 @@ mod tests {
                 .unwrap_err()
                 .contains("JSON shape")
         );
-        assert!(
-            validate_indexed_user_summaries(
-                r#"{"summaries":[{"message_index":0,"summary":"Safe."}]}"#,
-                &batch,
-                &items,
-                true,
-            )
-            .unwrap_err()
-            .contains("count mismatch")
+        let missing = validate_indexed_user_summaries(
+            r#"{"summaries":[{"message_index":0,"summary":"A retry mechanism was requested."}]}"#,
+            &batch,
+            &items,
+            true,
+        )
+        .unwrap();
+        assert_eq!(missing.summaries.len(), 1);
+        assert!(missing.failures[0].1.contains("missing summary"));
+
+        let reordered = validate_indexed_user_summaries(
+            r#"{"summaries":[{"message_index":1,"summary":"A compact interface was requested."},{"message_index":0,"summary":"A retry mechanism was requested."}]}"#,
+            &batch,
+            &items,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            reordered
+                .summaries
+                .iter()
+                .map(|(index, _)| *index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
         );
-        assert!(
-            validate_indexed_user_summaries(
-                r#"{"summaries":[{"message_index":1,"summary":"Safe."},{"message_index":0,"summary":"Also safe."}]}"#,
-                &batch,
-                &items,
-                true,
-            )
-            .unwrap_err()
-            .contains("index mismatch")
-        );
-        assert!(
-            validate_indexed_user_summaries(
-                r#"{"summaries":[{"message_index":0,"summary":""},{"message_index":1,"summary":"Safe."}]}"#,
-                &batch,
-                &items,
-                true,
-            )
-            .unwrap_err()
-            .contains("empty summary")
-        );
-        assert!(
-            validate_indexed_user_summaries(
-                r#"{"summaries":[{"message_index":0,"summary":"Add retry support to the network client now"},{"message_index":1,"summary":"The interface was simplified."}]}"#,
-                &batch,
-                &items,
-                true,
-            )
-            .unwrap_err()
-            .contains("privacy overlap")
-        );
+        assert!(reordered.failures.is_empty());
+
+        let partial = validate_indexed_user_summaries(
+            r#"{"summaries":[{"message_index":0,"summary":""},{"message_index":1,"summary":"A compact interface was requested."}]}"#,
+            &batch,
+            &items,
+            true,
+        )
+        .unwrap();
+        assert_eq!(partial.summaries[0].0, 1);
+        assert!(partial.failures[0].1.contains("empty summary"));
+
+        let privacy = validate_indexed_user_summaries(
+            r#"{"summaries":[{"message_index":0,"summary":"Add retry support to the network client now"},{"message_index":1,"summary":"A compact interface was requested."}]}"#,
+            &batch,
+            &items,
+            true,
+        )
+        .unwrap();
+        assert_eq!(privacy.summaries[0].0, 1);
+        assert!(privacy.failures[0].1.contains("privacy overlap"));
     }
 
     #[test]

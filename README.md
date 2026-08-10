@@ -58,8 +58,8 @@ dedicated API-key, credential-assignment, and private-key detectors.
 
 ### Local LLM configuration
 
-Local `summarize` accepts `--api`, `--base-url`, `--model`, `--api-key`,
-`--api-key-env`, and the OpenRouter-only `--provider`. Passing a literal key on
+Local `summarize` accepts `--api`, `--base-url`, `--model`, `--prompt-model`,
+`--api-key`, `--api-key-env`, and the OpenRouter-only `--provider`. Passing a literal key on
 the command line can expose it in shell history and process listings, so
 `--api-key-env NAME` is preferred. Authentication is optional for compatible
 local endpoints.
@@ -77,6 +77,7 @@ file selected with `--llm-config PATH`:
 api = "openai-compatible"
 base_url = "http://127.0.0.1:11434/v1"
 model = "qwen2.5-coder:7b"
+prompt_model = "qwen2.5-coder:3b"
 fallback_model = "qwen2.5-coder:32b"
 # api_key_env = "MY_LLM_API_KEY"
 ```
@@ -85,13 +86,21 @@ Use `api_key_env` rather than `api_key` in a file that might be committed.
 Configuration precedence is CLI arguments, then environment variables, then
 the TOML file, then built-in defaults. The generic environment names are
 `AISSENCE_LLM_API`, `AISSENCE_LLM_BASE_URL`, `AISSENCE_LLM_MODEL`,
+`AISSENCE_LLM_PROMPT_MODEL`,
 `AISSENCE_LLM_FALLBACK_MODEL`, `AISSENCE_LLM_API_KEY`,
 `AISSENCE_LLM_API_KEY_ENV`, and `AISSENCE_LLM_PROVIDER`. Existing
-`OPENROUTER_API_KEY`, `OPENROUTER_MODEL`, `OPENROUTER_FALLBACK_MODEL`, and
+`OPENROUTER_API_KEY`, `OPENROUTER_MODEL`, `OPENROUTER_PROMPT_MODEL`,
+`OPENROUTER_FALLBACK_MODEL`, and
 `OPENROUTER_PROVIDER` settings remain supported and OpenRouter remains the
 zero-configuration backend. `--fallback-model` selects a better model for any
 request or output-validation failure; it is unused when it matches the primary
 model.
+
+`--prompt-model` routes only the per-prompt paraphrase stage to a different
+model; public-story synthesis continues to use `--model`. This makes it possible
+to test a cheaper first-stage model without changing the narrative output model.
+If a prompt response fails validation, recovery tries `--prompt-model`, then
+`--model`, then `--fallback-model`, skipping duplicate model identifiers.
 
 Compatible endpoints use `POST <base_url>/chat/completions` with standard
 system/user messages, `temperature`, and `max_tokens`. OpenRouter-specific
@@ -130,7 +139,7 @@ AISSENCE_BIND=127.0.0.1:8787
 
 The server also reads:
 
-- `OPENROUTER_API_KEY` and optional `OPENROUTER_MODEL`,
+- `OPENROUTER_API_KEY` and optional `OPENROUTER_MODEL`, `OPENROUTER_PROMPT_MODEL`,
   `OPENROUTER_FALLBACK_MODEL`, and `OPENROUTER_PROVIDER`.
 - `SUPABASE_JWT_SECRET` for validating browser login approval.
 - `AISSENCE_TOKEN_SECRET`, issuer, audience, public API URL, frontend site URL,

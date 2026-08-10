@@ -1036,6 +1036,7 @@ mod tests {
                 usd: 0.001234,
                 request_count: 7,
                 unpriced_request_count: 0,
+                ..SummarizationCost::default()
             },
         };
 
@@ -1057,6 +1058,7 @@ mod tests {
                 usd: 0.02,
                 request_count: 3,
                 unpriced_request_count: 1,
+                ..SummarizationCost::default()
             },
         };
 

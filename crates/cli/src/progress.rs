@@ -610,6 +610,8 @@ mod tests {
                 completion_tokens: 42,
                 total_tokens: 942,
                 cost: None,
+                upstream_prompt_cost: None,
+                upstream_completion_cost: None,
             }),
         });
         live.handle(SummarizationProgress::Failed {
@@ -671,6 +673,8 @@ mod tests {
                     completion_tokens: tokens,
                     total_tokens: tokens + 10,
                     cost: None,
+                    upstream_prompt_cost: None,
+                    upstream_completion_cost: None,
                 }),
             });
             let state = live.requests.get_mut(&id).unwrap();

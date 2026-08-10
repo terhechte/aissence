@@ -132,6 +132,9 @@ struct LlmOptions {
     /// Model identifier understood by the endpoint.
     #[arg(long)]
     model: Option<String>,
+    /// Optional cheaper model used only for per-prompt paraphrases.
+    #[arg(long)]
+    prompt_model: Option<String>,
     /// Better model used when the primary model's request or output fails.
     #[arg(long)]
     fallback_model: Option<String>,
@@ -148,6 +151,7 @@ impl LlmOptions {
             api_key: self.api_key,
             api_key_env: self.api_key_env,
             model: self.model,
+            prompt_model: self.prompt_model,
             fallback_model: self.fallback_model,
             provider: self.provider,
         }
@@ -160,6 +164,7 @@ impl LlmOptions {
             && self.api_key.is_none()
             && self.api_key_env.is_none()
             && self.model.is_none()
+            && self.prompt_model.is_none()
             && self.fallback_model.is_none()
             && self.provider.is_none()
     }
@@ -313,12 +318,23 @@ async fn summarize_local(
     } else {
         format!(", {} unpriced", cost.unpriced_request_count)
     };
+    let upstream_split = if cost.upstream_prompt_usd > 0.0 || cost.upstream_completion_usd > 0.0 {
+        format!(
+            ", upstream input ${:.6} + output ${:.6}",
+            cost.upstream_prompt_usd, cost.upstream_completion_usd
+        )
+    } else {
+        String::new()
+    };
     println!(
-        "Wrote {} with local summaries ({} request(s), ${:.6}{}).",
+        "Wrote {} with local summaries ({} request(s), {} input + {} output tokens, ${:.6}{}{}).",
         store.path().display(),
         cost.request_count,
+        cost.prompt_tokens,
+        cost.completion_tokens,
         cost.usd,
-        unpriced
+        unpriced,
+        upstream_split
     );
     Ok(())
 }

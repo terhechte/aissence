@@ -427,6 +427,7 @@ mod tests {
             usd: 0.00125,
             request_count: 3,
             unpriced_request_count: 1,
+            ..SummarizationCost::default()
         };
         assert!(markdown_cost(&cost).contains("actual cost may be higher"));
         assert!(markdown_cost(&cost).contains("$0.00125000"));
